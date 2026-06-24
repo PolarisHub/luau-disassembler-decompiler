@@ -96,6 +96,22 @@ fn sibling_closures_resolve_distinct_protos() {
 }
 
 #[test]
+fn multret_call_args_reconstructed() {
+    // A multret producer (C=0) feeding a "to top" consumer (B=0) must keep the call as an
+    // expanding expression, not a `--[[...]]` marker or a single-value truncation.
+    let out = decompile(&parse_and_validate(&read("19_multret.luauc")).unwrap()).source;
+    assert!(!out.contains("--[[...]]"), "multret marker left in:\n{out}");
+    assert!(out.contains("math.max(triple())"), "f(g()) not rebuilt:\n{out}");
+    assert!(out.contains("{triple()}"), "open table {{g()}} not rebuilt:\n{out}");
+    assert!(out.contains("print(triple())"), "print(g()) not rebuilt:\n{out}");
+    assert!(out.contains("return triple()"), "multret return not rebuilt:\n{out}");
+    assert!(
+        recompiles(&out, "multret"),
+        "multret output must recompile:\n{out}"
+    );
+}
+
+#[test]
 fn method_calls_reconstructed() {
     let module = parse_and_validate(&read("09_method_call.luauc")).unwrap();
     let out = decompile(&module);

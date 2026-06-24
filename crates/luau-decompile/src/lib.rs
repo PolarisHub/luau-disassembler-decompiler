@@ -190,6 +190,11 @@ struct Decompiler<'a> {
     /// inlined away or dead-store-eliminated — the closure references them by name, which our
     /// use-counting (the closure body is opaque) cannot see.
     captured_regs: BTreeSet<u8>,
+    /// Base register of the open-ended multret value left by the IMMEDIATELY preceding
+    /// instruction (a `CALL` with C=0 or `GETVARARGS` with B=0). A following `B=0`/`C=0`
+    /// "to top" consumer (nested call, multret return, open SETLIST) reads its trailing
+    /// operands up to and including this register. Flows exactly one instruction.
+    pending_multret: Option<u8>,
     /// Set when a nested closure decompiled to a partial result (its gotos are hidden inside
     /// the rendered closure string, so the parent can't see them otherwise).
     has_partial_child: bool,
@@ -212,6 +217,7 @@ impl<'a> Decompiler<'a> {
             reg_name_override: BTreeMap::new(),
             next_loopvar: 0,
             captured_regs: BTreeSet::new(),
+            pending_multret: None,
             has_partial_child: false,
             globals: BTreeSet::new(),
             notes: Vec::new(),
@@ -320,13 +326,37 @@ impl<'a> Decompiler<'a> {
                             continue;
                         }
                         if t == cont {
-                            // A jump to the loop's continue point that isn't the natural
-                            // bottom edge is `continue`.
+                            // A jump to the loop's continue point (the update/back-edge).
                             self.flush_inline(stmts);
-                            stmts.push(Stmt::Comment("continue".into()));
+                            stmts.push(Stmt::Continue);
                             pc += len;
                             continue;
                         }
+                    }
+                }
+            }
+            // Conditional break/continue: a conditional jump straight to the loop's exit or
+            // continue point. The target is outside the loop body (so `try_if` can't see it);
+            // lower it to `if <taken-condition> then break/continue end`. A compound
+            // `if not (a and b) then break` compiles to several such jumps, which decompose
+            // into equivalent sequential conditional breaks.
+            if is_conditional_jump(op) {
+                if let Some((cont, brk)) = loop_ctx {
+                    let kw = match jump_target(insn, pc) {
+                        Some(t) if t == brk => Some(Stmt::Break),
+                        Some(t) if t == cont => Some(Stmt::Continue),
+                        _ => None,
+                    };
+                    if let Some(kw) = kw {
+                        let cond = self.taken_condition(op, pc);
+                        self.flush_inline(stmts);
+                        stmts.push(Stmt::If {
+                            cond,
+                            then_body: vec![kw],
+                            else_body: Vec::new(),
+                        });
+                        pc += len;
+                        continue;
                     }
                 }
             }
@@ -683,7 +713,13 @@ impl<'a> Decompiler<'a> {
         if let Some(tl) = then_last {
             if Opcode::from_u8(insn_op(self.proto.code[tl])) == Some(Opcode::JUMP) {
                 if let Some(end) = jump_target(self.proto.code[tl], tl) {
-                    if end > target && end <= hi {
+                    // A trailing JUMP to the enclosing loop's exit/continue point is a
+                    // `break`/`continue`, NOT an else-skip. Treating it as an else would steal
+                    // the rest of the loop body into a phantom else-arm (and lose the break).
+                    // Leave it in the then-body so emit_range lowers it to the keyword.
+                    let is_loop_exit =
+                        loop_ctx.is_some_and(|(cont, brk)| end == brk || end == cont);
+                    if end > target && end <= hi && !is_loop_exit {
                         else_region = Some((target, end));
                         region_end = end;
                         then_hi = tl; // exclude the trailing JUMP
@@ -757,6 +793,10 @@ impl<'a> Decompiler<'a> {
         let b = insn_b(insn);
         let c = insn_c(insn);
         let d = insn_d(insn);
+
+        // The multret value (if any) left by the immediately-preceding instruction. Cleared
+        // here; producers below re-arm it for the next instruction.
+        let multret_top = self.pending_multret.take();
 
         use Opcode::*;
         match op {
@@ -832,8 +872,18 @@ impl<'a> Decompiler<'a> {
                 self.assign(a, e, stmts);
             }
             SETLIST => {
-                // SETLIST A B C [aux]: table[aux + i] = R(B+i) for i in 0..C-1.
-                let count = c as i32 - 1;
+                // SETLIST A B C [aux]: table[aux + i] = R(B+i) for i in 0..C-1. C==0 means
+                // "to top": fill from R(B) up to the preceding multret value.
+                let count = if c == 0 {
+                    multret_top
+                        .map(|t| (t as i32 - b as i32 + 1).max(0))
+                        .unwrap_or(0)
+                } else {
+                    c as i32 - 1
+                };
+                if c == 0 && multret_top.is_none() {
+                    self.note("open SETLIST (to top) approximated");
+                }
                 let start = aux as i32;
                 for i in 0..count.max(0) {
                     let target = Expr::Index(
@@ -886,14 +936,15 @@ impl<'a> Decompiler<'a> {
                 });
             }
             GETVARARGS => {
-                // B-1 results from `...`. With one result, R(A) = (...); else materialize
-                // each from a vararg expansion (best effort).
-                let n = b as i32 - 1;
-                if n == 1 {
-                    self.assign(a, Expr::Vararg, stmts);
+                // B-1 results from `...`. B==0 means `...` extends to top: keep it inline and
+                // arm the multret so a following "to top" consumer (`f(...)`, `return ...`,
+                // `{...}`) expands every vararg. Otherwise R(A) = (...) (its first value).
+                if b == 0 {
+                    self.set_inline(a, Expr::Vararg);
+                    self.pending_multret = Some(a);
                 } else {
                     self.assign(a, Expr::Vararg, stmts);
-                    if n != 1 {
+                    if b as i32 - 1 != 1 {
                         self.note("multi-value `...` expansion approximated");
                     }
                 }
@@ -929,14 +980,20 @@ impl<'a> Decompiler<'a> {
                 let method = self.string_const(aux);
                 *pending_namecall = Some((a, self.reg(b), method));
             }
-            CALL => self.emit_call(a, b, c, stmts, pending_namecall),
+            CALL => self.emit_call(a, b, c, multret_top, stmts, pending_namecall),
             RETURN => {
-                let n = b as i32 - 1;
-                let vals = if n < 0 {
-                    self.note("multret return approximated");
-                    vec![self.reg(a)]
+                // B-1 values from R(A). B==0 means "to top": return R(A) up to the preceding
+                // multret value (e.g. `return f(...)` tail position).
+                let vals: Vec<Expr> = if b == 0 {
+                    match multret_top {
+                        Some(top) if top >= a => (a..=top).map(|r| self.reg(r)).collect(),
+                        _ => {
+                            self.note("multret return approximated");
+                            vec![self.reg(a)]
+                        }
+                    }
                 } else {
-                    (0..n).map(|i| self.reg(a + i as u8)).collect()
+                    (0..b as i32 - 1).map(|i| self.reg(a + i as u8)).collect()
                 };
                 stmts.push(Stmt::Return(vals));
             }
@@ -986,6 +1043,27 @@ impl<'a> Decompiler<'a> {
             other => {
                 stmts.push(Stmt::Comment(format!("unhandled op {}", other.name())));
                 self.note(&format!("unhandled opcode {}", other.name()));
+            }
+        }
+
+        // Carry a pending multret across an instruction that only set up the call target
+        // (`obj:m(g())` / `f(g())` compute `g()` first, then load the callee/method). Such a
+        // load writes a register strictly below the multret base, leaving the stack top — and
+        // thus the trailing multi-value argument — intact for the consuming CALL. Hint opcodes
+        // write nothing and always carry. Anything else (incl. the consuming CALL/RETURN, and
+        // producers, which re-arm explicitly) drops it.
+        if self.pending_multret.is_none() {
+            if let Some(base) = multret_top {
+                let carries = match op {
+                    GETIMPORT | GETGLOBAL | GETUPVAL | MOVE | GETTABLE | GETTABLEKS | GETTABLEN
+                    | NAMECALL => a < base,
+                    FASTCALL | FASTCALL1 | FASTCALL2 | FASTCALL2K | FASTCALL3 | PREPVARARGS
+                    | NOP | COVERAGE => true,
+                    _ => false,
+                };
+                if carries {
+                    self.pending_multret = Some(base);
+                }
             }
         }
     }
@@ -1294,46 +1372,58 @@ impl<'a> Decompiler<'a> {
         a: u8,
         b: u8,
         c: u8,
+        multret_top: Option<u8>,
         stmts: &mut Vec<Stmt>,
         pending_namecall: &mut Option<(u8, Expr, String)>,
     ) {
-        let nargs = b as i32 - 1;
         let nresults = c as i32 - 1;
+
+        // Arguments occupy registers `first ..= last`. The total slots after the callee are
+        // B-1 (so the last slot is A+B-1); for a method call the receiver takes the first of
+        // those slots and the explicit args start one later. With B==0 the list runs to the
+        // top of the stack — the value left by the preceding multret instruction — so the
+        // final argument is itself a multi-value expression.
+        let last: Option<u8> = if b == 0 { multret_top } else { Some(a + b - 1) };
+        let collect_args = |me: &mut Self, first: u8| -> Vec<Expr> {
+            match last {
+                Some(last) if last >= first => (first..=last).map(|r| me.reg(r)).collect(),
+                Some(_) => Vec::new(), // no arguments
+                None => {
+                    me.note("multret call args approximated");
+                    vec![Expr::Raw("--[[...]]".into())]
+                }
+            }
+        };
 
         let call_expr = match pending_namecall.take() {
             Some((reg, obj, method)) if reg == a => {
-                // self is at A+1; explicit args at A+2..A+nargs.
-                let count = (nargs - 1).max(0);
-                let args = (0..count).map(|i| self.reg(a + 2 + i as u8)).collect();
-                if nargs < 0 {
-                    self.note("multret method-call args approximated");
-                }
+                // receiver is at A+1; explicit args start at A+2.
+                let args = collect_args(self, a + 2);
                 Expr::MethodCall(Box::new(obj), method, args)
             }
             other => {
                 *pending_namecall = other;
                 let callee = self.reg(a);
-                let args = if nargs < 0 {
-                    self.note("multret call args approximated");
-                    vec![Expr::Raw("--[[...]]".into())]
-                } else {
-                    (0..nargs).map(|i| self.reg(a + 1 + i as u8)).collect()
-                };
+                let args = collect_args(self, a + 1);
                 Expr::Call(Box::new(callee), args)
             }
         };
 
-        if nresults == 0 {
+        if nresults < 0 {
+            // Multret result (C==0): the call's values extend to the top of the stack and are
+            // consumed by the immediately-following "to top" instruction. Keep the call as an
+            // inline expression (do NOT materialize it to one register — that would truncate it
+            // to a single value) and arm the multret so the consumer expands it in place:
+            // `f(g())`, `return g()`, `{g()}` all preserve every value g() returns.
+            self.pending_multret = Some(a);
+            self.set_inline(a, call_expr);
+        } else if nresults == 0 {
             stmts.push(Stmt::Call(call_expr));
         } else if nresults == 1 {
             self.assign(a, call_expr, stmts);
         } else {
-            // Multiple results: name each destination register and assign as a tuple.
-            let n = if nresults < 0 { 1 } else { nresults };
-            if nresults < 0 {
-                self.note("multret call results approximated");
-            }
-            let targets: Vec<Expr> = (0..n)
+            // A fixed number (>1) of results: name each destination register, tuple-assign.
+            let targets: Vec<Expr> = (0..nresults)
                 .map(|i| {
                     let r = a + i as u8;
                     self.materialize(r);

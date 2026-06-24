@@ -79,6 +79,7 @@ pub enum Stmt {
     Call(Expr),
     Return(Vec<Expr>),
     Break,
+    Continue,
     /// `if cond then <then> [else <else_>] end`. elseif chains are nested else-ifs.
     If {
         cond: Expr,
@@ -156,6 +157,10 @@ fn render_stmt(out: &mut String, s: &Stmt, indent: usize) {
         Stmt::Break => {
             pad(out, indent);
             out.push_str("break\n");
+        }
+        Stmt::Continue => {
+            pad(out, indent);
+            out.push_str("continue\n");
         }
         Stmt::If {
             cond,

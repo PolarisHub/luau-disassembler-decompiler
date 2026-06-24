@@ -1,0 +1,61 @@
+Function 0 (triple):
+    5: 	return 1, 2, 3
+LOADN R0 1
+LOADN R1 2
+LOADN R2 3
+RETURN R0 3
+
+Function 1 (forward):
+    9: 	return ... -- multret return of varargs
+GETVARARGS R0 -1
+RETURN R0 -1
+
+Function 2 (tail):
+   18: 	return triple() -- multret return: return g()
+GETUPVAL R0 0
+CALL R0 0 -1
+RETURN R0 -1
+
+Function 3 (??):
+local 0: reg 0, start pc 2 line 8, end pc 29 line 21
+local 1: reg 1, start pc 3 line 12, end pc 29 line 21
+local 2: reg 2, start pc 9 line 13, end pc 29 line 21
+local 3: reg 3, start pc 15 line 14, end pc 29 line 21
+local 4: reg 4, start pc 27 line 17, end pc 29 line 21
+local 5: reg 5, start pc 29 line 21, end pc 29 line 21
+    4: local function triple()
+DUPCLOSURE R0 K0 ['triple']
+    8: local function forward(...)
+DUPCLOSURE R1 K1 ['forward']
+REMARK builtin math.max/1+
+   12: local a = math.max(triple()) -- f(g()): args to top
+MOVE R3 R0
+CALL R3 0 -1
+FASTCALL 18 L0
+GETIMPORT R2 4 [math.max]
+CALL R2 -1 1
+REMARK allocation: table array 1
+   13: local packed = { triple() } -- open SETLIST: {g()}
+L0: NEWTABLE R3 0 1
+MOVE R4 R0
+CALL R4 0 -1
+SETLIST R3 R4 -1 [1]
+   14: print(triple()) -- statement call with multret args
+GETIMPORT R4 6 [print]
+MOVE R5 R0
+CALL R5 0 -1
+CALL R4 -1 0
+REMARK builtin tostring/1+
+   15: local s = tostring(forward(7)) -- nested call
+MOVE R5 R1
+LOADN R6 7
+CALL R5 1 -1
+FASTCALL 63 L1
+GETIMPORT R4 8 [tostring]
+CALL R4 -1 1
+   17: local function tail()
+L1: DUPCLOSURE R5 K9 ['tail']
+CAPTURE VAL R0
+   21: return a, packed, s, tail
+RETURN R2 4
+
