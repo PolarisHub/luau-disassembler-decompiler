@@ -160,18 +160,26 @@ fn table_fill_field(s: &Stmt, t: &str, array_next: &mut usize) -> Option<TableFi
     }
 }
 
-/// Drop statements after a `return`/`break` in each block. A flush of the inline cache can
-/// append assignments after a terminator; that code is both unreachable and (for `return`)
-/// not even valid Luau, so it must go.
+/// Drop statements after a `return`/`break`/`continue` in each block. A flush of the inline
+/// cache can append assignments after a terminator; that code is both unreachable and (for
+/// `return`) not even valid Luau, so it must go. Statements at or after a `::label::` are kept,
+/// however — they may be reached by a `goto` that jumps over the terminator (a guard like
+/// `if not (a and b) then return end <body>` puts <body> behind a label after the return), and
+/// dropping them would silently delete reachable code.
 pub fn drop_unreachable(root: &mut Vec<Stmt>) {
     for s in root.iter_mut() {
         for_each_block_mut(s, drop_unreachable);
     }
-    if let Some(idx) = root
-        .iter()
-        .position(|s| matches!(s, Stmt::Return(_) | Stmt::Break | Stmt::Continue))
-    {
-        root.truncate(idx + 1);
+    let mut i = 0;
+    while i < root.len() {
+        if matches!(root[i], Stmt::Return(_) | Stmt::Break | Stmt::Continue) {
+            let mut j = i + 1;
+            while j < root.len() && !matches!(root[j], Stmt::Label(_)) {
+                j += 1;
+            }
+            root.drain(i + 1..j);
+        }
+        i += 1;
     }
 }
 

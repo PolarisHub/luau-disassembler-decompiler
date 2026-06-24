@@ -101,10 +101,22 @@ fn multret_call_args_reconstructed() {
     // expanding expression, not a `--[[...]]` marker or a single-value truncation.
     let out = decompile(&parse_and_validate(&read("19_multret.luauc")).unwrap()).source;
     assert!(!out.contains("--[[...]]"), "multret marker left in:\n{out}");
-    assert!(out.contains("math.max(triple())"), "f(g()) not rebuilt:\n{out}");
-    assert!(out.contains("{triple()}"), "open table {{g()}} not rebuilt:\n{out}");
-    assert!(out.contains("print(triple())"), "print(g()) not rebuilt:\n{out}");
-    assert!(out.contains("return triple()"), "multret return not rebuilt:\n{out}");
+    assert!(
+        out.contains("math.max(triple())"),
+        "f(g()) not rebuilt:\n{out}"
+    );
+    assert!(
+        out.contains("{triple()}"),
+        "open table {{g()}} not rebuilt:\n{out}"
+    );
+    assert!(
+        out.contains("print(triple())"),
+        "print(g()) not rebuilt:\n{out}"
+    );
+    assert!(
+        out.contains("return triple()"),
+        "multret return not rebuilt:\n{out}"
+    );
     assert!(
         recompiles(&out, "multret"),
         "multret output must recompile:\n{out}"
