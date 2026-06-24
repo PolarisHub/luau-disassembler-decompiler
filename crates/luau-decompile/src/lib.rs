@@ -22,7 +22,7 @@ mod naming;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ast::{render_block, render_expr, Expr, Stmt, TableField};
+use ast::{render_block, render_expr, Capture, Expr, Stmt, TableField};
 use luau_bytecode::opcode::*;
 use luau_bytecode::{capture_type, Constant, Module, Proto, StringRef};
 use luau_disasm::{compute_labels, render_constant_at};
@@ -82,18 +82,31 @@ fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoRep
     // Recover the `z = a and b or c` short-circuit ternary from its goto/label diamond.
     cleanup::recover_and_or(&mut stmts);
 
-    // Fold register-reuse field/method chains (x = a.b; x = x.c -> x = a.b.c) before naming,
-    // so a variable is named from its final, complete expression.
-    naming::fold_refinements(&mut stmts);
-
-    // Restore readability lost by always materializing: inline single-use pure temporaries
-    // and drop dead stores. Both are sound (see cleanup.rs). Captured registers and globals
-    // are excluded: closures must keep the variables they close over, and a global write is
-    // an observable effect even when nothing in this proto reads it back.
+    // Captured registers, upvalues, and globals are excluded from inlining/elimination:
+    // closures must keep the variables they close over, and a write to an upvalue or global
+    // is an observable effect (another closure sees it) even when nothing in this proto reads
+    // it back.
     let mut protected = d.captured_names();
     protected.extend(d.globals.iter().cloned());
-    cleanup::single_use_inline(&mut stmts, &protected);
-    cleanup::dead_store_elim(&mut stmts, &protected);
+    for i in 0..d.proto.num_upvalues {
+        protected.insert(d.upval_name(i));
+    }
+
+    // Run the reducing passes to a fixpoint: chain-folding, table-literal rebuilding,
+    // per-definition copy propagation, and dead-store elimination all enable each other
+    // (e.g. inlining temps makes a chain consecutive, which folds, which frees more temps).
+    let mut prev = usize::MAX;
+    for _ in 0..16 {
+        naming::fold_refinements(&mut stmts);
+        cleanup::fold_table_literals(&mut stmts);
+        cleanup::single_use_inline(&mut stmts, &protected);
+        cleanup::dead_store_elim(&mut stmts, &protected);
+        let n = cleanup::count_stmts(&stmts);
+        if n == prev {
+            break;
+        }
+        prev = n;
+    }
     // A constant `1` step on a numeric for is implicit.
     drop_unit_for_steps(&mut stmts);
 
@@ -112,6 +125,10 @@ fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoRep
             *n = new.clone();
         }
     }
+
+    // Now that this function's locals have their final names, rewrite the `u0`/`u1`/… upvalue
+    // placeholders inside each nested closure to the captured local's name.
+    d.resolve_closures(&mut stmts, &rename);
 
     // Determine `partial` from the FINAL tree: a proto is partial only if some unstructured
     // control flow (a goto/label) survived all recovery passes, or a nested closure was partial.
@@ -882,14 +899,25 @@ impl<'a> Decompiler<'a> {
                 }
             }
             NEWCLOSURE => {
-                let child = insn_d(insn) as usize;
-                let e = self.closure_expr(child);
-                self.assign(a, e, stmts);
+                // A captured register backs the closure's upvalue, so its current value must
+                // be a real statement before the closure (not left in the inline cache).
+                self.flush_captured(stmts);
+                // The D operand indexes the ENCLOSING proto's child-proto list (`p->p[D]`),
+                // not the module's flat proto table.
+                let local = insn_d(insn) as usize;
+                if let Some(&child) = self.proto.child_protos.get(local) {
+                    let e = self.closure_expr(child as usize, pc);
+                    self.assign(a, e, stmts);
+                } else {
+                    self.assign(a, Expr::Raw("--[[closure?]]".into()), stmts);
+                    self.note("NEWCLOSURE child index out of range");
+                }
             }
             DUPCLOSURE => {
+                self.flush_captured(stmts);
                 // The constant is a Closure referencing a child proto.
                 if let Some(Constant::Closure { proto }) = self.proto.constants.get(d as usize) {
-                    let e = self.closure_expr(*proto as usize);
+                    let e = self.closure_expr(*proto as usize, pc);
                     self.assign(a, e, stmts);
                 } else {
                     self.assign(a, Expr::Raw("--[[closure?]]".into()), stmts);
@@ -1079,10 +1107,11 @@ impl<'a> Decompiler<'a> {
         Expr::Binary(symbol, Box::new(lhs), Box::new(rhs))
     }
 
-    fn closure_expr(&mut self, child_idx: usize) -> Expr {
+    fn closure_expr(&mut self, child_idx: usize, pc: usize) -> Expr {
         // Recursively decompile the child proto into a function literal.
         let child = &self.module.protos[child_idx];
         let params = self.signature_params(child);
+        let captures = self.closure_captures(pc);
         let mut sub_reports = Vec::new();
         let body = decompile_proto(self.module, child_idx, &mut sub_reports);
         if sub_reports.iter().any(|r| r.partial) {
@@ -1108,12 +1137,150 @@ impl<'a> Decompiler<'a> {
         } else {
             String::new()
         };
-        Expr::Closure(format!(
-            "function({}{})\n{}end",
-            params.join(", "),
-            vararg,
-            indented
-        ))
+        Expr::Closure {
+            text: format!("function({}{})\n{}end", params.join(", "), vararg, indented),
+            captures,
+        }
+    }
+
+    /// The ordered upvalue captures of the closure created at `pc`, read from the CAPTURE
+    /// instructions that follow the NEWCLOSURE/DUPCLOSURE.
+    fn closure_captures(&self, pc: usize) -> Vec<Capture> {
+        let code = &self.proto.code;
+        let len = Opcode::from_u8(insn_op(code[pc]))
+            .map(|o| o.length())
+            .unwrap_or(1)
+            .max(1);
+        let mut caps = Vec::new();
+        let mut q = pc + len;
+        while q < code.len() && Opcode::from_u8(insn_op(code[q])) == Some(Opcode::CAPTURE) {
+            let cap = code[q];
+            match insn_a(cap) {
+                capture_type::VAL | capture_type::REF => caps.push(Capture::Reg(insn_b(cap))),
+                capture_type::UPVAL => caps.push(Capture::Upval(insn_b(cap))),
+                _ => {}
+            }
+            q += 1;
+        }
+        caps
+    }
+
+    /// After the enclosing function's names are final, rewrite each closure's upvalue
+    /// placeholders (`u0`, `u1`, …) to the captured local's name. Captures of our own
+    /// upvalues stay `uN` for OUR enclosing function to resolve in turn.
+    fn resolve_closures(&self, stmts: &mut [Stmt], rename: &BTreeMap<String, String>) {
+        for s in stmts.iter_mut() {
+            self.resolve_closures_stmt(s, rename);
+        }
+    }
+
+    fn resolve_closures_stmt(&self, s: &mut Stmt, rename: &BTreeMap<String, String>) {
+        match s {
+            Stmt::Local { values, .. } => values
+                .iter_mut()
+                .for_each(|e| self.resolve_in_expr(e, rename)),
+            Stmt::Assign { targets, values } => {
+                targets
+                    .iter_mut()
+                    .for_each(|e| self.resolve_in_expr(e, rename));
+                values
+                    .iter_mut()
+                    .for_each(|e| self.resolve_in_expr(e, rename));
+            }
+            Stmt::Call(e) => self.resolve_in_expr(e, rename),
+            Stmt::Return(es) => es.iter_mut().for_each(|e| self.resolve_in_expr(e, rename)),
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                self.resolve_in_expr(cond, rename);
+                self.resolve_closures(then_body, rename);
+                self.resolve_closures(else_body, rename);
+            }
+            Stmt::While { cond, body } => {
+                self.resolve_in_expr(cond, rename);
+                self.resolve_closures(body, rename);
+            }
+            Stmt::Repeat { body, cond } => {
+                self.resolve_closures(body, rename);
+                self.resolve_in_expr(cond, rename);
+            }
+            Stmt::NumericFor {
+                start,
+                limit,
+                step,
+                body,
+                ..
+            } => {
+                self.resolve_in_expr(start, rename);
+                self.resolve_in_expr(limit, rename);
+                if let Some(s) = step {
+                    self.resolve_in_expr(s, rename);
+                }
+                self.resolve_closures(body, rename);
+            }
+            Stmt::GenericFor { exprs, body, .. } => {
+                exprs
+                    .iter_mut()
+                    .for_each(|e| self.resolve_in_expr(e, rename));
+                self.resolve_closures(body, rename);
+            }
+            _ => {}
+        }
+    }
+
+    fn resolve_in_expr(&self, e: &mut Expr, rename: &BTreeMap<String, String>) {
+        match e {
+            Expr::Closure { text, captures } => {
+                let names: Vec<String> = captures
+                    .iter()
+                    .map(|c| match c {
+                        Capture::Reg(r) => {
+                            let n = self.reg_name(*r);
+                            rename.get(&n).cloned().unwrap_or(n)
+                        }
+                        // Our own upvalue, resolved later by our enclosing function.
+                        Capture::Upval(u) => format!("u{u}"),
+                    })
+                    .collect();
+                *text = substitute_upvalues(text, &names);
+            }
+            Expr::Index(a, b) => {
+                self.resolve_in_expr(a, rename);
+                self.resolve_in_expr(b, rename);
+            }
+            Expr::Field(a, _) => self.resolve_in_expr(a, rename),
+            Expr::Call(f, args) => {
+                self.resolve_in_expr(f, rename);
+                args.iter_mut()
+                    .for_each(|x| self.resolve_in_expr(x, rename));
+            }
+            Expr::MethodCall(o, _, args) => {
+                self.resolve_in_expr(o, rename);
+                args.iter_mut()
+                    .for_each(|x| self.resolve_in_expr(x, rename));
+            }
+            Expr::Unary(_, a) => self.resolve_in_expr(a, rename),
+            Expr::Binary(_, a, b) => {
+                self.resolve_in_expr(a, rename);
+                self.resolve_in_expr(b, rename);
+            }
+            Expr::Table(fields) => {
+                for f in fields {
+                    match f {
+                        TableField::Item(e) | TableField::Named(_, e) => {
+                            self.resolve_in_expr(e, rename)
+                        }
+                        TableField::Keyed(k, v) => {
+                            self.resolve_in_expr(k, rename);
+                            self.resolve_in_expr(v, rename);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn signature_params(&self, proto: &Proto) -> Vec<String> {
@@ -1218,6 +1385,24 @@ impl<'a> Decompiler<'a> {
                         values: vec![e],
                     });
                 }
+            }
+        }
+    }
+
+    /// Emit a real assignment for any captured register still sitting in the inline cache.
+    /// Called right before a closure is created so the value the closure captures is not lost.
+    fn flush_captured(&mut self, stmts: &mut Vec<Stmt>) {
+        let caps: Vec<u8> = self.captured_regs.iter().copied().collect();
+        for r in caps {
+            if let Some(e) = self.regs.get(r as usize).and_then(|s| s.clone()) {
+                self.regs[r as usize] = None;
+                if r >= self.proto.num_params {
+                    self.hoisted.insert(r);
+                }
+                stmts.push(Stmt::Assign {
+                    targets: vec![Expr::Var(self.reg_name(r))],
+                    values: vec![e],
+                });
             }
         }
     }
@@ -1462,6 +1647,61 @@ fn retain_referenced_labels(stmts: &mut Vec<Stmt>, referenced: &BTreeSet<String>
             _ => {}
         }
     }
+}
+
+/// Replace whole-word `u0`, `u1`, … upvalue placeholders in rendered closure text with the
+/// captured names. String literals are skipped so identical-looking text inside a string is
+/// never rewritten.
+fn substitute_upvalues(text: &str, names: &[String]) -> String {
+    if names.is_empty() {
+        return text.to_string();
+    }
+    let bytes = text.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let mut in_str: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            out.push(b);
+            if b == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1]);
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_str = Some(b);
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        let prev_ident = i > 0 && is_ident(bytes[i - 1]);
+        if b == b'u' && !prev_ident {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 1 && (j >= bytes.len() || !is_ident(bytes[j])) {
+                if let Ok(idx) = text[i + 1..j].parse::<usize>() {
+                    if idx < names.len() {
+                        out.extend_from_slice(names[idx].as_bytes());
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(b);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
 }
 
 /// A two-way conditional jump (has a taken and a fall-through edge).

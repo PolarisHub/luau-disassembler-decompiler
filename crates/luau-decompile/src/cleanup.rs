@@ -49,15 +49,9 @@ pub fn assigned_locals(root: &[Stmt], exclude: &BTreeSet<String>) -> Vec<String>
 }
 
 /// Inline single-use pure temporaries to fixpoint. `protected` names are never inlined
-/// (e.g. registers captured by closures).
+/// (e.g. registers captured by closures or globals).
 pub fn single_use_inline(root: &mut Vec<Stmt>, protected: &BTreeSet<String>) {
-    loop {
-        let uses = count_uses(root);
-        let defs = count_defs(root);
-        if !inline_in_block(root, &uses, &defs, protected) {
-            break;
-        }
-    }
+    while inline_in_block(root, protected) {}
 }
 
 /// Remove dead pure stores; reduce dead call-stores to bare calls. `protected` names are
@@ -68,6 +62,101 @@ pub fn dead_store_elim(root: &mut Vec<Stmt>, protected: &BTreeSet<String>) {
         if !dead_in_block(root, &uses, protected) {
             break;
         }
+    }
+}
+
+/// Total statement count across the whole tree (used to detect cleanup fixpoint).
+pub fn count_stmts(root: &[Stmt]) -> usize {
+    let mut n = 0;
+    for s in root {
+        n += 1;
+        for_each_block(s, |b| n += count_stmts(b));
+    }
+    n
+}
+
+/// Fold `t = {}; t[1]=a; t[2]=b; t.k=v` (a NEWTABLE/DUPTABLE followed by its consecutive
+/// SETLIST/SETTABLEKS fills) into a table literal `t = {a, b, k = v}`. Only consecutive fills
+/// of `t` whose key/value don't reference `t` are absorbed, so evaluation order and any later
+/// mutation of `t` are preserved. Combined with single-use inlining, nested tables collapse
+/// into nested literals.
+pub fn fold_table_literals(root: &mut Vec<Stmt>) {
+    for s in root.iter_mut() {
+        for_each_block_mut(s, fold_table_literals);
+    }
+    let mut i = 0;
+    while i < root.len() {
+        let (t, mut fields) = match &root[i] {
+            Stmt::Assign { targets, values } if targets.len() == 1 && values.len() == 1 => {
+                match (&targets[0], &values[0]) {
+                    (Expr::Var(t), Expr::Table(base)) => (t.clone(), base.clone()),
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let mut array_next = 1 + fields
+            .iter()
+            .filter(|f| matches!(f, TableField::Item(_)))
+            .count();
+        let mut j = i + 1;
+        while j < root.len() {
+            match table_fill_field(&root[j], &t, &mut array_next) {
+                Some(field) => {
+                    fields.push(field);
+                    j += 1;
+                }
+                None => break,
+            }
+        }
+        if j > i + 1 {
+            root[i] = Stmt::Assign {
+                targets: vec![Expr::Var(t)],
+                values: vec![Expr::Table(fields)],
+            };
+            root.drain(i + 1..j);
+        }
+        i += 1;
+    }
+}
+
+/// If `s` is a fill of table `t` (`t[k] = v` or `t.k = v`) safe to absorb into a literal,
+/// return the corresponding field. `array_next` tracks the next positional array index.
+fn table_fill_field(s: &Stmt, t: &str, array_next: &mut usize) -> Option<TableField> {
+    let Stmt::Assign { targets, values } = s else {
+        return None;
+    };
+    if targets.len() != 1 || values.len() != 1 {
+        return None;
+    }
+    let value = &values[0];
+    if reads_of_expr(value).contains(t) {
+        return None; // value reads t — the literal can't capture it
+    }
+    let is_t = |e: &Expr| matches!(e, Expr::Var(n) if n == t);
+    match &targets[0] {
+        Expr::Field(base, name) if is_t(base) => {
+            Some(TableField::Named(name.clone(), value.clone()))
+        }
+        Expr::Index(base, key) if is_t(base) => {
+            if reads_of_expr(key).contains(t) {
+                return None;
+            }
+            if let Expr::Num(n) = key.as_ref() {
+                if *n == array_next.to_string() {
+                    *array_next += 1;
+                    return Some(TableField::Item(value.clone()));
+                }
+            }
+            Some(TableField::Keyed((**key).clone(), value.clone()))
+        }
+        _ => None,
     }
 }
 
@@ -176,18 +265,13 @@ fn match_and_or(s0: &Stmt, s1: &Stmt, s2: &Stmt) -> Option<Stmt> {
 
 // --- inlining --------------------------------------------------------------------------
 
-fn inline_in_block(
-    block: &mut Vec<Stmt>,
-    uses: &BTreeMap<String, usize>,
-    defs: &BTreeMap<String, usize>,
-    protected: &BTreeSet<String>,
-) -> bool {
+fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool {
     // Recurse into nested blocks first.
     for s in block.iter_mut() {
         let mut changed = false;
         for_each_block_mut(s, |b| {
             if !changed {
-                changed = inline_in_block(b, uses, defs, protected);
+                changed = inline_in_block(b, protected);
             }
         });
         if changed {
@@ -202,22 +286,39 @@ fn inline_in_block(
         if protected.contains(&name) {
             continue;
         }
-        if uses.get(&name).copied().unwrap_or(0) != 1 || defs.get(&name).copied().unwrap_or(0) != 1
-        {
-            continue;
+        if reads_of_expr(&val).contains(&name) {
+            continue; // self-referential definition (a refinement); leave it
         }
-        if !is_pure(&val) {
-            continue; // only pure values may move
-        }
-        let inputs = reads_of_expr(&val);
-        let has_table_read = reads_table(&val);
+        // Pure values can move anywhere (interference-checked). An impure value (a call) may
+        // only be inlined when the use evaluates it first (the temp is the head/receiver) and
+        // nothing effectful sits between — then no side effect is reordered.
+        let impure = !is_pure(&val);
 
-        // Find the unique use in this same block, after i.
-        let Some(j) = (i + 1..block.len()).find(|&k| stmt_reads_var(&block[k], &name)) else {
+        // The definition's value is live until `name` is next written. Work only within a
+        // straight-line window up to that point so we can see every use of THIS value.
+        let next_def = ((i + 1)..block.len())
+            .find(|&k| writes_of_stmt(&block[k]).contains(&name))
+            .unwrap_or(block.len());
+        if block[i + 1..next_def].iter().any(is_control_flow) {
+            continue; // a branch/loop may use the value on a path we can't see; be safe
+        }
+        // If the next write reads `name` in its own value (`x = x.foo`), that's a refinement
+        // handled by fold_refinements; don't inline past it.
+        if next_def < block.len() && stmt_reads_var(&block[next_def], &name) {
             continue;
-        };
+        }
+
+        let reads: Vec<usize> = ((i + 1)..next_def)
+            .filter(|&k| stmt_reads_var(&block[k], &name))
+            .collect();
+        if reads.len() != 1 {
+            continue; // inline only genuinely single-use values
+        }
+        let j = reads[0];
 
         // Interference check on the statements strictly between def and use.
+        let inputs = reads_of_expr(&val);
+        let needs_no_effects = reads_table(&val) || impure;
         let mut safe = true;
         for stmt in &block[i + 1..j] {
             if matches!(stmt, Stmt::Label(_) | Stmt::Goto(_)) {
@@ -228,22 +329,66 @@ fn inline_in_block(
                 safe = false;
                 break;
             }
-            if has_table_read && stmt_effectful(stmt) {
+            if needs_no_effects && stmt_effectful(stmt) {
                 safe = false;
                 break;
             }
+        }
+        // An impure value may only be inlined where it is evaluated first (head/receiver).
+        if impure && stmt_head(&block[j]) != Some(name.as_str()) {
+            safe = false;
         }
         if !safe {
             continue;
         }
 
-        // Inline: replace the single occurrence in block[j], drop the def.
         let mut v = Some(val);
         replace_first_var(&mut block[j], &name, &mut v);
         block.remove(i);
         return true;
     }
     false
+}
+
+/// The variable read first when evaluating an expression (its receiver/leftmost operand),
+/// if evaluation begins by reading a variable.
+fn expr_head(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Var(n) => Some(n),
+        Expr::Field(b, _) | Expr::Index(b, _) => expr_head(b),
+        Expr::MethodCall(o, _, _) => expr_head(o),
+        Expr::Call(c, _) => expr_head(c),
+        Expr::Binary(_, a, _) => expr_head(a),
+        Expr::Unary(_, a) => expr_head(a),
+        _ => None,
+    }
+}
+
+/// The variable a statement evaluates first, when that is a plain leading read (so an impure
+/// value inlined there isn't reordered relative to the statement's other side effects).
+fn stmt_head(s: &Stmt) -> Option<&str> {
+    match s {
+        Stmt::Call(e) => expr_head(e),
+        Stmt::Return(vals) => vals.first().and_then(expr_head),
+        Stmt::Assign { targets, values } if matches!(targets.as_slice(), [Expr::Var(_)]) => {
+            values.first().and_then(expr_head)
+        }
+        _ => None,
+    }
+}
+
+fn is_control_flow(s: &Stmt) -> bool {
+    matches!(
+        s,
+        Stmt::If { .. }
+            | Stmt::While { .. }
+            | Stmt::Repeat { .. }
+            | Stmt::NumericFor { .. }
+            | Stmt::GenericFor { .. }
+            | Stmt::Label(_)
+            | Stmt::Goto(_)
+            | Stmt::Break
+    )
 }
 
 // --- dead store elimination ------------------------------------------------------------
@@ -333,20 +478,6 @@ fn count_uses_stmt(s: &Stmt, counts: &mut BTreeMap<String, usize>) {
             count_uses_stmt(st, counts);
         }
     });
-}
-
-fn count_defs(root: &[Stmt]) -> BTreeMap<String, usize> {
-    let mut counts = BTreeMap::new();
-    fn walk(stmts: &[Stmt], counts: &mut BTreeMap<String, usize>) {
-        for s in stmts {
-            if let Some((name, _)) = sole_var_assign(s) {
-                *counts.entry(name).or_insert(0) += 1;
-            }
-            for_each_block(s, |b| walk(b, counts));
-        }
-    }
-    walk(root, &mut counts);
-    counts
 }
 
 fn add_reads(e: &Expr, counts: &mut BTreeMap<String, usize>) {

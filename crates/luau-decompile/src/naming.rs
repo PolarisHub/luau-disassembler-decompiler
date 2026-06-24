@@ -267,7 +267,7 @@ pub(crate) fn is_pure(e: &Expr) -> bool {
         | Expr::Vector(_)
         | Expr::Var(_)
         | Expr::Vararg
-        | Expr::Closure(_) => true,
+        | Expr::Closure { .. } => true,
         Expr::Field(b, _) => is_pure(b),
         Expr::Index(b, k) => is_pure(b) && is_pure(k),
         Expr::Unary(_, a) => is_pure(a),
@@ -388,7 +388,7 @@ fn rename_expr(e: &mut Expr, map: &BTreeMap<String, String>) {
         | Expr::Str(_)
         | Expr::Vector(_)
         | Expr::Vararg
-        | Expr::Closure(_)
+        | Expr::Closure { .. }
         | Expr::Raw(_) => {}
     }
 }

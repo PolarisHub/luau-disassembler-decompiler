@@ -33,10 +33,24 @@ pub enum Expr {
     Table(Vec<TableField>),
     /// `...`
     Vararg,
-    /// A function literal (rendered separately and spliced in).
-    Closure(String),
+    /// A function literal: the rendered body text plus, in order, what each upvalue captures
+    /// from the enclosing function. The upvalues read as `u0`, `u1`, … in `text` until the
+    /// enclosing function resolves them to its real names (see `resolve_closure_upvalues`).
+    Closure {
+        text: String,
+        captures: Vec<Capture>,
+    },
     /// Fallback raw text (e.g. `R3 --[[?]]`) for things we couldn't reconstruct.
     Raw(String),
+}
+
+/// What a closure upvalue captures from its enclosing function.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Capture {
+    /// A register (local) of the enclosing function.
+    Reg(u8),
+    /// An upvalue of the enclosing function (a chained capture).
+    Upval(u8),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -246,13 +260,13 @@ pub fn render_expr(e: &Expr) -> String {
         Expr::Nil => "nil".to_string(),
         Expr::Bool(b) => b.to_string(),
         Expr::Num(s) | Expr::Str(s) | Expr::Vector(s) | Expr::Var(s) | Expr::Raw(s) => s.clone(),
-        Expr::Closure(s) => s.clone(),
+        Expr::Closure { text, .. } => text.clone(),
         Expr::Vararg => "...".to_string(),
-        Expr::Index(t, k) => format!("{}[{}]", render_expr(t), render_expr(k)),
-        Expr::Field(t, f) => format!("{}.{}", render_expr(t), f),
-        Expr::Call(f, args) => format!("{}({})", render_expr(f), join_exprs(args)),
+        Expr::Index(t, k) => format!("{}[{}]", prefix(t), render_expr(k)),
+        Expr::Field(t, f) => format!("{}.{}", prefix(t), f),
+        Expr::Call(f, args) => format!("{}({})", prefix(f), join_exprs(args)),
         Expr::MethodCall(o, m, args) => {
-            format!("{}:{}({})", render_expr(o), m, join_exprs(args))
+            format!("{}:{}({})", prefix(o), m, join_exprs(args))
         }
         Expr::Unary(op, a) => {
             // `not` needs a space; symbolic ops don't.
@@ -285,6 +299,22 @@ fn paren(e: &Expr) -> String {
     match e {
         Expr::Binary(..) | Expr::Unary(..) => format!("({})", render_expr(e)),
         _ => render_expr(e),
+    }
+}
+
+/// Render an expression used as a *prefix expression* — the base of a call, method call,
+/// index, or field access. Lua's grammar only allows a name, another prefix expression, or a
+/// parenthesized expression there, so anything else (a function literal, string, table,
+/// binary op, …) must be wrapped: `(function() end)()`, `("s"):upper()`, `({}).x`.
+fn prefix(e: &Expr) -> String {
+    match e {
+        Expr::Var(_)
+        | Expr::Raw(_)
+        | Expr::Index(..)
+        | Expr::Field(..)
+        | Expr::Call(..)
+        | Expr::MethodCall(..) => render_expr(e),
+        _ => format!("({})", render_expr(e)),
     }
 }
 

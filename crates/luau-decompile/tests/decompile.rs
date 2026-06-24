@@ -53,6 +53,49 @@ fn straight_line_functions_are_not_partial() {
 }
 
 #[test]
+fn table_literals_reconstructed() {
+    // NEWTABLE + SETLIST/SETTABLEKS fills should fold back into table literals.
+    let arr = decompile(&parse_and_validate(&read("01_literals.luauc")).unwrap()).source;
+    assert!(
+        arr.contains("{1, 2, 3}"),
+        "array literal not rebuilt:\n{arr}"
+    );
+
+    let mixed = decompile(&parse_and_validate(&read("10_tables.luauc")).unwrap()).source;
+    assert!(
+        mixed.contains("{10, 20, 30, 40}"),
+        "array not rebuilt:\n{mixed}"
+    );
+    assert!(
+        mixed.contains("name = \"luau\""),
+        "hash literal not rebuilt:\n{mixed}"
+    );
+}
+
+#[test]
+fn sibling_closures_resolve_distinct_protos() {
+    // NEWCLOSURE's D operand indexes the parent's child-proto list, not the flat table.
+    // Two siblings capturing the same upvalue must render their OWN (distinct) bodies, the
+    // captured local must be materialized, and an upvalue write must not be folded away.
+    let out = decompile(&parse_and_validate(&read("18_sibling_closures.luauc")).unwrap()).source;
+    assert!(out.contains("hits = hits + 1"), "bump body wrong:\n{out}");
+    assert!(
+        out.contains("hits = 0"),
+        "captured local/reset lost:\n{out}"
+    );
+    // `reset` writes the shared upvalue then returns it — must not collapse to `return 0`.
+    assert!(
+        out.contains("return hits"),
+        "upvalue write was folded away:\n{out}"
+    );
+    // The chained capture (inner closure reads the outer closure's upvalues) resolves names.
+    assert!(
+        out.contains("name .. \": \") .. hits") || out.contains("(name .. \": \") .. hits"),
+        "chained upvalue names not resolved:\n{out}"
+    );
+}
+
+#[test]
 fn method_calls_reconstructed() {
     let module = parse_and_validate(&read("09_method_call.luauc")).unwrap();
     let out = decompile(&module);
@@ -136,8 +179,7 @@ fn roblox_idioms_get_smart_names() {
         "MyModule_doThing = require(game.ReplicatedStorage.MyModule).doThing",
         "part = Instance.new(\"Part\")",
         "Players.LocalPlayer.Character",
-        "children = workspace:GetChildren()",
-        "#children",
+        "#workspace:GetChildren()",
     ] {
         assert!(
             out.source.contains(needle),
