@@ -13,3 +13,6 @@
 # Live game scripts pulled for ad-hoc testing
 /.live
 /tmp_*.luauc
+/.codex
+debug_patch.py
+tmp_guard.bin

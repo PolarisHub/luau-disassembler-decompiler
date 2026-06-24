@@ -35,4 +35,14 @@ local function guardInLoop(items)
 	return total
 end
 
-return { twoAnd, threeAnd, guardThenWork, guardInLoop }
+-- Effectful-guard chain: the right-hand side of `and` is a call whose result is tested
+-- immediately. The compiler emits it as two conditional jumps with intervening code
+-- between them, which the structurer must rebuild as flat sequential guards.
+local function guardWithCall(panel, name)
+	if not (panel and panel:FindFirstChild(name)) then
+		return false
+	end
+	return true
+end
+
+return { twoAnd, threeAnd, guardThenWork, guardInLoop, guardWithCall }

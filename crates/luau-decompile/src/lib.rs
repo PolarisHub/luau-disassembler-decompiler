@@ -714,62 +714,232 @@ impl<'a> Decompiler<'a> {
         stmts: &mut Vec<Stmt>,
         loop_ctx: Option<(usize, usize)>,
     ) -> Option<usize> {
-        // Collect the maximal run of consecutive conditional jumps.
+        // Collect conditional jumps, allowing straight-line (non-control-flow) instructions
+        // between them. The intervening instructions are the effect that produces the next
+        // guard's test value; we re-validate them below. Bail if we hit a real branch,
+        // loop op, or terminator (anything that would break the and-link).
         let mut jumps: Vec<usize> = Vec::new();
         let mut p = pc;
         while p < hi {
             let op = Opcode::from_u8(insn_op(self.proto.code[p]))?;
-            if !is_conditional_jump(op) {
+            if is_conditional_jump(op) {
+                jumps.push(p);
+                p += op.length().max(1);
+            } else if self.op_breaks_chain(op) {
                 break;
+            } else {
+                // Straight-line; keep walking until we find another conditional jump or
+                // something that breaks the chain.
+                p += op.length().max(1);
             }
-            jumps.push(p);
-            p += op.length().max(1);
         }
         if jumps.len() < 2 {
-            return None; // a single guard is already handled by `try_if`
-        }
-
-        // The final jump targets BODY; its fall-through (`p`) must be the guard block start G.
-        let last = *jumps.last().unwrap();
-        let body = jump_target(self.proto.code[last], last)?;
-        let guard = p;
-        if body <= guard || body > hi || guard <= last {
+            eprintln!("DEBUG try_guard_chain: pc={} hi={} jumps={:?}", pc, hi, jumps);
             return None;
         }
-        // Every earlier jump must divert to the guard block (target == G).
-        for &j in &jumps[..jumps.len() - 1] {
-            if jump_target(self.proto.code[j], j) != Some(guard) {
+        eprintln!("DEBUG try_guard_chain: entering pattern detection, jumps={:?}", jumps);
+
+        // Compute guard (G) and body. Three patterns:
+        //   1. Simple consecutive: last jump -> BODY, earlier jumps -> G, no intervening code.
+        //      Produces: if not (a and b ...) then <G> end.
+        //   2. Effectful: ALL jumps -> G, intervening straight-line between jumps.
+        //   3. Mixed: last jump -> BODY, earlier jumps -> G, intervening straight-line.
+        //   Patterns 2 and 3 both produce flat sequential guards with effects between them.
+        let first = jumps[0];
+        let last = *jumps.last().unwrap();
+        let guard = jump_target(self.proto.code[first], first)?;
+        if guard <= first {
+            return None;
+        }
+        let last_taken = jump_target(self.proto.code[last], last)?;
+        // Detect intervening code between any pair of consecutive jumps.
+        let has_intervening = jumps.windows(2).any(|w| {
+            let a_len = Opcode::from_u8(insn_op(self.proto.code[w[0]]))
+                .map(|o| o.length().max(1))
+                .unwrap_or(1);
+            w[0] + a_len != w[1]
+        });
+        if last_taken != guard && !has_intervening {
+            // Simple pattern: last jump jumps over G to BODY.
+            if last_taken <= guard || last_taken > hi {
                 return None;
             }
-        }
-        // The guard block [G, BODY) must end in a terminator so control can't fall into BODY.
-        if !self.block_is_terminated(guard, body, loop_ctx) {
-            return None;
+            for &j in &jumps[..jumps.len() - 1] {
+                if jump_target(self.proto.code[j], j) != Some(guard) {
+                    return None;
+                }
+            }
+            if !self.block_is_terminated(guard, last_taken, loop_ctx) {
+                return None;
+            }
+            let body = last_taken;
+            self.flush_inline(stmts);
+            let mut conds: Vec<Expr> = Vec::new();
+            for (i, &j) in jumps.iter().enumerate() {
+                let op = Opcode::from_u8(insn_op(self.proto.code[j]))?;
+                if i + 1 == jumps.len() {
+                    conds.push(self.taken_condition(op, j));
+                } else {
+                    conds.push(self.fallthrough_condition(op, j));
+                }
+            }
+            let proceed = conds
+                .into_iter()
+                .reduce(|acc, c| Expr::Binary("and", Box::new(acc), Box::new(c)))?;
+            let guard_body = self.emit_body(guard, body, loop_ctx);
+            stmts.push(Stmt::If {
+                cond: Expr::Unary("not ", Box::new(proceed)),
+                then_body: guard_body,
+                else_body: Vec::new(),
+            });
+            return Some(body);
         }
 
-        // proceed-toward-body condition for each jump.
-        let mut conds: Vec<Expr> = Vec::new();
-        for (i, &j) in jumps.iter().enumerate() {
-            let op = Opcode::from_u8(insn_op(self.proto.code[j]))?;
-            if i + 1 == jumps.len() {
-                // last jump: taken edge goes to BODY, so proceed == taken condition.
-                conds.push(self.taken_condition(op, j));
-            } else {
-                // earlier jumps: taken edge goes to the guard, so proceed == fall-through.
-                conds.push(self.fallthrough_condition(op, j));
+        // Intervening-code pattern (effects between guard jumps): scan bytes between
+        // consecutive jumps to confirm the straight-line code is just evaluation.
+        for window in jumps.windows(2) {
+            let a = window[0];
+            let b = window[1];
+            let a_len = Opcode::from_u8(insn_op(self.proto.code[a]))?
+                .length().max(1);
+            let mut q = a + a_len;
+            while q < b {
+                let op = Opcode::from_u8(insn_op(self.proto.code[q]))?;
+                if self.op_breaks_chain(op) {
+                    return None;
+                }
+                q += op.length().max(1);
             }
         }
-        let proceed = conds
-            .into_iter()
-            .reduce(|acc, c| Expr::Binary("and", Box::new(acc), Box::new(c)))?;
+        // Determine guard block G and body based on jump target pattern.
+        let (guard, body) = if last_taken == guard {
+            // All jumps target G. Body starts after the guard block terminator.
+            for &j in &jumps {
+                if jump_target(self.proto.code[j], j) != Some(guard) {
+                    return None;
+                }
+            }
+            let gt = self.last_instr_before(guard, hi)?;
+            let gt_op = Opcode::from_u8(insn_op(self.proto.code[gt]))?;
+            let body_pc = gt + gt_op.length().max(1);
+            if body_pc > hi {
+                return None;
+            }
+            (guard, body_pc)
+        } else {
+            // Last jump targets BODY. Earlier jumps target G.
+            let body_pc = last_taken;
+            if body_pc <= guard || body_pc > hi {
+                return None;
+            }
+            for &j in &jumps[..jumps.len() - 1] {
+                if jump_target(self.proto.code[j], j) != Some(guard) {
+                    return None;
+                }
+            }
+            (guard, body_pc)
+        };
+        if !self.block_is_terminated(guard, body, loop_ctx) {
+            eprintln!("DEBUG try_guard_chain: block not terminated for guard={} body={}", guard, body);
+            return None;
+        }
+        eprintln!("DEBUG try_guard_chain: SUCCESS, guard={} body={}", guard, body);
 
+        // Emit flat sequential guards: `if not <cond> then <terminator> end`
+        // with intervening straight-line statements between them.
         self.flush_inline(stmts);
-        let guard_body = self.emit_body(guard, body, loop_ctx);
-        stmts.push(Stmt::If {
-            cond: Expr::Unary("not ", Box::new(proceed)),
-            then_body: guard_body,
-            else_body: Vec::new(),
-        });
+        let guard_stmts = self.collect_guard_body(guard, body, loop_ctx)?;
+        eprintln!("DEBUG: guard_stmts.len() = {}", guard_stmts.len());
+        // If the guard body has a single statement (a simple terminator), clone it into each
+        // guard clause. If it has multiple statements, the fallthrough from each guard's
+        // condition passes through to the next guard's condition test, so we need to emit
+        // the entire guard body after each guard's condition check. We handle this by
+        // emitting only the FIRST guard's condition check and letting the rest fall through,
+        // then emit the guard body at the end. This is only valid when all guards target
+        // the same block.
+        // For multi-statement guard bodies, we emit each guard's condition check only when
+        // it actually matters — which is for every guard that precedes another guard. The last
+        // guard's fall-through goes to the guard body, so we skip emitting a separate
+        // condition check for the last guard (its fall-through implicitly reaches G).
+        let guard_stmt = if guard_stmts.len() == 1 {
+            Some(guard_stmts.into_iter().next().unwrap())
+        } else {
+            None
+        };
+        for (i, &j) in jumps.iter().enumerate() {
+            let op = Opcode::from_u8(insn_op(self.proto.code[j]))?;
+            // The guard condition: under what condition does this jump divert to G?
+            // - If the jump targets G (guard block): taken -> G, so guard = taken condition.
+            // - If the jump targets BODY (last jump in mixed pattern): fall-through -> G,
+            //   so guard = fall-through condition.
+            let targets_guard = jump_target(self.proto.code[j], j) == Some(guard);
+            eprintln!("DEBUG COND: jump={} target={:?} guard={} targets_guard={}", j, jump_target(self.proto.code[j], j), guard, targets_guard);
+            let cond = if targets_guard {
+                self.taken_condition(op, j)
+            } else {
+                self.fallthrough_condition(op, j)
+            };
+            stmts.push(Stmt::If {
+                cond,
+                then_body: vec![guard_stmt.as_ref().unwrap().clone()],
+                else_body: Vec::new(),
+            });
+            if i + 1 < jumps.len() {
+                let next_j = jumps[i + 1];
+                let j_len = Opcode::from_u8(insn_op(self.proto.code[j]))?
+                    .length()
+                    .max(1);
+                let after_j = j + j_len;
+                if after_j != next_j {
+                    let inner = self.emit_body(after_j, next_j, loop_ctx);
+                    stmts.extend(inner);
+                }
+            }
+        }
+        Some(body)}
+    /// Whether `op` is something that cannot legally appear between two `and`-linked guard
+    /// jumps. The compiler only emits straight-line evaluation between such jumps.
+    fn op_breaks_chain(&self, op: Opcode) -> bool {
+        use Opcode::*;
+        matches!(
+            op,
+            JUMP
+                | JUMPBACK
+                | JUMPX
+                | JUMPIF
+                | JUMPIFNOT
+                | JUMPIFEQ
+                | JUMPIFLE
+                | JUMPIFLT
+                | JUMPIFNOTEQ
+                | JUMPIFNOTLE
+                | JUMPIFNOTLT
+                | JUMPXEQKNIL
+                | JUMPXEQKB
+                | JUMPXEQKN
+                | JUMPXEQKS
+                | RETURN
+                | FORNPREP
+                | FORNLOOP
+                | FORGPREP
+                | FORGPREP_INEXT
+                | FORGPREP_NEXT
+                | FORGLOOP
+                | CMPPROTO
+        )
+    }
+
+    /// Collect statements from [lo, hi) without consuming emit_range borrow.
+    fn collect_guard_body(
+        &mut self,
+        lo: usize,
+        hi: usize,
+        loop_ctx: Option<(usize, usize)>,
+    ) -> Option<Vec<Stmt>> {
+        let mut body = Vec::new();
+        let mut pending = None;
+        self.emit_range(lo, hi, &mut body, &mut pending, loop_ctx);
+        self.flush_inline(&mut body);
         Some(body)
     }
 
