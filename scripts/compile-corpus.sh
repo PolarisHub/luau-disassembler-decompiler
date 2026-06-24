@@ -15,12 +15,15 @@ cd "$(dirname "$0")/.."
 LUAU="./tools/luau-compile.exe"
 V7_FLAGS="--fflags=LuauEmitCallFeedback=false,LuauCompileUdataDirect=false,LuauIntegerType2=false"
 
-mkdir -p corpus/bytecode corpus/expected-text corpus/bytecode-v11
+mkdir -p corpus/bytecode corpus/expected-text corpus/bytecode-v11 corpus/bytecode-stripped
 
 for src in corpus/src/*.luau; do
 	name="$(basename "$src" .luau)"
 	"$LUAU" --binary -O1 -g2 $V7_FLAGS "$src" > "corpus/bytecode/$name.luauc"
 	"$LUAU" --text   -O1 -g2 $V7_FLAGS "$src" > "corpus/expected-text/$name.txt"
+	# Stripped (-g0): no local/upvalue names, so the decompiler must synthesize and the
+	# name-derivation heuristics get exercised.
+	"$LUAU" --binary -O1 -g0 $V7_FLAGS "$src" > "corpus/bytecode-stripped/$name.luauc"
 done
 
 # A single version-11 (default flags) sample so the reader is exercised on feedback vectors.

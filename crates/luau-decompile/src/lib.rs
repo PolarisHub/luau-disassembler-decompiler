@@ -17,10 +17,11 @@
 //!   until then the output reflects the real control flow rather than guessing.
 
 mod ast;
+mod naming;
 
 use std::collections::BTreeSet;
 
-use ast::{render_block, render_expr, Expr, Stmt, TableField};
+use ast::{render_block, render_expr, Expr, Stmt};
 use luau_bytecode::opcode::*;
 use luau_bytecode::{Constant, Module, Proto, StringRef};
 use luau_disasm::{compute_labels, render_constant_at};
@@ -73,7 +74,7 @@ pub fn decompile(module: &Module) -> Decompiled {
 fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoReport>) -> String {
     let proto = &module.protos[proto_idx];
     let mut d = Decompiler::new(module, proto, proto_idx);
-    let stmts = d.run();
+    let mut stmts = d.run();
 
     reports.push(ProtoReport {
         index: proto_idx,
@@ -82,12 +83,29 @@ fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoRep
         notes: d.notes.clone(),
     });
 
+    // Fold register-reuse field/method chains (x = a.b; x = x.c -> x = a.b.c) before naming,
+    // so a variable is named from its final, complete expression.
+    naming::fold_refinements(&mut stmts);
+
+    // The names for materialized, hoisted locals (debug names where unambiguous, else vN).
+    let mut hoist_names: Vec<String> = d.hoisted.iter().map(|&r| d.reg_name(r)).collect();
+
+    // Smart-rename synthesized locals from the expressions they hold (require -> module,
+    // GetService -> service, etc.). Renaming a local is always semantics-preserving, so this
+    // runs after reconstruction and rewrites the AST consistently.
+    let rename = naming::smart_rename(&stmts, &hoist_names);
+    naming::apply_rename(&mut stmts, &rename);
+    for n in hoist_names.iter_mut() {
+        if let Some(new) = rename.get(n) {
+            *n = new.clone();
+        }
+    }
+
     // Hoist all materialized non-parameter locals so every assignment has a declaration in
     // scope regardless of how control flow nests.
     let mut out = String::new();
-    if !d.hoisted.is_empty() {
-        let names: Vec<String> = d.hoisted.iter().map(|&r| d.reg_name(r)).collect();
-        out.push_str(&format!("local {}\n", names.join(", ")));
+    if !hoist_names.is_empty() {
+        out.push_str(&format!("local {}\n", hoist_names.join(", ")));
     }
     out.push_str(&render_block(&stmts, 0));
     out
@@ -145,6 +163,12 @@ impl<'a> Decompiler<'a> {
             self.step(op, pc, &mut stmts, &mut pending_namecall);
             pc += len;
         }
+
+        // Drop labels nothing jumps to. Many jump targets (notably the FASTCALL skip-over)
+        // never produce a goto in the reconstruction, and a dangling `::label::` is not even
+        // valid Luau, so emitting it would wrongly break otherwise-clean output.
+        let referenced = collect_goto_targets(&stmts);
+        stmts.retain(|s| !matches!(s, Stmt::Label(n) if !referenced.contains(n)));
         stmts
     }
 
@@ -376,7 +400,16 @@ impl<'a> Decompiler<'a> {
     fn const_expr(&self, k: usize) -> Expr {
         let text = render_constant_at(self.module, self.proto, k);
         match self.proto.constants.get(k) {
-            Some(Constant::String(_)) => Expr::Str(text),
+            // Use a lossless, fully-escaped literal — the disassembler's renderer truncates
+            // long strings, which would corrupt decompiled output.
+            Some(Constant::String(sref)) => {
+                let lit = sref
+                    .index()
+                    .and_then(|i| self.module.string_bytes(i))
+                    .map(naming::lua_string_literal)
+                    .unwrap_or_else(|| "\"\"".to_string());
+                Expr::Str(lit)
+            }
             Some(Constant::Number(_)) | Some(Constant::Integer(_)) => Expr::Num(text),
             Some(Constant::Boolean(v)) => Expr::Bool(*v),
             Some(Constant::Nil) => Expr::Nil,
@@ -393,12 +426,17 @@ impl<'a> Decompiler<'a> {
         if is_identifier(&key) {
             Expr::Field(Box::new(table), key)
         } else {
-            Expr::Index(Box::new(table), Box::new(Expr::Str(format!("{key:?}"))))
+            let lit = naming::lua_string_literal(key.as_bytes());
+            Expr::Index(Box::new(table), Box::new(Expr::Str(lit)))
         }
     }
 
     fn binop_rr(&self, op: Opcode, b: u8, c: u8) -> Expr {
-        Expr::Binary(bin_op_text(op), Box::new(self.reg(b)), Box::new(self.reg(c)))
+        Expr::Binary(
+            bin_op_text(op),
+            Box::new(self.reg(b)),
+            Box::new(self.reg(c)),
+        )
     }
     fn binop_rk(&self, op: Opcode, b: u8, c: u8) -> Expr {
         Expr::Binary(
@@ -522,7 +560,7 @@ impl<'a> Decompiler<'a> {
         };
 
         if nresults == 0 {
-            stmts.push(Stmt::ExprStmt(call_expr));
+            stmts.push(Stmt::Call(call_expr));
         } else if nresults == 1 {
             self.assign(a, call_expr, stmts);
         } else {
@@ -669,6 +707,36 @@ impl<'a> Decompiler<'a> {
         }
         let _ = self.proto_idx;
     }
+}
+
+/// Collect the set of label names that some emitted `goto` targets, recursing into nested
+/// statement bodies (the conditional-goto fallback puts a goto inside an `if`).
+fn collect_goto_targets(stmts: &[Stmt]) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
+    fn walk(stmts: &[Stmt], set: &mut BTreeSet<String>) {
+        for s in stmts {
+            match s {
+                Stmt::Goto(n) => {
+                    set.insert(n.clone());
+                }
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    walk(then_body, set);
+                    walk(else_body, set);
+                }
+                Stmt::While { body, .. }
+                | Stmt::Repeat { body, .. }
+                | Stmt::NumericFor { body, .. }
+                | Stmt::GenericFor { body, .. } => walk(body, set),
+                _ => {}
+            }
+        }
+    }
+    walk(stmts, &mut set);
+    set
 }
 
 fn bin_op_text(op: Opcode) -> &'static str {

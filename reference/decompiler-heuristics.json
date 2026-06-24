@@ -1,0 +1,276 @@
+{
+  "name_derivation_rules": [
+    {
+      "match": "value == Call(callee, [arg]) where render(callee) is exactly \"require\" OR ends in \".require\". Derive MODULE TAIL from arg: if arg is Str, strip quotes, split on '/' '.' '\\\\', drop trailing .lua/.luau, take last non-empty component; if arg is Var(dotted import path), take last dotted segment; if arg is a chain of MethodCall(_,\"WaitForChild\"|\"FindFirstChild\",[Str(child)]) / Field(_,name) / Index(_,Str(name)), take the LAST string-literal child/field, dropping leading 'script'/'Parent' segments. If the chosen tail is in the GENERIC denylist {init,index,main,module,src,shared,client,server,new,get} OR a single letter, walk to the immediately-preceding path segment instead; if all generic, no-name.",
+      "name": "module tail (last meaningful path segment of the require target)",
+      "example": "require(game.ReplicatedStorage.Modules.Inventory) -> Inventory ; require(\"Shared/Config.lua\") -> Config ; require(script.Parent.Net) -> Net ; require(rs:WaitForChild(\"Modules\"):WaitForChild(\"Combat\")) -> Combat ; require(path.Inventory.init) -> Inventory"
+    },
+    {
+      "match": "value == Field(require-call, member) OR Index(require-call, Str(member)) where require-call matches the rule above and member is identifier-safe. Compute moduleTail per above; join moduleTail + \"_\" + member, capped to ONE member segment. If a second access level exists (Field(Field(require-call,a),b)), join at most the last 2 accessor segments, dropping generic accessors. If combined name > 40 chars, fall back to just `member`. If moduleTail cannot be derived, use just `member`.",
+      "name": "moduleTail_member (combine module name with the accessed member)",
+      "example": "require(path.Net).Send -> Net_Send ; require(path.Net).Client.Send -> Client_Send (Net generic-dropped) ; require(path.Utils).format -> Utils_format"
+    },
+    {
+      "match": "value == Call(Field(require-call, ctor), _) OR MethodCall(require-call, ctor, _) where ctor in {new,create,init,Create,New}. Compute moduleTail; lowercase its first letter to read as an instance. Do NOT lowercase if result is a Luau keyword.",
+      "name": "lowerCamel(moduleTail) (an instance of the required class)",
+      "example": "require(path.Inventory).new(player) -> inventory ; Account.new(100) -> account"
+    },
+    {
+      "match": "value == MethodCall(recv, \"GetService\"|\"FindService\", [Str(svc)]) where render(recv) is \"game\" or resolves to the DataModel/a local already named game/DataModel, and svc is a string literal that is identifier-safe.",
+      "name": "svc (the service name verbatim)",
+      "example": "game:GetService(\"Players\") -> Players ; game:GetService(\"ReplicatedStorage\") -> ReplicatedStorage ; game:GetService(\"RunService\") -> RunService"
+    },
+    {
+      "match": "value == Call(Field(Var(\"Instance\"),\"new\")|Var(\"Instance.new\"), [Str(class), ..]) where class is a string literal that is identifier-safe.",
+      "name": "lowerCamelFirst(class) (lowercase only the first letter of the ClassName)",
+      "example": "Instance.new(\"Part\") -> part ; Instance.new(\"RemoteEvent\") -> remoteEvent ; Instance.new(\"ScreenGui\") -> screenGui"
+    },
+    {
+      "match": "value == MethodCall(obj, m, [Str(child), ..]) where m in {WaitForChild, FindFirstChild, FindFirstAncestor} and child is a string literal that is identifier-safe (no spaces/punctuation). Keep child's case verbatim.",
+      "name": "child (the literal child name)",
+      "example": "character:WaitForChild(\"Humanoid\") -> Humanoid ; ReplicatedStorage.Remotes:WaitForChild(\"BuyItem\") -> BuyItem"
+    },
+    {
+      "match": "value == MethodCall(obj, m, [Str(class), ..]) where m in {FindFirstChildOfClass, FindFirstChildWhichIsA, FindFirstAncestorOfClass} and class is identifier-safe.",
+      "name": "lowerCamelFirst(class) (the asserted class as an instance)",
+      "example": "character:FindFirstChildOfClass(\"Humanoid\") -> humanoid ; FindFirstChildWhichIsA(\"BasePart\") -> basePart"
+    },
+    {
+      "match": "value == Field(svc,\"LocalPlayer\") OR Index(svc,Str(\"LocalPlayer\")) OR a Var path ending in \".LocalPlayer\" where svc resolves to Players. Fixed conventional name.",
+      "name": "localPlayer (fixed)",
+      "example": "Players.LocalPlayer -> localPlayer"
+    },
+    {
+      "match": "value == Index(Var(\"_G\")|Var(\"shared\"), Str(key)) OR Field(Var(\"_G\")|Var(\"shared\"), key) where key is identifier-safe. (Do not rewrite the _G/shared access itself.)",
+      "name": "key (the _G/shared key)",
+      "example": "_G[\"PlayerData\"] -> PlayerData ; shared.Config -> Config"
+    },
+    {
+      "match": "value == MethodCall(obj, m, []) where m matches /^Get([A-Z]\\w+)$/ and the captured remainder is PLURAL (ends in 's'). Use the remainder, lowercasing its first letter. Special-case GetPlayers->players, GetChildren->children, GetDescendants->descendants.",
+      "name": "lowerCamelFirst(remainder-after-Get) (plural collection)",
+      "example": "folder:GetChildren() -> children ; Players:GetPlayers() -> players ; workspace:GetDescendants() -> descendants"
+    },
+    {
+      "match": "value == MethodCall(obj,\"IsA\",[Str(class)]) OR Call/MethodCall whose name matches /^Is([A-Z]\\w+)$/. For IsA use \"is\"+class; otherwise keep the Is-name (lowerCamelFirst).",
+      "name": "is<Class> / lowerCamelFirst(IsName) (boolean)",
+      "example": "part:IsA(\"BasePart\") -> isBasePart ; obj:IsDescendantOf(x) -> isDescendantOf"
+    },
+    {
+      "match": "value == Binary(\"~=\"|\"==\", e, Nil) used as a boolean local, OR Call/MethodCall whose name matches /^Has([A-Z]\\w+)$/. For the nil-check, derive base noun from e's trailing field/child/call name and prefix \"has\". For Has-name keep it (lowerCamelFirst).",
+      "name": "has<Base> (existence boolean)",
+      "example": "model:FindFirstChild(\"Seat\") ~= nil -> hasSeat ; obj:HasTag(\"x\") -> hasTag"
+    },
+    {
+      "match": "value == Call(Field(base,\"new\")|MethodCall(base,\"new\",..)) where base renders to a Roblox datatype path: Instance handled above; Vector3/Vector2->vector (or position when later assigned to a .Position/.CFrame field), CFrame->cframe, Color3->color, UDim2->udim2, UDim->udim, TweenInfo->tweenInfo, BrickColor->brickColor, Ray->ray, Region3->region3, Rect->rect, Random->random, NumberSequence/ColorSequence->sequence. For TweenService:Create(..) -> tween.",
+      "name": "fixed datatype value name",
+      "example": "Vector3.new(0,5,0) -> vector ; CFrame.new(p) -> cframe ; Color3.fromRGB(...) -> color ; TweenInfo.new(...) -> tweenInfo ; TweenService:Create(part,info,goals) -> tween"
+    },
+    {
+      "match": "value == MethodCall(remote, m, _) where m in {InvokeServer, InvokeClient}. (NOT FireServer/FireClient/FireAllClients \u2014 those return nothing.) Fixed.",
+      "name": "result (remote invoke return)",
+      "example": "shopRemote:InvokeServer() -> result"
+    },
+    {
+      "match": "value == MethodCall(signal, m, [closure]) where m in {Connect, ConnectParallel, Once}. Derive eventBase from signal's trailing field name; name = lowerCamelFirst(eventBase)+\"Connection\". If event name not recoverable -> \"connection\".",
+      "name": "<event>Connection (signal connection handle)",
+      "example": "part.Touched:Connect(fn) -> touchedConnection ; RunService.Heartbeat:Connect(fn) -> heartbeatConnection"
+    },
+    {
+      "match": "Assign with MULTIPLE targets whose single value is Call(pcall|xpcall, _). First target -> \"ok\", second -> \"result\".",
+      "name": "ok, result (pcall pair)",
+      "example": "local v1,v2 = pcall(loadData) -> local ok, result = pcall(loadData)"
+    },
+    {
+      "match": "value == Call(callee,[arg]) where render(callee) in {tostring,tonumber,typeof,type}. If arg has a derivable base noun b: tostring->b+\"Str\", tonumber->b+\"Num\", typeof/type->b+\"Type\"; else generic str/num/typeName.",
+      "name": "<base>Str / <base>Num / <base>Type (conversion)",
+      "example": "tostring(score) -> scoreStr ; tonumber(text) -> textNum ; typeof(value) -> valueType"
+    },
+    {
+      "match": "value == Unary(\"#\", inner). If inner has a plural base noun, singularize+\"Count\"; else \"count\".",
+      "name": "<singular>Count (length)",
+      "example": "#players -> playerCount ; #t -> count"
+    },
+    {
+      "match": "value == Call(callee, args) where render(callee) is a dotted math path. math.clamp(x,..)->base(arg0)+\"Clamped\"; math.floor/ceil/round(x)->base(x) (de-dup mandatory); math.random->\"random\"; math.max->\"max\"; math.min->\"min\"; math.sqrt(x)->base(x)+\"Sqrt\"; math.abs(x)->base(x).",
+      "name": "math-derived name",
+      "example": "math.clamp(damage,0,100) -> damageClamped ; math.random(1,6) -> random ; math.floor(speed) -> speed"
+    },
+    {
+      "match": "value == Call(callee,_) where render(callee) in {task.wait,wait}->\"dt\"; {tick,os.clock,os.time,DateTime.now}->\"now\"; {task.spawn,task.defer,coroutine.create}->\"thread\".",
+      "name": "fixed time/thread name",
+      "example": "tick() -> now ; task.wait(0.1) -> dt ; coroutine.create(fn) -> thread"
+    },
+    {
+      "match": "value == Call(callee,[arg,..]) where render(callee) in {loadstring,load}. Fixed.",
+      "name": "loaded (loaded chunk)",
+      "example": "loadstring(src) -> loaded"
+    },
+    {
+      "match": "value == MethodCall(strExpr, m, _) OR Call(string.m,_) where m in {split->\"parts\", match/find->\"match\", format->\"text\", gmatch->\"iter\", sub/rep/upper/lower-> base(strExpr) or \"text\"}.",
+      "name": "string-lib result name",
+      "example": "data:split(\",\") -> parts ; string.format(...) -> text"
+    },
+    {
+      "match": "value == Call(callee,_) where callee resolves to a plain identifier funcName not matched above, and funcName has a leading verb in {get,make,create,build,new,fetch,load,spawn,clone}. Strip the verb, lowerCamelFirst the remainder. If remainder empty/keyword, use funcName itself.",
+      "name": "lowerCamelFirst(funcName minus leading verb)",
+      "example": "createHitbox(size) -> hitbox ; spawnEnemy() -> enemy ; fetchData() -> data"
+    },
+    {
+      "match": "value == Field(base, fname) OR Index(base, Str(fname)) (a plain property/field read) not matched above, fname identifier-safe. Use last segment only; lowerCamelFirst. If last segment is generic {Value,Name,Parent} and a parent segment exists, join parent_last (e.g. config_value).",
+      "name": "lowerCamelFirst(trailing field name)",
+      "example": "player.Character -> character ; config.MaxHealth -> maxHealth ; player.Character.Humanoid -> humanoid"
+    },
+    {
+      "match": "value == Index(base, Num(_)) where base has a plural base noun b. Singularize b; if not plural, base+\"Item\" or \"item\".",
+      "name": "singular(base) (element of an array)",
+      "example": "players[1] -> player ; parts[i] -> part"
+    },
+    {
+      "match": "value == Binary(\"or\", primary, fallback) used as a defaulted value. Derive base noun from primary's trailing field/call name.",
+      "name": "base-noun of primary operand (defaulted value)",
+      "example": "config.WalkSpeed or 16 -> walkSpeed ; player.Team or default -> team"
+    },
+    {
+      "match": "value == Vararg OR Call(Field(Var(\"table\"),\"pack\"),[Vararg]). Fixed.",
+      "name": "args (packed varargs)",
+      "example": "local v = ... -> local args = ... ; table.pack(...) -> args"
+    },
+    {
+      "match": "value == Call(Field(Var(\"table\"),\"remove\"),_)->\"removed\"; Call(Field(Var(\"table\"),\"find\"),_)->\"index\". (NOT table.insert \u2014 no meaningful return.)",
+      "name": "removed / index (table mutation result)",
+      "example": "table.remove(queue,1) -> removed ; table.find(list,x) -> index"
+    },
+    {
+      "match": "value == Binary(\"..\", _, _) chain with >=1 Str literal operand. Use \"text\" by default; \"message\" if a string operand contains a space; \"name\" if all operands are short identifier-like tokens.",
+      "name": "text / message / name (concatenation)",
+      "example": "\"Hello, \"..playerName -> text"
+    }
+  ],
+  "ordered_plan": [
+    {
+      "id": "P0-string-literal-correctness",
+      "rule": "Stop using luau-disasm render_constant_at / render_string for Expr::Str in the decompiler. Add a decompiler-local full-string renderer that emits the COMPLETE bytes, escapes backslash, the chosen quote char, and all control bytes (\\n,\\t,\\xNN), and uses double quotes (or [[...]] for strings with embedded quotes/newlines). Apply in const_expr's Constant::String arm and anywhere a string is materialized.",
+      "pipeline_stage": "printing",
+      "impl_note": "crates/luau-decompile/src/lib.rs const_expr() currently calls render_constant_at which truncates to 32 chars with a trailing ' ...' and single-quotes (verified in luau-disasm/src/constant.rs render_string). That output is WRONG/unparseable source. This is the single highest-impact correctness fix; do it before any cosmetic work.",
+      "priority": "high"
+    },
+    {
+      "id": "P1-keyword-and-identifier-sanitize",
+      "rule": "Add a finalize_name(candidate) gate: (1) strip chars outside [A-Za-z0-9_], collapsing runs to '_'; (2) if it starts with a digit, prefix '_'; (3) if empty after sanitizing, return None (caller keeps synthesized v#/p#); (4) if it equals a Luau reserved word, append '_'. Reserved set: and break do else elseif end false for function if in local nil not or repeat return then true until while (avoid 'continue' too). Route ALL names through this: reg_name, unique_debug_name, upval_name, AND every value-derived candidate. Also force bracket form t[\"end\"] when a field key is reserved (in field()).",
+      "pipeline_stage": "name-derivation",
+      "impl_note": "is_identifier() in lib.rs (line 732) does NOT reject keywords, so a debug local literally named `end`/`function` currently produces non-parsing output. Filter in unique_debug_name/upval_name must add the keyword check. Field-key reserved-word -> bracket form is a correctness fix in field().",
+      "priority": "high"
+    },
+    {
+      "id": "P2-name-derivation-fn",
+      "rule": "Implement derive_name(expr, ctx) -> Option<String> as a first-match-wins match over the name_derivation_rules list (in that order: require family first, then GetService, Instance.new, WaitForChild, datatype constructors, boolean/getter idioms, then generic field/index/call fallbacks). Returns a pre-sanitize candidate; caller runs finalize_name then dedup.",
+      "pipeline_stage": "name-derivation",
+      "impl_note": "Call site: in assign()/emit_call() when materializing register r, BEFORE choosing reg_name, attempt derive_name(value). Only use it when r has NO unique debug name (debug name always wins). Store the chosen name in a per-register override map keyed by reg so reg() reads it back consistently.",
+      "priority": "high"
+    },
+    {
+      "id": "P3-single-definition-guard",
+      "rule": "Only apply a value-derived name to a register that has exactly ONE definition in the proto (SSA-like). If a register is assigned in more than one place to unrelated values, keep the synthesized name. Never let derive_name fire on multi-def registers.",
+      "pipeline_stage": "name-derivation",
+      "impl_note": "Pre-scan the proto's instructions to count writes per register (every assign()/multi-result target/loop var). Build a set of single-def registers. derive_name only consulted for those. This is what makes 'consistent rename' safe given there is currently no real liveness/SSA.",
+      "priority": "high"
+    },
+    {
+      "id": "P4-dedup-pass",
+      "rule": "After all names are chosen per scope, run a dedup pass: walk in declaration order, keep a set of taken names (params, upvalue names, derived locals, loop vars, plus resolved global/import leading segments referenced as bare Var in scope). On collision append smallest free numeric suffix (Players, Players2). Apply the final name to every Expr::Var occurrence of that register consistently. Never merge two distinct registers to one name.",
+      "pipeline_stage": "name-derivation",
+      "impl_note": "There is currently NO dedup. Because each proto is decompiled independently and hoisted as one `local a,b,c` line (decompile_proto), dedup is per-proto scope. Must run as the final naming step, after debug-name resolution and derive_name.",
+      "priority": "high"
+    },
+    {
+      "id": "P5-loop-var-naming",
+      "rule": "When structuring produces NumericFor/GenericFor with synthesized vars: NumericFor -> i/j/k/l by lexical nesting depth. GenericFor over pairs -> (key,value); over ipairs -> (index,value); over next,t -> (key,value); over :GetChildren()/:GetDescendants() -> (index|_, child)/(descendant); :GetPlayers() -> (index, player); :GetEnumItems() -> (index, enumItem). If the iterated collection is a simple plural path, optionally singularize the value name. Only when vars are synthesized; debug names win; dedup mandatory.",
+      "pipeline_stage": "name-derivation",
+      "impl_note": "Depends on generic-for structuring existing (currently FORGPREP/FORGLOOP emit comment+goto). Wire after P10. Do NOT alter the iterator exprs (next,t triple is semantic).",
+      "priority": "medium"
+    },
+    {
+      "id": "P6-self-and-method-sugar",
+      "rule": "When a closure is assigned via SETTABLEKS to tbl.Method and the child's R0 debug name is `self` OR R0 is only ever used as receiver (R0.f / R0:m() / R0[k]), emit `function tbl:Method(rest) ... end` and name R0 `self`. Otherwise if target is a plain field path, emit `function tbl.Method(params) ... end`. Keep `tbl.Method = function(...)` for computed-key targets.",
+      "pipeline_stage": "printing",
+      "impl_note": "Requires recognizing the SETTABLEKS-of-closure pattern in step() and a new method-def AST form or a Closure rendered with the sugar. Also OnServerEvent/OnServerInvoke first closure param -> `player`; Touched->hit; PlayerAdded->player; CharacterAdded->character; ChildAdded->child; Heartbeat/Stepped/RenderStepped->deltaTime. Param renames are always safe (positional).",
+      "priority": "medium"
+    },
+    {
+      "id": "P7-table-literal-folding",
+      "rule": "Fold NEWTABLE/DUPTABLE followed by a contiguous run of SETLIST (array, index from 1) and/or SETTABLEKS/SETTABLEN writes whose table operand is R(A) into a single Expr::Table with Item/Named/Keyed fields in emission order. Only fold while R(A) is not read, not overwritten, not captured, and not escaped (passed to a call/returned) between the NEWTABLE and the last fold-able write.",
+      "pipeline_stage": "ast-cleanup",
+      "impl_note": "Currently NEWTABLE emits Expr::Table(empty) and each SETLIST/SETTABLEKS emits a separate Assign. Implement as a peephole over the emitted Stmt stream or during step() with a lookahead. Leading contiguous-from-1 numeric keys become positional Items; gaps stay Keyed; multret SETLIST (C==0) must NOT fold.",
+      "priority": "medium"
+    },
+    {
+      "id": "P8-method-vs-dot-fidelity",
+      "rule": "Render `obj:Method(args)` (MethodCall) ONLY when it came from a real NAMECALL where the self arg equals the receiver table textually. If a field was fetched then called with an explicit first arg that is NOT the receiver, render obj.Method(selfExpr, args). Never fabricate `:` for a `.`-call.",
+      "pipeline_stage": "printing",
+      "impl_note": "emit_call already reconstructs MethodCall only from pending_namecall with reg==a; keep that invariant. Just ensure no later transform converts dot-call into method-call.",
+      "priority": "medium"
+    },
+    {
+      "id": "P9-vararg-multret-fidelity",
+      "rule": "Preserve true arity. When a CALL forwards the open vararg/multret range (b==0/c==0 on the producing op), emit `...` as the final argument and `return f(...)` for multret tail returns, instead of the current --[[...]] placeholder. Only emit `...` when the bytecode truly passes the open range; otherwise keep an explicit `-- arity approximated` comment. Never guess a fixed arity.",
+      "pipeline_stage": "ast-cleanup",
+      "impl_note": "emit_call currently pushes Expr::Raw(\"--[[...]]\") for nargs<0 and RETURN approximates multret as a single value. Replace the placeholder with Expr::Vararg when the last arg is the multret source; gate strictly on the multret flag.",
+      "priority": "medium"
+    },
+    {
+      "id": "P10-native-structuring",
+      "rule": "Wire luau-ir CFG/dominators to recover: NumericFor (FORNPREP/FORNLOOP canonical pair, single back edge), GenericFor (FORGPREP/FORGPREP_NEXT->pairs, FORGPREP_INEXT->ipairs, else raw gen,state,ctrl), while (pre-test header, false edge is unique exit), repeat (post-test latch), and if/elseif/else from JUMPIF structuring. Replace goto/label fallback only when the region is the exact canonical shape with a single back edge / unique exit; otherwise keep the goto fallback and partial flag.",
+      "pipeline_stage": "structuring",
+      "impl_note": "This is the big semantic piece; the AST variants (While/Repeat/NumericFor/GenericFor/If) already exist and are printer-tested. FORGPREP_NEXT/INEXT map to pairs/ipairs ONLY if the generator register holds the corresponding builtin; never guess for a user generator. Each non-canonical region stays goto.",
+      "priority": "high"
+    },
+    {
+      "id": "P11-cond-normalization",
+      "rule": "After structuring, normalize conditions in COND POSITION ONLY (if/while/repeat/until): not(a==b)->a~=b and not(a~=b)->a==b (always safe); ordering flips not(a<b)->a>=b etc ONLY when both operands are provably numeric; not not e -> e only in pure boolean cond context; collapse `else { single If }` into elseif (already partially in render_stmt); swap empty-then/non-empty-else by negating the cond.",
+      "pipeline_stage": "ast-cleanup",
+      "impl_note": "render_stmt already collapses else-if. Equality flip always safe; gate ordering flips on numeric provability (Num literals/#/arith). These transforms must NOT run when the value is returned/stored/passed (not a cond).",
+      "priority": "medium"
+    },
+    {
+      "id": "P12-goto-to-break-continue",
+      "rule": "Within a structured loop, convert if{then:[Goto L]} / bare Goto L to Break when L is the loop's unique post-exit block, or to `continue` when L is the loop's continue/latch point AND the label sits at the very end of the loop body AND no local declared between the goto and label is read after the label. Otherwise keep the goto. Also delete a Goto L immediately followed by Label L (no-op) and drop the now-unreferenced label.",
+      "pipeline_stage": "structuring",
+      "impl_note": "Needs CFG to identify the unique exit/latch of the innermost enclosing loop. break only exits one level; if the goto leaves multiple loop levels keep it. continue has Luau scoping restrictions on locals jumped over. The no-op goto-to-next-label deletion is always safe (collect_goto_targets already prunes unreferenced labels).",
+      "priority": "medium"
+    },
+    {
+      "id": "P13-early-return-and-temp-cleanup",
+      "rule": "Apply guarded readability cleanups: (a) `local t = e; return t` -> `return e` when t is single-use, not captured, and arity-preserving; (b) inline a single-use temp into its very next use ONLY across pure leaves (no intervening side-effect/write); (c) guard clause flattening `if C then <rest> else return end` -> `if not C then return end <rest>` only when else is a bare return and nothing follows the if; (d) `if cond then return true else return false end` -> `return cond` only when cond's top node is already a comparison/not.",
+      "pipeline_stage": "ast-cleanup",
+      "impl_note": "These are the dangerous ones. Default to NOT collapsing across any Call/MethodCall/SET*/global/upvalue access. Treat any Index/Field on a non-local as potentially effectful (__index). The anti-pattern guards in pitfalls MUST block these when conditions aren't met.",
+      "priority": "low"
+    },
+    {
+      "id": "P14-honesty-comments",
+      "rule": "Emit a per-proto confidence banner derived strictly from collected notes/partial flag (low when goto fallback/unhandled ops/multret approximations present; high when fully structured with debug names). Attach inline `--[[ arity approximated ]]` / `--[[ name ambiguous ]]` comments at the exact uncertain site. Comments only; never change code; keep brackets balanced.",
+      "pipeline_stage": "printing",
+      "impl_note": "ProtoReport already tracks partial+notes (lib.rs). This is pure-cosmetic and always safe; do it last.",
+      "priority": "low"
+    }
+  ],
+  "pitfalls": [
+    "Never rename anything that is not a true local/param/loop-var/upvalue-declaration. Do NOT rename SETGLOBAL/GETGLOBAL targets, resolved import paths (Var(\"game.Players\")), table field names, method names, or constant string contents \u2014 those are different bindings and renaming changes semantics.",
+    "Never apply a value-derived name to a register that has more than one definition (multiple unrelated assignments). A single derived name across distinct values is misleading and can collide with its own later meaning. Keep the synthesized name for multi-def registers.",
+    "Never merge two distinct registers/live-ranges into one variable name (no CSE via naming). On any name collision within overlapping scope, suffix; when live-range info is unavailable, treat all in-scope names as overlapping and always suffix.",
+    "Never emit the truncated 32-char `'...'` string form (render_constant_at) in decompiled output \u2014 it is wrong, lossy, and unparseable. Always emit the full, correctly-escaped string with a quote style that matches the contents.",
+    "Never emit a local/param/field name equal to a Luau keyword (and/break/do/else/elseif/end/false/for/function/if/in/local/nil/not/or/repeat/return/then/true/until/while). Suffix locals with '_'; force bracket form t[\"end\"] for reserved field keys.",
+    "Never inline/substitute an expression that reads a register/global/field which is WRITTEN (SET*/assign/call) between its definition and the use site \u2014 that produces a stale-value read. When write/alias analysis is uncertain, assume a conflict and keep the named temp.",
+    "Never reorder, merge, or eliminate two effectful expressions in a way that changes observable evaluation order. Treat every Call/MethodCall, any Index/Field on a non-local (possible __index metamethod), and any global/upvalue read as effectful. Only pure leaves (Nil/Bool/Num/Str/Vector/Vararg/Var-of-local) may be reordered.",
+    "Never inline or eliminate a register that is captured by a child closure (CAPTURE/NEWCLOSURE upvalue, especially REF captures). The closure shares the variable's identity; duplicating its value breaks shared-upvalue mutation. The named local must survive.",
+    "Never rewrite `and`/`or` expressions into control flow or fold `x and true or false`-style idioms \u2014 Luau and/or short-circuit and return operands (not booleans). Do not assume operands are boolean; do not reorder or drop operands.",
+    "Never apply ordering-comparison negation (not(a<b)->a>=b, etc.) unless both operands are provably numeric \u2014 NaN breaks the equivalence. Equality flips (==/~=) are always safe; ordering flips are not.",
+    "Never convert a goto to `break` unless its target is the unique exit of the innermost enclosing loop, nor to `continue` unless the target is that loop's latch with the label at the loop-body end and no in-scope local is jumped over and later read. break only exits one level.",
+    "Never apply De Morgan / not-not elimination outside a pure boolean cond position (if/while/repeat/until). When the value is returned, stored, or passed as an argument, `not not x` is a deliberate boolean cast and the simplification changes the value/type.",
+    "Never change call/return arity: only emit `...` for an open vararg/multret range when the producing op truly passes the open range (b==0/c==0). Guessing a fixed arity for a multret site is a semantic bug; prefer an explicit comment when arity is unrecoverable.",
+    "Never convert a dot-call obj.m(self, args) into a method call obj:m(args) unless the first argument is textually identical to the receiver table; and never drop the self argument when it is not the receiver. Conversely never fabricate a `:` for a real `.`-call.",
+    "Never fold NEWTABLE+SET* into a table literal if R(A) is read, overwritten, captured, or escapes (passed to a call/returned) between creation and the folded writes, or if any SETLIST is multret (C==0); the partially-built table could be observed.",
+    "Never drop a LOADNIL/LOADB or a `local x` declaration as dead unless the next write provably dominates all reads on every control-flow path and the register is not captured before assignment; with goto/partial control flow, be conservative and keep it.",
+    "Never hoist a loop-invariant statement out of a loop (e.g. game:GetService inside a for) \u2014 that is semantic reordering and changes timing/side-effect placement. Naming the local is fine; moving the statement is not."
+  ],
+  "summary": "I merged the six expert catalogs into one design grounded in the actual code (crates/luau-decompile/src/lib.rs and ast.rs). The core deliverable is an ordered, first-match-wins derive_name(expr) function: Roblox-idiom rules fire first (require-tail, require.member, require().new, GetService, Instance.new, WaitForChild/FindFirstChild*, LocalPlayer, _G/shared, datatype constructors, signal connections, pcall pair, Get*-plural collections, Is/Has/length/conversion idioms) before generic field/index/call/concat/default-or fallbacks. Every candidate passes through a mandatory finalize_name gate (sanitize -> keyword-guard -> per-scope dedup) and is only applied to single-definition true locals, never globals/fields/methods/imports. I de-duplicated heavily overlapping rules from all six experts (require-module-name, getservice, instance.new, waitforchild, loop vars each appeared 3-6 times) and resolved the priority conflicts so specific Roblox rules win over generic ones. Two real correctness BUGS surfaced from reading the code: (1) Expr::Str goes through luau-disasm render_constant_at which truncates strings to 32 chars with a trailing '...' and single-quotes them \u2014 that is wrong, unparseable source and must be replaced with a full escaped renderer (P0, highest priority); (2) is_identifier() does not reject Luau keywords, so a debug local named `end`/`function` emits non-parsing code (P1). The ordered_plan sequences: correctness fixes first, then the naming pipeline (derive/single-def/dedup), then param/self/method sugar and table folding, then native structuring via luau-ir (replacing the goto fallback only for exact canonical CFG shapes), then guarded cond-normalization and temp/early-return cleanups, then honesty comments. The pitfalls list captures every transform that could emit semantically wrong code \u2014 the anti-pattern guards from the readability-and-safety expert are treated as hard invariants, not suggestions."
+}
