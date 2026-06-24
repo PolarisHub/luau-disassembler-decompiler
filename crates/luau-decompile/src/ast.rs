@@ -281,7 +281,16 @@ pub fn render_expr(e: &Expr) -> String {
                 format!("{op}{}", paren(a))
             }
         }
-        Expr::Binary(op, a, b) => format!("{} {op} {}", paren(a), paren(b)),
+        Expr::Binary(op, a, b) => {
+            // `and`/`or` are associative and left-grouped by the compiler; a same-operator
+            // left operand doesn't need parens (`a and b and c`, not `(a and b) and c`).
+            let lhs = match (a.as_ref(), *op) {
+                (Expr::Binary(inner, ..), "and") if *inner == "and" => render_expr(a),
+                (Expr::Binary(inner, ..), "or") if *inner == "or" => render_expr(a),
+                _ => paren(a),
+            };
+            format!("{lhs} {op} {}", paren(b))
+        }
         Expr::Table(fields) => {
             let parts: Vec<String> = fields
                 .iter()

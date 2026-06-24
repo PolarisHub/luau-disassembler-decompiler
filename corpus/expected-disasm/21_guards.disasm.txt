@@ -1,0 +1,55 @@
+Function 0 (twoAnd):
+; params=3 upvals=0 vararg=false stack=4 line=5
+    0       JUMPIFNOT R0 L0  ; line 6
+    1       JUMPIF R1 L1  ; line 6
+    2  L0:  LOADNIL R3  ; line 7
+    3       RETURN R3 1  ; line 7
+    4  L1:  RETURN R2 1  ; line 9
+
+Function 1 (threeAnd):
+; params=4 upvals=0 vararg=false stack=5 line=12
+    0       JUMPIFNOT R0 L0  ; line 13
+    1       JUMPIFNOT R1 L0  ; line 13
+    2       JUMPIF R2 L1  ; line 13
+    3  L0:  LOADK R4 K0 ['bad']  ; line 14
+    4       RETURN R4 1  ; line 14
+    5  L1:  RETURN R3 1  ; line 16
+
+Function 2 (guardThenWork):
+; params=3 upvals=0 vararg=false stack=3 line=19
+    0       JUMPIFNOT R0 L0  ; line 20
+    1       JUMPIF R1 L1  ; line 20
+    2  L0:  RETURN R0 0  ; line 21
+    3  L1:  SETTABLE R2 R0 R1  ; line 23
+    4       RETURN R0 1  ; line 24
+
+Function 3 (guardInLoop):
+; params=1 upvals=0 vararg=false stack=8 line=27
+    0       LOADN R1 0  ; line 28
+    1       GETIMPORT R2 1 [ipairs]  ; line 29
+    3       MOVE R3 R0  ; line 29
+    4       CALL R2 1 3  ; line 29
+    5       FORGPREP_INEXT R2 L1  ; line 29
+    6  L0:  JUMPIFNOT R6 L2  ; line 30
+    7       GETTABLEKS R7 R6 K2 ['amount']  ; line 30
+    9       JUMPIFNOT R7 L2  ; line 30
+   10       GETTABLEKS R7 R6 K2 ['amount']  ; line 33
+   12       ADD R1 R1 R7  ; line 33
+   13  L1:  FORGLOOP R2 L0 2 [inext]  ; line 29
+   15  L2:  RETURN R1 1  ; line 35
+
+Function 4 (??):
+; params=0 upvals=0 vararg=true stack=9 line=1
+    0       PREPVARARGS 0  ; line 1
+    1       DUPCLOSURE R0 K0 ['twoAnd']  ; line 5
+    2       DUPCLOSURE R1 K1 ['threeAnd']  ; line 12
+    3       DUPCLOSURE R2 K2 ['guardThenWork']  ; line 19
+    4       DUPCLOSURE R3 K3 ['guardInLoop']  ; line 27
+    5       NEWTABLE R4 0 4  ; line 38
+    7       MOVE R5 R0  ; line 38
+    8       MOVE R6 R1  ; line 38
+    9       MOVE R7 R2  ; line 38
+   10       MOVE R8 R3  ; line 38
+   11       SETLIST R4 R5 4 [1]  ; line 38
+   13       RETURN R4 1  ; line 38
+

@@ -138,6 +138,27 @@ fn loop_break_and_continue_recovered() {
 }
 
 #[test]
+fn guard_chains_recovered() {
+    // `if not (a and b ...) then return/break end` compiles to a run of conditional jumps
+    // converging on a terminator block; the structurer must rebuild the combined condition
+    // (no goto), and recompiling must preserve the control-flow shape.
+    let out = decompile(&parse_and_validate(&read("21_guards.luauc")).unwrap()).source;
+    assert!(!out.contains("goto"), "goto left in guard output:\n{out}");
+    assert!(
+        out.contains("if not (a and b) then"),
+        "two-condition guard not rebuilt:\n{out}"
+    );
+    assert!(
+        out.contains("if not (a and b and c) then"),
+        "three-condition guard not flattened:\n{out}"
+    );
+    assert!(
+        recompiles(&out, "guards"),
+        "guard output must recompile:\n{out}"
+    );
+}
+
+#[test]
 fn method_calls_reconstructed() {
     let module = parse_and_validate(&read("09_method_call.luauc")).unwrap();
     let out = decompile(&module);

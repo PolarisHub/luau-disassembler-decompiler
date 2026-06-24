@@ -370,6 +370,12 @@ impl<'a> Decompiler<'a> {
             }
             // if / if-else: a forward conditional jump (but not a loop header's test).
             if !is_header && is_conditional_jump(op) {
+                // First try a short-circuit guard chain (`if not (a and b) then return end`),
+                // which spans several conditional jumps; fall back to a single if/else.
+                if let Some(next) = self.try_guard_chain(pc, hi, stmts, loop_ctx) {
+                    pc = next;
+                    continue;
+                }
                 if let Some(t) = jump_target(insn, pc) {
                     if t > pc && t <= hi {
                         if let Some(next) = self.try_if(pc, hi, stmts, loop_ctx) {
@@ -685,6 +691,115 @@ impl<'a> Decompiler<'a> {
             pc += op.length().max(1);
         }
         None
+    }
+
+    /// Short-circuit guard chain: a run of conditional jumps that route to a small block
+    /// ending in a terminator (`return`/`break`/`continue`), with the fall-through reaching
+    /// the body. The compiler emits `if not (a and b and ...) then return end` this way:
+    ///
+    /// ```text
+    ///   JUMPIFNOT a -> G      ; proceed (toward body) when a
+    ///   JUMPIF    b -> BODY   ; proceed (toward body) when b; fall-through reaches G
+    ///   G:   <terminator block>
+    ///   BODY: ...
+    /// ```
+    ///
+    /// We reconstruct `if not (<proceed conditions, and-ed>) then <G block> end` and resume
+    /// at BODY. This is sound: the guard block carries no value, it only diverts control, so
+    /// there is no `a and b or c` value-merge hazard. Returns the PC to resume at (BODY).
+    fn try_guard_chain(
+        &mut self,
+        pc: usize,
+        hi: usize,
+        stmts: &mut Vec<Stmt>,
+        loop_ctx: Option<(usize, usize)>,
+    ) -> Option<usize> {
+        // Collect the maximal run of consecutive conditional jumps.
+        let mut jumps: Vec<usize> = Vec::new();
+        let mut p = pc;
+        while p < hi {
+            let op = Opcode::from_u8(insn_op(self.proto.code[p]))?;
+            if !is_conditional_jump(op) {
+                break;
+            }
+            jumps.push(p);
+            p += op.length().max(1);
+        }
+        if jumps.len() < 2 {
+            return None; // a single guard is already handled by `try_if`
+        }
+
+        // The final jump targets BODY; its fall-through (`p`) must be the guard block start G.
+        let last = *jumps.last().unwrap();
+        let body = jump_target(self.proto.code[last], last)?;
+        let guard = p;
+        if body <= guard || body > hi || guard <= last {
+            return None;
+        }
+        // Every earlier jump must divert to the guard block (target == G).
+        for &j in &jumps[..jumps.len() - 1] {
+            if jump_target(self.proto.code[j], j) != Some(guard) {
+                return None;
+            }
+        }
+        // The guard block [G, BODY) must end in a terminator so control can't fall into BODY.
+        if !self.block_is_terminated(guard, body, loop_ctx) {
+            return None;
+        }
+
+        // proceed-toward-body condition for each jump.
+        let mut conds: Vec<Expr> = Vec::new();
+        for (i, &j) in jumps.iter().enumerate() {
+            let op = Opcode::from_u8(insn_op(self.proto.code[j]))?;
+            if i + 1 == jumps.len() {
+                // last jump: taken edge goes to BODY, so proceed == taken condition.
+                conds.push(self.taken_condition(op, j));
+            } else {
+                // earlier jumps: taken edge goes to the guard, so proceed == fall-through.
+                conds.push(self.fallthrough_condition(op, j));
+            }
+        }
+        let proceed = conds
+            .into_iter()
+            .reduce(|acc, c| Expr::Binary("and", Box::new(acc), Box::new(c)))?;
+
+        self.flush_inline(stmts);
+        let guard_body = self.emit_body(guard, body, loop_ctx);
+        stmts.push(Stmt::If {
+            cond: Expr::Unary("not ", Box::new(proceed)),
+            then_body: guard_body,
+            else_body: Vec::new(),
+        });
+        Some(body)
+    }
+
+    /// Whether the block `[lo, hi)` ends in a terminator (return / break / continue / a jump
+    /// out of the block), i.e. control cannot fall through into `hi`.
+    fn block_is_terminated(&self, lo: usize, hi: usize, loop_ctx: Option<(usize, usize)>) -> bool {
+        let Some(last) = self.last_instr_before(lo, hi) else {
+            return false;
+        };
+        let Some(op) = Opcode::from_u8(insn_op(self.proto.code[last])) else {
+            return false;
+        };
+        match op {
+            Opcode::RETURN => true,
+            Opcode::JUMP | Opcode::JUMPBACK => {
+                // A jump whose target is outside [lo, hi) leaves the block.
+                match jump_target(self.proto.code[last], last) {
+                    Some(t) => {
+                        if let Some((cont, brk)) = loop_ctx {
+                            if t == cont || t == brk {
+                                return true;
+                            }
+                        }
+                        t < lo || t >= hi
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
+        }
     }
 
     fn try_if(
