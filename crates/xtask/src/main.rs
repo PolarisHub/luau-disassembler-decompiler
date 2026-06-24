@@ -23,7 +23,9 @@ fn main() -> ExitCode {
         }
     };
 
-    let module = match luau_bytecode::parse_and_validate(&bytes) {
+    // Parse only (no validation): `robloxmap` deliberately works on bytecode whose opcodes
+    // don't validate against the open-source numbering.
+    let mut module = match luau_bytecode::parse(&bytes) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("parse {path}: {e}");
@@ -31,7 +33,52 @@ fn main() -> ExitCode {
         }
     };
 
+    // Deobfuscate Roblox opcode encoding (no-op for standard bytecode).
+    if cmd != "robloxmap" {
+        let d = luau_bytecode::normalize_opcodes(&mut module);
+        if d != 1 {
+            eprintln!("-- opcode multiplier: {d} (Roblox-encoded bytecode)");
+        }
+    }
+
     match cmd {
+        // Brute-force the opcode decode multiplier (Roblox encodes opcodes as op*K mod 256).
+        "robloxmap" => {
+            use luau_bytecode::opcode::{insn_op, Opcode};
+            let mut found = false;
+            for d in (1u32..256).step_by(2) {
+                let mut ok = true;
+                let mut count = 0usize;
+                'protos: for proto in &module.protos {
+                    let code = &proto.code;
+                    let mut pc = 0;
+                    while pc < code.len() {
+                        let real = (insn_op(code[pc]) as u32).wrapping_mul(d) & 0xff;
+                        match Opcode::from_u8(real as u8) {
+                            Some(op) => {
+                                pc += op.length().max(1);
+                                count += 1;
+                            }
+                            None => {
+                                ok = false;
+                                break 'protos;
+                            }
+                        }
+                    }
+                    if pc != code.len() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    println!("decode multiplier D={d} validates all {count} instructions across {} protos", module.protos.len());
+                    found = true;
+                }
+            }
+            if !found {
+                println!("no single opcode multiplier validates; encoding is not a simple multiply");
+            }
+        }
         "disasm" => print!("{}", luau_disasm::disassemble(&module)),
         "cfg" => {
             for (i, proto) in module.protos.iter().enumerate() {
