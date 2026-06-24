@@ -112,6 +112,20 @@ fn multret_call_args_reconstructed() {
 }
 
 #[test]
+fn loop_break_and_continue_recovered() {
+    // Conditional jumps to a loop's exit / continue point must lower to native `break` /
+    // `continue` keywords (this Luau dialect has no goto), and the result must recompile.
+    let out = decompile(&parse_and_validate(&read("20_loop_control.luauc")).unwrap()).source;
+    assert!(!out.contains("goto"), "goto left in loop output:\n{out}");
+    assert!(out.contains("break"), "break not recovered:\n{out}");
+    assert!(out.contains("continue"), "continue not recovered:\n{out}");
+    assert!(
+        recompiles(&out, "loopctl"),
+        "loop-control output must recompile:\n{out}"
+    );
+}
+
+#[test]
 fn method_calls_reconstructed() {
     let module = parse_and_validate(&read("09_method_call.luauc")).unwrap();
     let out = decompile(&module);
