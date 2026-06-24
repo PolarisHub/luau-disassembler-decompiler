@@ -38,18 +38,32 @@ Function 3 (guardInLoop):
    13  L1:  FORGLOOP R2 L0 2 [inext]  ; line 29
    15  L2:  RETURN R1 1  ; line 35
 
-Function 4 (??):
-; params=0 upvals=0 vararg=true stack=9 line=1
+Function 4 (guardWithCall):
+; params=2 upvals=0 vararg=false stack=5 line=41
+    0       JUMPIFNOT R0 L0  ; line 42
+    1       MOVE R4 R1  ; line 42
+    2       NAMECALL R2 R0 K0 ['FindFirstChild']  ; line 42
+    4       CALL R2 2 1  ; line 42
+    5       JUMPIF R2 L1  ; line 42
+    6  L0:  LOADB R2 0  ; line 43
+    7       RETURN R2 1  ; line 43
+    8  L1:  LOADB R2 1  ; line 45
+    9       RETURN R2 1  ; line 45
+
+Function 5 (??):
+; params=0 upvals=0 vararg=true stack=11 line=1
     0       PREPVARARGS 0  ; line 1
     1       DUPCLOSURE R0 K0 ['twoAnd']  ; line 5
     2       DUPCLOSURE R1 K1 ['threeAnd']  ; line 12
     3       DUPCLOSURE R2 K2 ['guardThenWork']  ; line 19
     4       DUPCLOSURE R3 K3 ['guardInLoop']  ; line 27
-    5       NEWTABLE R4 0 4  ; line 38
-    7       MOVE R5 R0  ; line 38
-    8       MOVE R6 R1  ; line 38
-    9       MOVE R7 R2  ; line 38
-   10       MOVE R8 R3  ; line 38
-   11       SETLIST R4 R5 4 [1]  ; line 38
-   13       RETURN R4 1  ; line 38
+    5       DUPCLOSURE R4 K4 ['guardWithCall']  ; line 41
+    6       NEWTABLE R5 0 5  ; line 48
+    8       MOVE R6 R0  ; line 48
+    9       MOVE R7 R1  ; line 48
+   10       MOVE R8 R2  ; line 48
+   11       MOVE R9 R3  ; line 48
+   12       MOVE R10 R4  ; line 48
+   13       SETLIST R5 R6 5 [1]  ; line 48
+   15       RETURN R5 1  ; line 48
 

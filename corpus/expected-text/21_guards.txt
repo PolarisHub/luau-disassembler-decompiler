@@ -64,11 +64,28 @@ L1: FORGLOOP R2 L0 2 [inext]
    35: 	return total
 L2: RETURN R1 1
 
-Function 4 (??):
-local 0: reg 0, start pc 2 line 12, end pc 13 line 38
-local 1: reg 1, start pc 3 line 19, end pc 13 line 38
-local 2: reg 2, start pc 4 line 27, end pc 13 line 38
-local 3: reg 3, start pc 5 line 38, end pc 13 line 38
+Function 4 (guardWithCall):
+local 0: reg 0, start pc 0 line 42, end pc 9 line 45
+local 1: reg 1, start pc 0 line 42, end pc 9 line 45
+   42: 	if not (panel and panel:FindFirstChild(name)) then
+JUMPIFNOT R0 L0
+MOVE R4 R1
+NAMECALL R2 R0 K0 ['FindFirstChild']
+CALL R2 2 1
+JUMPIF R2 L1
+   43: 		return false
+L0: LOADB R2 0
+RETURN R2 1
+   45: 	return true
+L1: LOADB R2 1
+RETURN R2 1
+
+Function 5 (??):
+local 0: reg 0, start pc 2 line 12, end pc 15 line 48
+local 1: reg 1, start pc 3 line 19, end pc 15 line 48
+local 2: reg 2, start pc 4 line 27, end pc 15 line 48
+local 3: reg 3, start pc 5 line 41, end pc 15 line 48
+local 4: reg 4, start pc 6 line 48, end pc 15 line 48
     5: local function twoAnd(a, b, x)
 DUPCLOSURE R0 K0 ['twoAnd']
    12: local function threeAnd(a, b, c, x)
@@ -77,13 +94,16 @@ DUPCLOSURE R1 K1 ['threeAnd']
 DUPCLOSURE R2 K2 ['guardThenWork']
    27: local function guardInLoop(items)
 DUPCLOSURE R3 K3 ['guardInLoop']
-REMARK allocation: table array 4
-   38: return { twoAnd, threeAnd, guardThenWork, guardInLoop }
-NEWTABLE R4 0 4
-MOVE R5 R0
-MOVE R6 R1
-MOVE R7 R2
-MOVE R8 R3
-SETLIST R4 R5 4 [1]
-RETURN R4 1
+   41: local function guardWithCall(panel, name)
+DUPCLOSURE R4 K4 ['guardWithCall']
+REMARK allocation: table array 5
+   48: return { twoAnd, threeAnd, guardThenWork, guardInLoop, guardWithCall }
+NEWTABLE R5 0 5
+MOVE R6 R0
+MOVE R7 R1
+MOVE R8 R2
+MOVE R9 R3
+MOVE R10 R4
+SETLIST R5 R6 5 [1]
+RETURN R5 1
 

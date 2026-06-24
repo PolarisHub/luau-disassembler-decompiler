@@ -734,10 +734,8 @@ impl<'a> Decompiler<'a> {
             }
         }
         if jumps.len() < 2 {
-            eprintln!("DEBUG try_guard_chain: pc={} hi={} jumps={:?}", pc, hi, jumps);
             return None;
         }
-        eprintln!("DEBUG try_guard_chain: entering pattern detection, jumps={:?}", jumps);
 
         // Compute guard (G) and body. Three patterns:
         //   1. Simple consecutive: last jump -> BODY, earlier jumps -> G, no intervening code.
@@ -801,7 +799,8 @@ impl<'a> Decompiler<'a> {
             let a = window[0];
             let b = window[1];
             let a_len = Opcode::from_u8(insn_op(self.proto.code[a]))?
-                .length().max(1);
+                .length()
+                .max(1);
             let mut q = a + a_len;
             while q < b {
                 let op = Opcode::from_u8(insn_op(self.proto.code[q]))?;
@@ -840,40 +839,22 @@ impl<'a> Decompiler<'a> {
             (guard, body_pc)
         };
         if !self.block_is_terminated(guard, body, loop_ctx) {
-            eprintln!("DEBUG try_guard_chain: block not terminated for guard={} body={}", guard, body);
             return None;
         }
-        eprintln!("DEBUG try_guard_chain: SUCCESS, guard={} body={}", guard, body);
 
-        // Emit flat sequential guards: `if not <cond> then <terminator> end`
-        // with intervening straight-line statements between them.
+        // Emit flat sequential guards: `if <cond> then <guard-body> end`, with the intervening
+        // straight-line statements (the next guard's value computation) emitted between them.
+        // The guard body always terminates (block_is_terminated above), so at most one guard's
+        // clause runs — cloning the whole body into each clause is correct, not duplicated work.
         self.flush_inline(stmts);
         let guard_stmts = self.collect_guard_body(guard, body, loop_ctx)?;
-        eprintln!("DEBUG: guard_stmts.len() = {}", guard_stmts.len());
-        // If the guard body has a single statement (a simple terminator), clone it into each
-        // guard clause. If it has multiple statements, the fallthrough from each guard's
-        // condition passes through to the next guard's condition test, so we need to emit
-        // the entire guard body after each guard's condition check. We handle this by
-        // emitting only the FIRST guard's condition check and letting the rest fall through,
-        // then emit the guard body at the end. This is only valid when all guards target
-        // the same block.
-        // For multi-statement guard bodies, we emit each guard's condition check only when
-        // it actually matters — which is for every guard that precedes another guard. The last
-        // guard's fall-through goes to the guard body, so we skip emitting a separate
-        // condition check for the last guard (its fall-through implicitly reaches G).
-        let guard_stmt = if guard_stmts.len() == 1 {
-            Some(guard_stmts.into_iter().next().unwrap())
-        } else {
-            None
-        };
         for (i, &j) in jumps.iter().enumerate() {
             let op = Opcode::from_u8(insn_op(self.proto.code[j]))?;
-            // The guard condition: under what condition does this jump divert to G?
-            // - If the jump targets G (guard block): taken -> G, so guard = taken condition.
-            // - If the jump targets BODY (last jump in mixed pattern): fall-through -> G,
-            //   so guard = fall-through condition.
+            // Under what condition does this jump divert to the guard block G?
+            // - jump targets G: taken -> G, so the guard fires on the taken condition.
+            // - jump targets BODY (the last jump in a mixed chain): fall-through -> G, so the
+            //   guard fires on the fall-through condition.
             let targets_guard = jump_target(self.proto.code[j], j) == Some(guard);
-            eprintln!("DEBUG COND: jump={} target={:?} guard={} targets_guard={}", j, jump_target(self.proto.code[j], j), guard, targets_guard);
             let cond = if targets_guard {
                 self.taken_condition(op, j)
             } else {
@@ -881,7 +862,7 @@ impl<'a> Decompiler<'a> {
             };
             stmts.push(Stmt::If {
                 cond,
-                then_body: vec![guard_stmt.as_ref().unwrap().clone()],
+                then_body: guard_stmts.clone(),
                 else_body: Vec::new(),
             });
             if i + 1 < jumps.len() {
@@ -896,15 +877,15 @@ impl<'a> Decompiler<'a> {
                 }
             }
         }
-        Some(body)}
+        Some(body)
+    }
     /// Whether `op` is something that cannot legally appear between two `and`-linked guard
     /// jumps. The compiler only emits straight-line evaluation between such jumps.
     fn op_breaks_chain(&self, op: Opcode) -> bool {
         use Opcode::*;
         matches!(
             op,
-            JUMP
-                | JUMPBACK
+            JUMP | JUMPBACK
                 | JUMPX
                 | JUMPIF
                 | JUMPIFNOT
