@@ -169,7 +169,7 @@ pub fn drop_unreachable(root: &mut Vec<Stmt>) {
     }
     if let Some(idx) = root
         .iter()
-        .position(|s| matches!(s, Stmt::Return(_) | Stmt::Break))
+        .position(|s| matches!(s, Stmt::Return(_) | Stmt::Break | Stmt::Continue))
     {
         root.truncate(idx + 1);
     }
@@ -471,7 +471,7 @@ fn count_uses_stmt(s: &Stmt, counts: &mut BTreeMap<String, usize>) {
             }
         }
         Stmt::GenericFor { exprs, .. } => exprs.iter().for_each(|e| add_reads(e, counts)),
-        Stmt::Break | Stmt::Label(_) | Stmt::Goto(_) | Stmt::Comment(_) => {}
+        Stmt::Break | Stmt::Continue | Stmt::Label(_) | Stmt::Goto(_) | Stmt::Comment(_) => {}
     }
     for_each_block(s, |b| {
         for st in b {

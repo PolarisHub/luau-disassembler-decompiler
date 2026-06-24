@@ -341,7 +341,7 @@ fn rename_stmt(s: &mut Stmt, map: &BTreeMap<String, String>) {
             exprs.iter_mut().for_each(|e| rename_expr(e, map));
             apply_rename(body, map);
         }
-        Stmt::Break | Stmt::Label(_) | Stmt::Goto(_) | Stmt::Comment(_) => {}
+        Stmt::Break | Stmt::Continue | Stmt::Label(_) | Stmt::Goto(_) | Stmt::Comment(_) => {}
     }
 }
 
