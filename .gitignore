@@ -1,0 +1,11 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# Vendored Luau toolchain binaries (downloaded, platform-specific, large).
+# See README / memory for how to fetch luau-compile 0.726.
+/tools/*.exe
+/tools/*.zip
+
+# Local scratch
+/tmp

@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/luau-bytecode",
+    "crates/luau-disasm",
+    "crates/luau-ir",
+    "crates/luau-decompile",
+    "crates/luau-server",
+    "crates/xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Axon Hub"]
+repository = "https://github.com/Xenith/luau-disassembler"
+rust-version = "1.80"
+
+# Dependencies are pinned at the workspace level so every crate agrees on versions.
+# The layering rule (server -> decompile -> ir -> disasm -> bytecode; bytecode depends on
+# nothing external) is enforced by hand in each crate's [dependencies]; keep it one-directional.
+[workspace.dependencies]
+luau-bytecode = { path = "crates/luau-bytecode" }
+luau-disasm = { path = "crates/luau-disasm" }
+luau-ir = { path = "crates/luau-ir" }
+luau-decompile = { path = "crates/luau-decompile" }
+
+[profile.release]
+# Reverse-engineering input is hostile; keep overflow checks on even in release so an
+# arithmetic mistake surfaces as a panic we catch rather than silent corruption.
+overflow-checks = true
