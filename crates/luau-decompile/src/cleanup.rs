@@ -388,6 +388,7 @@ fn is_control_flow(s: &Stmt) -> bool {
             | Stmt::Label(_)
             | Stmt::Goto(_)
             | Stmt::Break
+            | Stmt::Continue
     )
 }
 
