@@ -155,7 +155,7 @@ fn apply_field_sink_names(
                         };
                         if let Some(f) = field {
                             if f != "Parent" {
-                                if let Some(base) = sanitize(&lower_first(&f)) {
+                                if let Some(base) = sanitize(&field_to_local_name(&f)) {
                                     let u = unique_name(&base, reserved);
                                     reserved.insert(u.clone());
                                     map.insert(name.clone(), u);
@@ -529,7 +529,7 @@ pub fn derive_name(e: &Expr) -> Option<String> {
                 return Some(n.to_string());
             }
             // Otherwise the trailing field, read as an instance: player.Character -> character.
-            sanitize(&lower_first(field))
+            sanitize(&field_to_local_name(field))
         }
         Expr::Index(_, key) => {
             if let Expr::Str(lit) = key.as_ref() {
@@ -871,6 +871,17 @@ fn strip_quotes(s: &str) -> String {
         s[1..s.len() - 1].to_string()
     } else {
         s.to_string()
+    }
+}
+
+/// Turn a field name into a local name: ALL-CAPS constants become fully lowercase
+/// (`REWARDS` -> `rewards`), otherwise just lowercase the first letter (`MaxHealth` ->
+/// `maxHealth`).
+fn field_to_local_name(f: &str) -> String {
+    if f.chars().any(|c| c.is_ascii_lowercase()) {
+        lower_first(f)
+    } else {
+        f.to_ascii_lowercase()
     }
 }
 

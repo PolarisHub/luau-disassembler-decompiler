@@ -103,6 +103,43 @@ fn surfaces_compile_error_sentinel() {
 }
 
 #[test]
+fn detects_and_reverses_roblox_opcode_encoding() {
+    use luau_bytecode::opcode::{insn_op, Opcode};
+    use luau_bytecode::{detect_opcode_multiplier, normalize_opcodes};
+
+    let bytes = read_bytecode("bytecode/06_numeric_for.luauc");
+    let original = parse_and_validate(&bytes).unwrap();
+
+    // Standard bytecode needs no remap.
+    assert_eq!(detect_opcode_multiplier(&original), 1);
+
+    // Simulate Roblox: encode each instruction's opcode byte as op*227 mod 256
+    // (227 is the inverse of the 203 decode multiplier).
+    let mut enc = original.clone();
+    for proto in &mut enc.protos {
+        let mut pc = 0;
+        while pc < proto.code.len() {
+            let real = insn_op(proto.code[pc]);
+            let len = Opcode::from_u8(real).unwrap().length().max(1);
+            let encoded = (real as u32).wrapping_mul(227) & 0xff;
+            proto.code[pc] = (proto.code[pc] & 0xffff_ff00) | encoded;
+            pc += len;
+        }
+    }
+
+    // It is detected and reversed back to the original opcodes.
+    assert_eq!(detect_opcode_multiplier(&enc), 203);
+    let mut restored = enc.clone();
+    assert_eq!(normalize_opcodes(&mut restored), 203);
+    for (a, b) in original.protos.iter().zip(restored.protos.iter()) {
+        assert_eq!(
+            a.code, b.code,
+            "opcodes should be restored to standard numbering"
+        );
+    }
+}
+
+#[test]
 fn truncation_never_panics() {
     // Every prefix of every valid corpus blob must parse to Ok or a clean Err, never panic.
     for path in corpus_files() {

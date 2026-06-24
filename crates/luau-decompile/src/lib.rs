@@ -22,7 +22,7 @@ mod naming;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ast::{render_block, render_expr, Expr, Stmt};
+use ast::{render_block, render_expr, Expr, Stmt, TableField};
 use luau_bytecode::opcode::*;
 use luau_bytecode::{capture_type, Constant, Module, Proto, StringRef};
 use luau_disasm::{compute_labels, render_constant_at};
@@ -806,7 +806,14 @@ impl<'a> Decompiler<'a> {
                 let e = Expr::Unary("#", Box::new(self.reg(b)));
                 self.assign(a, e, stmts);
             }
-            NEWTABLE | DUPTABLE => self.assign(a, Expr::Table(Vec::new()), stmts),
+            NEWTABLE => self.assign(a, Expr::Table(Vec::new()), stmts),
+            // DUPTABLE clones a constant template; if the template baked in its values
+            // (LBC_CONSTANT_TABLE_WITH_CONSTANTS, common in config modules), rebuild the
+            // literal. Entries with no baked value are filled by following SETTABLEKS ops.
+            DUPTABLE => {
+                let e = self.duptable_expr(d as usize);
+                self.assign(a, e, stmts);
+            }
             SETLIST => {
                 // SETLIST A B C [aux]: table[aux + i] = R(B+i) for i in 0..C-1.
                 let count = c as i32 - 1;
@@ -956,6 +963,36 @@ impl<'a> Decompiler<'a> {
     }
 
     // --- expression helpers -------------------------------------------------------------
+
+    /// Reconstruct a table literal from a DUPTABLE template constant. Baked key/value pairs
+    /// (TABLE_WITH_CONSTANTS) become fields; entries without a baked value are left out (a
+    /// following SETTABLEKS fills them).
+    fn duptable_expr(&self, k: usize) -> Expr {
+        let entries = match self.proto.constants.get(k) {
+            Some(Constant::TableWithConstants { entries }) => entries,
+            _ => return Expr::Table(Vec::new()),
+        };
+        let mut fields = Vec::new();
+        for (key_k, val_k) in entries {
+            if *val_k < 0 {
+                continue; // value supplied at runtime by a SETTABLEKS
+            }
+            let value = self.const_expr(*val_k as usize);
+            match self.proto.constants.get(*key_k as usize) {
+                Some(Constant::String(_)) => {
+                    let key = self.string_const(*key_k);
+                    if is_identifier(&key) {
+                        fields.push(TableField::Named(key, value));
+                    } else {
+                        fields.push(TableField::Keyed(self.const_expr(*key_k as usize), value));
+                    }
+                }
+                Some(_) => fields.push(TableField::Keyed(self.const_expr(*key_k as usize), value)),
+                None => {}
+            }
+        }
+        Expr::Table(fields)
+    }
 
     fn const_expr(&self, k: usize) -> Expr {
         let text = render_constant_at(self.module, self.proto, k);

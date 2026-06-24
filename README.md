@@ -28,6 +28,19 @@ under [`reference/luau-0.726/`](reference/luau-0.726):
 | `VM/src/lvmload.cpp` | `luau_load` — the exact deserialization order (the reader's spec) |
 | `Bytecode/src/BytecodeBuilder.cpp` | the writer and the `dumpInstruction`/`dumpConstant` text format we match |
 
+## Roblox (obfuscated) bytecode
+
+Roblox ships production bytecode in the standard Luau format but **encodes the opcode byte**
+of every instruction (`encoded = realOp * 227 mod 256`) — so a raw `getscriptbytecode` dump
+decodes to garbage opcodes under the open-source numbering. The reader handles this
+automatically: [`parse_normalized`](crates/luau-bytecode/src/lib.rs) brute-forces the opcode
+**decode multiplier** per chunk (the inverse, `203`, for current Roblox; `1` for normal
+bytecode, which is then left untouched) and rewrites opcodes to the standard numbering before
+analysis. The multiplier is reported back as `opcode_multiplier` in the server response (with
+a diagnostic). Because it's detected per file rather than hard-coded, it survives Roblox
+opcode-shuffle changes. `DUPTABLE` constant templates (`TABLE_WITH_CONSTANTS`, ubiquitous in
+config modules) are reconstructed into real table literals.
+
 ## Architecture
 
 A Cargo workspace, layered so each level is testable on its own; dependencies point one way

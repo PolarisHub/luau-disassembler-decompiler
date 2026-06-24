@@ -76,7 +76,9 @@ fn main() -> ExitCode {
                 }
             }
             if !found {
-                println!("no single opcode multiplier validates; encoding is not a simple multiply");
+                println!(
+                    "no single opcode multiplier validates; encoding is not a simple multiply"
+                );
             }
         }
         "disasm" => print!("{}", luau_disasm::disassemble(&module)),

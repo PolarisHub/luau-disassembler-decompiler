@@ -187,7 +187,7 @@ fn reader_error(e: luau_bytecode::Error) -> ApiError {
 
 fn handle_disassemble(body: &[u8]) -> Handled {
     let (bytes, options) = decode_request(body)?;
-    let module = luau_bytecode::parse_and_validate(&bytes).map_err(reader_error)?;
+    let (module, multiplier) = luau_bytecode::parse_normalized(&bytes).map_err(reader_error)?;
     let disasm = luau_disasm::disassemble(&module);
 
     let include_listing = option_bool(&options, "include_disassembly", true);
@@ -219,15 +219,27 @@ fn handle_disassemble(body: &[u8]) -> Handled {
         "types_version": module.types_version,
         "main_proto": module.main_proto,
         "proto_count": module.protos.len(),
+        "opcode_multiplier": multiplier,
         "protos": protos,
-        "diagnostics": [],
+        "diagnostics": opcode_diagnostics(multiplier),
     });
     Ok((200, response.to_string()))
 }
 
+/// A diagnostic noting opcode deobfuscation, when it happened.
+fn opcode_diagnostics(multiplier: u32) -> Vec<String> {
+    if multiplier == 1 {
+        Vec::new()
+    } else {
+        vec![format!(
+            "deobfuscated Roblox-encoded opcodes (decode multiplier {multiplier})"
+        )]
+    }
+}
+
 fn handle_decompile(body: &[u8]) -> Handled {
     let (bytes, options) = decode_request(body)?;
-    let module = luau_bytecode::parse_and_validate(&bytes).map_err(reader_error)?;
+    let (module, multiplier) = luau_bytecode::parse_normalized(&bytes).map_err(reader_error)?;
     let result = luau_decompile::decompile(&module);
 
     let per_proto: Vec<Value> = result
@@ -246,8 +258,9 @@ fn handle_decompile(body: &[u8]) -> Handled {
     let mut response = json!({
         "source": result.source,
         "partial": result.partial,
+        "opcode_multiplier": multiplier,
         "per_proto": per_proto,
-        "diagnostics": [],
+        "diagnostics": opcode_diagnostics(multiplier),
     });
 
     // Optionally include the raw disassembly alongside the decompile.
