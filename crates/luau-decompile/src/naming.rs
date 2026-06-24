@@ -163,7 +163,7 @@ fn fold_head(e2: &Expr, x: &str, e1: &Expr) -> Option<Expr> {
 }
 
 /// Side-effect-free for the purpose of reordering: no calls (which could observe order).
-fn is_pure(e: &Expr) -> bool {
+pub(crate) fn is_pure(e: &Expr) -> bool {
     match e {
         Expr::Nil
         | Expr::Bool(_)

@@ -17,13 +17,14 @@
 //!   until then the output reflects the real control flow rather than guessing.
 
 mod ast;
+mod cleanup;
 mod naming;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ast::{render_block, render_expr, Expr, Stmt};
 use luau_bytecode::opcode::*;
-use luau_bytecode::{Constant, Module, Proto, StringRef};
+use luau_bytecode::{capture_type, Constant, Module, Proto, StringRef};
 use luau_disasm::{compute_labels, render_constant_at};
 
 /// Result of decompiling a whole module.
@@ -85,10 +86,24 @@ fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoRep
 
     // Fold register-reuse field/method chains (x = a.b; x = x.c -> x = a.b.c) before naming,
     // so a variable is named from its final, complete expression.
+    // Remove unreachable code left after returns/breaks by inline-cache flushes.
+    cleanup::drop_unreachable(&mut stmts);
+
     naming::fold_refinements(&mut stmts);
 
-    // The names for materialized, hoisted locals (debug names where unambiguous, else vN).
-    let mut hoist_names: Vec<String> = d.hoisted.iter().map(|&r| d.reg_name(r)).collect();
+    // Restore readability lost by always materializing: inline single-use pure temporaries
+    // and drop dead stores. Both are sound (see cleanup.rs). Captured registers are excluded
+    // so closures don't lose the variables they close over.
+    let protected = d.captured_names();
+    cleanup::single_use_inline(&mut stmts, &protected);
+    cleanup::dead_store_elim(&mut stmts, &protected);
+    // A constant `1` step on a numeric for is implicit.
+    drop_unit_for_steps(&mut stmts);
+
+    // Locals that still need a hoisted declaration (a sole-Var assignment survived),
+    // excluding parameters and upvalues.
+    let non_local = d.non_local_names();
+    let mut hoist_names = cleanup::assigned_locals(&stmts, &non_local);
 
     // Smart-rename synthesized locals from the expressions they hold (require -> module,
     // GetService -> service, etc.). Renaming a local is always semantics-preserving, so this
@@ -115,11 +130,24 @@ struct Decompiler<'a> {
     module: &'a Module,
     proto: &'a Proto,
     proto_idx: usize,
-    /// Current expression held in each register, if it is an inlinable immutable leaf.
+    /// Expression currently held in each register when it is an inlinable immutable leaf
+    /// (constant/import/global). `None` means "read this register by its name". The cache is
+    /// flushed at every control-flow boundary so no inlined value ever crosses an edge.
     regs: Vec<Option<Expr>>,
-    /// Registers (>= num_params) that were materialized and need a hoisted `local`.
+    /// Registers (>= num_params) that were written and need a hoisted `local`.
     hoisted: BTreeSet<u8>,
     labels: Vec<Option<u32>>,
+    /// Loop headers: header PC -> furthest back-edge source (while/repeat kinds).
+    loop_back: BTreeMap<usize, usize>,
+    /// Overrides `reg_name` for the duration of a loop body, so the loop variable reads
+    /// consistently in the header and the body even when its register is reused elsewhere.
+    reg_name_override: BTreeMap<u8, String>,
+    /// Counter for synthesizing loop-variable names when debug info is absent.
+    next_loopvar: usize,
+    /// Registers captured (by value or by ref) into a child closure. These must never be
+    /// inlined away or dead-store-eliminated — the closure references them by name, which our
+    /// use-counting (the closure body is opaque) cannot see.
+    captured_regs: BTreeSet<u8>,
     partial: bool,
     notes: Vec<String>,
 }
@@ -133,19 +161,73 @@ impl<'a> Decompiler<'a> {
             regs: vec![None; proto.max_stack_size as usize + 1],
             hoisted: BTreeSet::new(),
             labels: compute_labels(proto),
+            loop_back: BTreeMap::new(),
+            reg_name_override: BTreeMap::new(),
+            next_loopvar: 0,
+            captured_regs: BTreeSet::new(),
             partial: false,
             notes: Vec::new(),
         }
     }
 
     fn run(&mut self) -> Vec<Stmt> {
+        self.loop_back = self.compute_loop_back();
+        self.captured_regs = self.compute_captured_regs();
         let mut stmts = Vec::new();
-        let code = &self.proto.code;
-        let mut pc = 0;
-        let mut pending_namecall: Option<(u8, Expr, String)> = None;
+        let mut pending = None;
+        self.emit_range(0, self.proto.code.len(), &mut stmts, &mut pending, None);
 
+        // Drop labels nothing jumps to (recursively). Structured regions don't reference
+        // their internal targets, and the FASTCALL skip-over is never a goto, so those labels
+        // (not even valid Luau on their own) are removed.
+        let referenced = collect_goto_targets(&stmts);
+        retain_referenced_labels(&mut stmts, &referenced);
+        stmts
+    }
+
+    /// Header PC -> furthest back-edge source, for the `while`/`repeat` loop kinds
+    /// (JUMPBACK and backward conditional jumps). FORNLOOP/FORGLOOP back-edges are excluded;
+    /// those loops are recovered from their FORNPREP/FORGPREP entries instead.
+    fn compute_loop_back(&self) -> BTreeMap<usize, usize> {
+        let code = &self.proto.code;
+        let mut m: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut pc = 0;
         while pc < code.len() {
             let insn = code[pc];
+            if let Some(op) = Opcode::from_u8(insn_op(insn)) {
+                let loopish = op == Opcode::JUMPBACK || is_conditional_jump(op);
+                if loopish {
+                    if let Some(t) = jump_target(insn, pc) {
+                        if t <= pc {
+                            let e = m.entry(t).or_insert(pc);
+                            if pc > *e {
+                                *e = pc;
+                            }
+                        }
+                    }
+                }
+                pc += op.length().max(1);
+            } else {
+                pc += 1;
+            }
+        }
+        m
+    }
+
+    /// Structure the instruction range `[lo, hi)` into statements, recognizing loops and
+    /// conditionals and falling back to labelled `goto` for anything that doesn't match.
+    /// `loop_ctx` is `(continue_target_pc, break_target_pc)` of the innermost loop.
+    fn emit_range(
+        &mut self,
+        lo: usize,
+        hi: usize,
+        stmts: &mut Vec<Stmt>,
+        pending: &mut Option<(u8, Expr, String)>,
+        loop_ctx: Option<(usize, usize)>,
+    ) {
+        let mut pc = lo;
+        while pc < hi {
+            let insn = self.proto.code[pc];
             let op = match Opcode::from_u8(insn_op(insn)) {
                 Some(o) => o,
                 None => {
@@ -155,21 +237,399 @@ impl<'a> Decompiler<'a> {
             };
             let len = op.length().max(1);
 
-            // Emit a label if this PC is a jump target.
-            if let Some(id) = self.labels.get(pc).copied().flatten() {
-                stmts.push(Stmt::Label(format!("L{id}")));
+            // Numeric / generic for brackets.
+            if op == Opcode::FORNPREP {
+                if let Some(next) = self.try_numeric_for(pc, hi, stmts) {
+                    pc = next;
+                    continue;
+                }
+            }
+            if matches!(
+                op,
+                Opcode::FORGPREP | Opcode::FORGPREP_INEXT | Opcode::FORGPREP_NEXT
+            ) {
+                if let Some(next) = self.try_generic_for(pc, hi, stmts) {
+                    pc = next;
+                    continue;
+                }
+            }
+            // while / repeat: this PC is a back-edge target (loop header).
+            let is_header = self.loop_back.contains_key(&pc);
+            if is_header {
+                if let Some(next) = self.try_loop(pc, hi, stmts) {
+                    pc = next;
+                    continue;
+                }
+            }
+            // break: an unconditional jump to the enclosing loop's exit.
+            if matches!(op, Opcode::JUMP | Opcode::JUMPBACK) {
+                if let Some((cont, brk)) = loop_ctx {
+                    if let Some(t) = jump_target(insn, pc) {
+                        if t == brk {
+                            self.flush_inline(stmts);
+                            stmts.push(Stmt::Break);
+                            pc += len;
+                            continue;
+                        }
+                        if t == cont {
+                            // A jump to the loop's continue point that isn't the natural
+                            // bottom edge is `continue`.
+                            self.flush_inline(stmts);
+                            stmts.push(Stmt::Comment("continue".into()));
+                            pc += len;
+                            continue;
+                        }
+                    }
+                }
+            }
+            // if / if-else: a forward conditional jump (but not a loop header's test).
+            if !is_header && is_conditional_jump(op) {
+                if let Some(t) = jump_target(insn, pc) {
+                    if t > pc && t <= hi {
+                        if let Some(next) = self.try_if(pc, hi, stmts, loop_ctx) {
+                            pc = next;
+                            continue;
+                        }
+                    }
+                }
             }
 
-            self.step(op, pc, &mut stmts, &mut pending_namecall);
+            // Straight-line (or goto fallback for unstructured control flow).
+            self.maybe_label(pc, stmts);
+            self.step(op, pc, stmts, pending);
             pc += len;
         }
+    }
 
-        // Drop labels nothing jumps to. Many jump targets (notably the FASTCALL skip-over)
-        // never produce a goto in the reconstruction, and a dangling `::label::` is not even
-        // valid Luau, so emitting it would wrongly break otherwise-clean output.
-        let referenced = collect_goto_targets(&stmts);
-        stmts.retain(|s| !matches!(s, Stmt::Label(n) if !referenced.contains(n)));
-        stmts
+    /// Emit a sub-range as its own block, flushing the inline cache at the block end so no
+    /// cached value escapes the region.
+    fn emit_body(&mut self, lo: usize, hi: usize, loop_ctx: Option<(usize, usize)>) -> Vec<Stmt> {
+        let mut body = Vec::new();
+        let mut pending = None;
+        self.emit_range(lo, hi, &mut body, &mut pending, loop_ctx);
+        self.flush_inline(&mut body);
+        body
+    }
+
+    fn maybe_label(&self, pc: usize, stmts: &mut Vec<Stmt>) {
+        if let Some(id) = self.labels.get(pc).copied().flatten() {
+            stmts.push(Stmt::Label(format!("L{id}")));
+        }
+    }
+
+    fn try_numeric_for(&mut self, pc: usize, hi: usize, stmts: &mut Vec<Stmt>) -> Option<usize> {
+        let insn = self.proto.code[pc];
+        let exit = jump_target(insn, pc)?; // instruction after FORNLOOP
+        if exit == 0 || exit > hi {
+            return None;
+        }
+        let fornloop = exit - 1;
+        if fornloop <= pc {
+            return None;
+        }
+        let flop = Opcode::from_u8(insn_op(*self.proto.code.get(fornloop)?))?;
+        if flop != Opcode::FORNLOOP || jump_target(self.proto.code[fornloop], fornloop) != Some(pc + 1)
+        {
+            return None;
+        }
+        let a = insn_a(insn);
+        // Layout at A: [limit, step, index/var]. Read setup exprs from the cache first
+        // (before the loop-variable name override shadows the register).
+        let start = self.reg(a + 2);
+        let limit = self.reg(a);
+        let step = self.reg(a + 1);
+        let var = self.loop_var_name(a + 2, pc + 1);
+
+        // The for header consumes these registers; clear them so the body reads the loop
+        // variable by name, then flush any other cached value across the loop boundary.
+        for r in [a, a + 1, a + 2] {
+            if let Some(slot) = self.regs.get_mut(r as usize) {
+                *slot = None;
+            }
+        }
+        self.flush_inline(stmts);
+
+        self.reg_name_override.insert(a + 2, var.clone());
+        let body = self.emit_body(pc + 1, fornloop, Some((fornloop, exit)));
+        self.reg_name_override.remove(&(a + 2));
+        // The loop variable is declared by the `for`, not hoisted.
+        self.hoisted.remove(&(a + 2));
+
+        stmts.push(Stmt::NumericFor {
+            var,
+            start,
+            limit,
+            step: Some(step),
+            body,
+        });
+        Some(exit)
+    }
+
+    fn try_generic_for(&mut self, pc: usize, hi: usize, stmts: &mut Vec<Stmt>) -> Option<usize> {
+        let insn = self.proto.code[pc];
+        let forgloop = jump_target(insn, pc)?;
+        if forgloop <= pc || forgloop >= self.proto.code.len() {
+            return None;
+        }
+        let glop = Opcode::from_u8(insn_op(self.proto.code[forgloop]))?;
+        if glop != Opcode::FORGLOOP || forgloop >= hi {
+            return None;
+        }
+        let a = insn_a(insn);
+        let aux = self.proto.code.get(forgloop + 1).copied().unwrap_or(0);
+        let var_count = (aux & 0xff) as u8;
+        if var_count == 0 {
+            return None;
+        }
+        // Generic-for layout at A: [generator, state, index, vars...]. The user variables
+        // start at A+3.
+
+        // The iterator was produced by a CALL into A..A+2 just before FORGPREP; if the last
+        // emitted statement is exactly that multi-assign, use its call as the `in` expression.
+        let iter_regs = [self.reg_name(a), self.reg_name(a + 1), self.reg_name(a + 2)];
+        let exprs = match stmts.last() {
+            Some(Stmt::Assign { targets, values })
+                if values.len() == 1
+                    && targets.len() == 3
+                    && targets
+                        .iter()
+                        .zip(iter_regs.iter())
+                        .all(|(t, n)| matches!(t, Expr::Var(v) if v == n)) =>
+            {
+                let call = values[0].clone();
+                stmts.pop();
+                vec![call]
+            }
+            _ => vec![self.reg(a), self.reg(a + 1), self.reg(a + 2)],
+        };
+
+        // Clear the loop registers and flush across the boundary.
+        for r in a..=(a + 2 + var_count) {
+            if let Some(slot) = self.regs.get_mut(r as usize) {
+                *slot = None;
+            }
+        }
+        self.flush_inline(stmts);
+
+        let exit = forgloop + 2; // FORGLOOP carries an AUX word
+        let mut vars = Vec::with_capacity(var_count as usize);
+        for i in 0..var_count {
+            let name = self.loop_var_name(a + 3 + i, pc + 1);
+            self.reg_name_override.insert(a + 3 + i, name.clone());
+            vars.push(name);
+        }
+        let body = self.emit_body(pc + 1, forgloop, Some((forgloop, exit)));
+        for i in 0..var_count {
+            self.reg_name_override.remove(&(a + 3 + i));
+            self.hoisted.remove(&(a + 3 + i));
+        }
+
+        stmts.push(Stmt::GenericFor { vars, exprs, body });
+        Some(exit)
+    }
+
+    fn try_loop(&mut self, pc: usize, hi: usize, stmts: &mut Vec<Stmt>) -> Option<usize> {
+        let back = *self.loop_back.get(&pc)?;
+        if back >= hi {
+            return None;
+        }
+        let back_op = Opcode::from_u8(insn_op(self.proto.code[back]))?;
+        let exit = back + back_op.length().max(1);
+
+        // Remove the header while structuring its body so the body emit doesn't recurse back
+        // into this same loop.
+        self.loop_back.remove(&pc);
+
+        let result = if back_op == Opcode::JUMPBACK {
+            self.structure_jumpback_loop(pc, back, exit, stmts)
+        } else if is_conditional_jump(back_op) {
+            self.structure_condback_repeat(pc, back, back_op, exit, stmts)
+        } else {
+            None
+        };
+
+        if result.is_none() {
+            self.loop_back.insert(pc, back);
+        }
+        result
+    }
+
+    /// A loop whose back-edge is an unconditional JUMPBACK. The single conditional exit test
+    /// classifies it: a test immediately before the back-jump is a `repeat ... until`; a test
+    /// at the top (with statement-free setup) is a `while`.
+    fn structure_jumpback_loop(
+        &mut self,
+        pc: usize,
+        back: usize,
+        exit: usize,
+        stmts: &mut Vec<Stmt>,
+    ) -> Option<usize> {
+        match self.find_loop_test(pc, back, exit) {
+            Some(tp) => {
+                let top = Opcode::from_u8(insn_op(self.proto.code[tp]))?;
+                let tlen = top.length().max(1);
+                if tp + tlen == back && tp > pc {
+                    // repeat ... until <taken test>: body is everything before the test.
+                    self.flush_inline(stmts);
+                    let mut body = Vec::new();
+                    let mut p = None;
+                    self.emit_range(pc, tp, &mut body, &mut p, Some((pc, exit)));
+                    let cond = self.taken_condition(top, tp);
+                    self.flush_inline(&mut body);
+                    stmts.push(Stmt::Repeat { body, cond });
+                    Some(exit)
+                } else {
+                    // while <cond>: the operand setup before the test must be statement-free.
+                    let snapshot = self.regs.clone();
+                    let mut setup = Vec::new();
+                    let mut p = None;
+                    let mut sp = pc;
+                    while sp < tp {
+                        let sop = Opcode::from_u8(insn_op(self.proto.code[sp]))?;
+                        self.step(sop, sp, &mut setup, &mut p);
+                        sp += sop.length().max(1);
+                    }
+                    if !setup.is_empty() {
+                        self.regs = snapshot;
+                        return None;
+                    }
+                    let cond = self.fallthrough_condition(top, tp);
+                    self.flush_inline(stmts);
+                    let body = self.emit_body(tp + tlen, back, Some((pc, exit)));
+                    stmts.push(Stmt::While { cond, body });
+                    Some(exit)
+                }
+            }
+            None => {
+                // No exit test on the back-edge path: an infinite `while true` (with breaks).
+                self.flush_inline(stmts);
+                let body = self.emit_body(pc, back, Some((pc, exit)));
+                stmts.push(Stmt::While {
+                    cond: Expr::Bool(true),
+                    body,
+                });
+                Some(exit)
+            }
+        }
+    }
+
+    /// A loop whose back-edge is itself a conditional jump (continues while taken). The
+    /// `until` condition is the negation of that edge.
+    fn structure_condback_repeat(
+        &mut self,
+        pc: usize,
+        back: usize,
+        back_op: Opcode,
+        exit: usize,
+        stmts: &mut Vec<Stmt>,
+    ) -> Option<usize> {
+        self.flush_inline(stmts);
+        let mut body = Vec::new();
+        let mut p = None;
+        self.emit_range(pc, back, &mut body, &mut p, Some((pc, exit)));
+        let cond = negate(self.taken_condition(back_op, back));
+        self.flush_inline(&mut body);
+        stmts.push(Stmt::Repeat { body, cond });
+        Some(exit)
+    }
+
+    /// First conditional jump in `[lo, hi)` whose taken target is `exit` (the loop test).
+    fn find_loop_test(&self, lo: usize, hi: usize, exit: usize) -> Option<usize> {
+        let mut pc = lo;
+        while pc < hi {
+            let op = Opcode::from_u8(insn_op(self.proto.code[pc]))?;
+            if is_conditional_jump(op) && jump_target(self.proto.code[pc], pc) == Some(exit) {
+                return Some(pc);
+            }
+            pc += op.length().max(1);
+        }
+        None
+    }
+
+    fn try_if(
+        &mut self,
+        pc: usize,
+        hi: usize,
+        stmts: &mut Vec<Stmt>,
+        loop_ctx: Option<(usize, usize)>,
+    ) -> Option<usize> {
+        let insn = self.proto.code[pc];
+        let op = Opcode::from_u8(insn_op(insn))?;
+        let len = op.length().max(1);
+        let target = jump_target(insn, pc)?; // else/end target
+        if target <= pc || target > hi {
+            return None;
+        }
+        let cond = self.fallthrough_condition(op, pc);
+
+        // Is there an `else`? The then-region's last instruction is an unconditional JUMP
+        // skipping forward past `target`.
+        let then_lo = pc + len;
+        let then_last = self.last_instr_before(then_lo, target);
+        let mut else_region: Option<(usize, usize)> = None;
+        let mut region_end = target;
+        let mut then_hi = target;
+        if let Some(tl) = then_last {
+            if Opcode::from_u8(insn_op(self.proto.code[tl])) == Some(Opcode::JUMP) {
+                if let Some(end) = jump_target(self.proto.code[tl], tl) {
+                    if end > target && end <= hi {
+                        else_region = Some((target, end));
+                        region_end = end;
+                        then_hi = tl; // exclude the trailing JUMP
+                    }
+                }
+            }
+        }
+
+        self.flush_inline(stmts);
+        let then_body = self.emit_body(then_lo, then_hi, loop_ctx);
+        let else_body = match else_region {
+            Some((elo, ehi)) => self.emit_body(elo, ehi, loop_ctx),
+            None => Vec::new(),
+        };
+        stmts.push(Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        });
+        Some(region_end)
+    }
+
+    /// The last instruction whose successor PC equals `target`, scanning from `from`.
+    fn last_instr_before(&self, from: usize, target: usize) -> Option<usize> {
+        let mut pc = from;
+        let mut last = None;
+        while pc < target {
+            let op = Opcode::from_u8(insn_op(*self.proto.code.get(pc)?))?;
+            let len = op.length().max(1);
+            if pc + len == target {
+                last = Some(pc);
+            }
+            pc += len;
+        }
+        last
+    }
+
+    /// The condition under which a conditional jump is taken.
+    fn taken_condition(&self, op: Opcode, pc: usize) -> Expr {
+        let insn = self.proto.code[pc];
+        let aux = self.proto.code.get(pc + 1).copied().unwrap_or(0);
+        let a = insn_a(insn);
+        use Opcode::*;
+        match op {
+            JUMPIF => self.reg(a),
+            JUMPIFNOT => Expr::Unary("not ", Box::new(self.reg(a))),
+            JUMPIFEQ | JUMPIFLE | JUMPIFLT | JUMPIFNOTEQ | JUMPIFNOTLE | JUMPIFNOTLT => {
+                self.cmp_cond(op, a, aux)
+            }
+            JUMPXEQKNIL | JUMPXEQKB | JUMPXEQKN | JUMPXEQKS => self.eqk_cond(op, a, aux),
+            _ => Expr::Raw("--[[cond?]]".into()),
+        }
+    }
+
+    /// The condition for the fall-through (not-taken) edge — used as `if`/`while` conditions.
+    fn fallthrough_condition(&self, op: Opcode, pc: usize) -> Expr {
+        negate(self.taken_condition(op, pc))
     }
 
     /// Process one instruction, mutating register state and possibly emitting statements.
@@ -189,7 +649,8 @@ impl<'a> Decompiler<'a> {
 
         use Opcode::*;
         match op {
-            // --- immutable leaves: inline at use, no statement ---
+            // Immutable leaves: cached for inlining within the straight-line span, flushed at
+            // control-flow boundaries so a value never silently crosses an edge.
             LOADNIL => self.set_inline(a, Expr::Nil),
             LOADB => self.set_inline(a, Expr::Bool(b != 0)),
             LOADN => self.set_inline(a, Expr::Num(d.to_string())),
@@ -198,7 +659,6 @@ impl<'a> Decompiler<'a> {
             GETIMPORT => self.set_inline(a, self.const_expr(d as usize)),
             GETGLOBAL => self.set_inline(a, Expr::Var(self.string_const(aux))),
 
-            // --- materialized values ---
             MOVE => self.assign(a, self.reg(b), stmts),
             GETUPVAL => self.assign(a, Expr::Var(self.upval_name(b)), stmts),
             GETTABLE => {
@@ -384,7 +844,7 @@ impl<'a> Decompiler<'a> {
                 stmts.push(Stmt::Goto(self.target_label(insn, pc)));
                 self.mark_partial_goto();
             }
-            PREPVARARGS | NOP | BREAK | COVERAGE | NATIVECALL => {}
+            PREPVARARGS | NOP | BREAK | COVERAGE | NATIVECALL | CLOSEUPVALS => {}
             FASTCALL | FASTCALL1 | FASTCALL2 | FASTCALL2K | FASTCALL3 => {
                 // Optimization hints; the real work is the following CALL.
             }
@@ -586,6 +1046,7 @@ impl<'a> Decompiler<'a> {
     // --- register/name bookkeeping ------------------------------------------------------
 
     /// Read the current expression of a register.
+    /// Read a register: its cached inline expression, or a read of its name.
     fn reg(&self, r: u8) -> Expr {
         match self.regs.get(r as usize).and_then(|e| e.clone()) {
             Some(e) => e,
@@ -593,15 +1054,39 @@ impl<'a> Decompiler<'a> {
         }
     }
 
-    /// Store an inlinable immutable expression in a register (no statement emitted).
+    /// Cache an inlinable immutable expression in a register (no statement emitted).
     fn set_inline(&mut self, r: u8, e: Expr) {
         if let Some(slot) = self.regs.get_mut(r as usize) {
             *slot = Some(e);
         }
     }
 
-    /// Materialize a register: clear any inlined expr so reads use its name, and record it
-    /// for hoisting if it is not a parameter.
+    /// Flush every cached inline value to a named local so nothing crosses a control-flow
+    /// edge. Dead flushes are removed and single-use ones re-inlined by the cleanup passes.
+    fn flush_inline(&mut self, stmts: &mut Vec<Stmt>) {
+        let count = self.regs.len();
+        for r in 0..count {
+            if let Some(e) = self.regs[r].clone() {
+                self.regs[r] = None;
+                if r < self.proto.num_params as usize {
+                    // A parameter slot holding a constant means it was reassigned; emit it.
+                    stmts.push(Stmt::Assign {
+                        targets: vec![Expr::Var(self.reg_name(r as u8))],
+                        values: vec![e],
+                    });
+                } else {
+                    self.hoisted.insert(r as u8);
+                    stmts.push(Stmt::Assign {
+                        targets: vec![Expr::Var(self.reg_name(r as u8))],
+                        values: vec![e],
+                    });
+                }
+            }
+        }
+    }
+
+    /// Materialize a register: clear any cached inline expr (reads now use the name) and
+    /// record it for hoisting if it is not a parameter.
     fn materialize(&mut self, r: u8) {
         if let Some(slot) = self.regs.get_mut(r as usize) {
             *slot = None;
@@ -609,6 +1094,51 @@ impl<'a> Decompiler<'a> {
         if r >= self.proto.num_params {
             self.hoisted.insert(r);
         }
+    }
+
+    /// Names that must not be hoisted as locals: parameters and upvalues.
+    fn non_local_names(&self) -> BTreeSet<String> {
+        let mut s: BTreeSet<String> =
+            (0..self.proto.num_params).map(|r| self.reg_name(r)).collect();
+        for i in 0..self.proto.num_upvalues {
+            s.insert(self.upval_name(i));
+        }
+        s
+    }
+
+    /// Names of registers captured into child closures (must survive cleanup).
+    fn captured_names(&self) -> BTreeSet<String> {
+        self.captured_regs.iter().map(|&r| self.reg_name(r)).collect()
+    }
+
+    /// Registers captured by a child closure: the B operand of each VAL/REF CAPTURE that
+    /// follows a NEWCLOSURE/DUPCLOSURE.
+    fn compute_captured_regs(&self) -> BTreeSet<u8> {
+        let code = &self.proto.code;
+        let mut set = BTreeSet::new();
+        let mut pc = 0;
+        while pc < code.len() {
+            let insn = code[pc];
+            if let Some(op) = Opcode::from_u8(insn_op(insn)) {
+                if matches!(op, Opcode::NEWCLOSURE | Opcode::DUPCLOSURE) {
+                    let mut q = pc + op.length().max(1);
+                    while q < code.len()
+                        && Opcode::from_u8(insn_op(code[q])) == Some(Opcode::CAPTURE)
+                    {
+                        let cap = code[q];
+                        let kind = insn_a(cap);
+                        if kind == capture_type::VAL || kind == capture_type::REF {
+                            set.insert(insn_b(cap));
+                        }
+                        q += 1;
+                    }
+                }
+                pc += op.length().max(1);
+            } else {
+                pc += 1;
+            }
+        }
+        set
     }
 
     /// Emit `name = expr` for a register and mark it materialized.
@@ -623,6 +1153,9 @@ impl<'a> Decompiler<'a> {
     /// A stable name for a register: the debug local name live here if unique, a parameter
     /// name, or `v<reg>`.
     fn reg_name(&self, r: u8) -> String {
+        if let Some(name) = self.reg_name_override.get(&r) {
+            return name.clone();
+        }
         if let Some(name) = self.unique_debug_name(self.proto, r) {
             return name;
         }
@@ -630,6 +1163,37 @@ impl<'a> Decompiler<'a> {
             format!("p{r}")
         } else {
             format!("v{r}")
+        }
+    }
+
+    /// The debug local name for a register live at `pc`, if present and a valid identifier.
+    fn debug_name_at(&self, reg: u8, pc: usize) -> Option<String> {
+        let dbg = self.proto.debug_info.as_ref()?;
+        for l in &dbg.locals {
+            if l.reg == reg && (l.start_pc as usize) <= pc && pc < (l.end_pc as usize) {
+                if let Some(n) = self.module.resolve(l.name) {
+                    if is_identifier(&n) {
+                        return Some(n.into_owned());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// A loop variable's name: its debug name if available, else a synthesized one that does
+    /// not collide with the `vN`/`pN` synthesized names.
+    fn loop_var_name(&mut self, reg: u8, body_pc: usize) -> String {
+        if let Some(n) = self.debug_name_at(reg, body_pc) {
+            return n;
+        }
+        const LETTERS: &[&str] = &["i", "j", "k", "l", "m", "o", "p", "q", "r", "s"];
+        let n = self.next_loopvar;
+        self.next_loopvar += 1;
+        if n < LETTERS.len() {
+            LETTERS[n].to_string()
+        } else {
+            format!("idx{n}")
         }
     }
 
@@ -737,6 +1301,91 @@ fn collect_goto_targets(stmts: &[Stmt]) -> BTreeSet<String> {
     }
     walk(stmts, &mut set);
     set
+}
+
+/// Recursively drop `Label` statements whose name no goto references.
+fn retain_referenced_labels(stmts: &mut Vec<Stmt>, referenced: &BTreeSet<String>) {
+    stmts.retain(|s| !matches!(s, Stmt::Label(n) if !referenced.contains(n)));
+    for s in stmts.iter_mut() {
+        match s {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                retain_referenced_labels(then_body, referenced);
+                retain_referenced_labels(else_body, referenced);
+            }
+            Stmt::While { body, .. }
+            | Stmt::Repeat { body, .. }
+            | Stmt::NumericFor { body, .. }
+            | Stmt::GenericFor { body, .. } => retain_referenced_labels(body, referenced),
+            _ => {}
+        }
+    }
+}
+
+/// A two-way conditional jump (has a taken and a fall-through edge).
+fn is_conditional_jump(op: Opcode) -> bool {
+    use Opcode::*;
+    matches!(
+        op,
+        JUMPIF
+            | JUMPIFNOT
+            | JUMPIFEQ
+            | JUMPIFLE
+            | JUMPIFLT
+            | JUMPIFNOTEQ
+            | JUMPIFNOTLE
+            | JUMPIFNOTLT
+            | JUMPXEQKNIL
+            | JUMPXEQKB
+            | JUMPXEQKN
+            | JUMPXEQKS
+    )
+}
+
+/// Logically negate a boolean condition, pushing the negation into comparisons so the
+/// result reads naturally. Note: flipping ordering comparisons mirrors exactly how the
+/// compiler chose the branch (it is recovery, not an unsound rewrite).
+fn negate(e: Expr) -> Expr {
+    match e {
+        Expr::Binary("==", a, b) => Expr::Binary("~=", a, b),
+        Expr::Binary("~=", a, b) => Expr::Binary("==", a, b),
+        Expr::Binary("<", a, b) => Expr::Binary(">=", a, b),
+        Expr::Binary("<=", a, b) => Expr::Binary(">", a, b),
+        Expr::Binary(">", a, b) => Expr::Binary("<=", a, b),
+        Expr::Binary(">=", a, b) => Expr::Binary("<", a, b),
+        Expr::Unary("not ", inner) => *inner,
+        other => Expr::Unary("not ", Box::new(other)),
+    }
+}
+
+/// A numeric-for `step` that is literally `1` is the Luau default and can be omitted.
+fn drop_unit_for_steps(stmts: &mut [Stmt]) {
+    for s in stmts.iter_mut() {
+        if let Stmt::NumericFor { step, body, .. } = s {
+            if matches!(step, Some(Expr::Num(n)) if n == "1") {
+                *step = None;
+            }
+            drop_unit_for_steps(body);
+        } else {
+            match s {
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    drop_unit_for_steps(then_body);
+                    drop_unit_for_steps(else_body);
+                }
+                Stmt::While { body, .. }
+                | Stmt::Repeat { body, .. }
+                | Stmt::GenericFor { body, .. } => drop_unit_for_steps(body),
+                _ => {}
+            }
+        }
+    }
 }
 
 fn bin_op_text(op: Opcode) -> &'static str {

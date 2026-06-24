@@ -137,7 +137,7 @@ fn roblox_idioms_get_smart_names() {
         "part = Instance.new(\"Part\")",
         "Players.LocalPlayer.Character",
         "children = workspace:GetChildren()",
-        "count = #children",
+        "#children",
     ] {
         assert!(
             out.source.contains(needle),
@@ -150,6 +150,84 @@ fn roblox_idioms_get_smart_names() {
         "smart-named output must recompile:\n{}",
         out.source
     );
+}
+
+/// Recompile `src`, returning the resulting bytecode, or `None` when the compiler is absent.
+fn recompile_bytes(src: &str, tag: &str) -> Option<Vec<u8>> {
+    let luau = root().join("tools").join("luau-compile.exe");
+    if !luau.exists() {
+        return None;
+    }
+    let tmp = std::env::temp_dir().join(format!("luau_sig_{tag}.luau"));
+    fs::write(&tmp, src).unwrap();
+    let out = Command::new(&luau)
+        .arg("--binary")
+        .arg("-O1")
+        .arg(&tmp)
+        .output()
+        .expect("run luau-compile");
+    if out.status.success() && out.stdout.first().map(|&b| (3..=11).contains(&b)).unwrap_or(false) {
+        Some(out.stdout)
+    } else {
+        None
+    }
+}
+
+/// Count control-flow-defining opcodes by category across a module:
+/// [numeric-for, generic-for, while/repeat back-edges, conditional branches].
+fn cf_signature(m: &luau_bytecode::Module) -> [usize; 4] {
+    use luau_bytecode::opcode::{insn_op, Opcode};
+    let mut sig = [0usize; 4];
+    for p in &m.protos {
+        let mut pc = 0;
+        while pc < p.code.len() {
+            if let Some(op) = Opcode::from_u8(insn_op(p.code[pc])) {
+                use Opcode::*;
+                match op {
+                    FORNPREP => sig[0] += 1,
+                    FORGPREP | FORGPREP_INEXT | FORGPREP_NEXT => sig[1] += 1,
+                    JUMPBACK => sig[2] += 1,
+                    JUMPIF | JUMPIFNOT | JUMPIFEQ | JUMPIFLE | JUMPIFLT | JUMPIFNOTEQ
+                    | JUMPIFNOTLE | JUMPIFNOTLT | JUMPXEQKNIL | JUMPXEQKB | JUMPXEQKN
+                    | JUMPXEQKS => sig[3] += 1,
+                    _ => {}
+                }
+                pc += op.length().max(1);
+            } else {
+                pc += 1;
+            }
+        }
+    }
+    sig
+}
+
+/// The structural round-trip: every fully-structured (non-partial) decompilation must
+/// recompile to bytecode with the SAME control-flow shape (same count of for/while/if
+/// constructs) as the original. This proves the structurer recovered the real control flow,
+/// not just something that happens to compile.
+#[test]
+fn structured_corpus_round_trips() {
+    if !root().join("tools").join("luau-compile.exe").exists() {
+        eprintln!("skipping: compiler not present");
+        return;
+    }
+    for path in all_files() {
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let original = parse_and_validate(&fs::read(&path).unwrap()).unwrap();
+        let out = decompile(&original);
+        if out.partial {
+            continue;
+        }
+        let bytes = recompile_bytes(&out.source, &name)
+            .unwrap_or_else(|| panic!("{name}: non-partial output failed to recompile:\n{}", out.source));
+        let recompiled = parse_and_validate(&bytes).unwrap();
+        assert_eq!(
+            cf_signature(&original),
+            cf_signature(&recompiled),
+            "{name}: control-flow shape changed.\n{}",
+            out.source
+        );
+    }
 }
 
 #[test]
