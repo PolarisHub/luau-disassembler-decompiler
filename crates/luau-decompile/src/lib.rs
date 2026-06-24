@@ -77,24 +77,21 @@ fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoRep
     let mut d = Decompiler::new(module, proto, proto_idx);
     let mut stmts = d.run();
 
-    reports.push(ProtoReport {
-        index: proto_idx,
-        name: module.resolve(proto.debug_name).map(|c| c.into_owned()),
-        partial: d.partial,
-        notes: d.notes.clone(),
-    });
+    // Remove unreachable code left after returns/breaks by inline-cache flushes.
+    cleanup::drop_unreachable(&mut stmts);
+    // Recover the `z = a and b or c` short-circuit ternary from its goto/label diamond.
+    cleanup::recover_and_or(&mut stmts);
 
     // Fold register-reuse field/method chains (x = a.b; x = x.c -> x = a.b.c) before naming,
     // so a variable is named from its final, complete expression.
-    // Remove unreachable code left after returns/breaks by inline-cache flushes.
-    cleanup::drop_unreachable(&mut stmts);
-
     naming::fold_refinements(&mut stmts);
 
     // Restore readability lost by always materializing: inline single-use pure temporaries
-    // and drop dead stores. Both are sound (see cleanup.rs). Captured registers are excluded
-    // so closures don't lose the variables they close over.
-    let protected = d.captured_names();
+    // and drop dead stores. Both are sound (see cleanup.rs). Captured registers and globals
+    // are excluded: closures must keep the variables they close over, and a global write is
+    // an observable effect even when nothing in this proto reads it back.
+    let mut protected = d.captured_names();
+    protected.extend(d.globals.iter().cloned());
     cleanup::single_use_inline(&mut stmts, &protected);
     cleanup::dead_store_elim(&mut stmts, &protected);
     // A constant `1` step on a numeric for is implicit.
@@ -116,6 +113,16 @@ fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoRep
         }
     }
 
+    // Determine `partial` from the FINAL tree: a proto is partial only if some unstructured
+    // control flow (a goto/label) survived all recovery passes, or a nested closure was partial.
+    let partial = contains_unstructured(&stmts) || d.has_partial_child;
+    reports.push(ProtoReport {
+        index: proto_idx,
+        name: module.resolve(proto.debug_name).map(|c| c.into_owned()),
+        partial,
+        notes: d.notes.clone(),
+    });
+
     // Hoist all materialized non-parameter locals so every assignment has a declaration in
     // scope regardless of how control flow nests.
     let mut out = String::new();
@@ -124,6 +131,24 @@ fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoRep
     }
     out.push_str(&render_block(&stmts, 0));
     out
+}
+
+/// Whether the tree still contains unstructured control flow (a `goto`/label), meaning the
+/// reconstruction fell back rather than recovering a native construct.
+fn contains_unstructured(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Goto(_) | Stmt::Label(_) => true,
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => contains_unstructured(then_body) || contains_unstructured(else_body),
+        Stmt::While { body, .. }
+        | Stmt::Repeat { body, .. }
+        | Stmt::NumericFor { body, .. }
+        | Stmt::GenericFor { body, .. } => contains_unstructured(body),
+        _ => false,
+    })
 }
 
 struct Decompiler<'a> {
@@ -148,7 +173,12 @@ struct Decompiler<'a> {
     /// inlined away or dead-store-eliminated — the closure references them by name, which our
     /// use-counting (the closure body is opaque) cannot see.
     captured_regs: BTreeSet<u8>,
-    partial: bool,
+    /// Set when a nested closure decompiled to a partial result (its gotos are hidden inside
+    /// the rendered closure string, so the parent can't see them otherwise).
+    has_partial_child: bool,
+    /// Names accessed as globals (via GETGLOBAL/SETGLOBAL). They must not be hoisted as
+    /// locals — doing so would turn a global write into a local one.
+    globals: BTreeSet<String>,
     notes: Vec<String>,
 }
 
@@ -165,7 +195,8 @@ impl<'a> Decompiler<'a> {
             reg_name_override: BTreeMap::new(),
             next_loopvar: 0,
             captured_regs: BTreeSet::new(),
-            partial: false,
+            has_partial_child: false,
+            globals: BTreeSet::new(),
             notes: Vec::new(),
         }
     }
@@ -282,6 +313,14 @@ impl<'a> Decompiler<'a> {
                     }
                 }
             }
+            // Boolean materialization: a conditional jump followed by two LOADBs writing the
+            // same register (false then true) is just a stored boolean condition.
+            if is_conditional_jump(op) {
+                if let Some(next) = self.try_bool_materialize(pc, hi, stmts) {
+                    pc = next;
+                    continue;
+                }
+            }
             // if / if-else: a forward conditional jump (but not a loop header's test).
             if !is_header && is_conditional_jump(op) {
                 if let Some(t) = jump_target(insn, pc) {
@@ -328,7 +367,8 @@ impl<'a> Decompiler<'a> {
             return None;
         }
         let flop = Opcode::from_u8(insn_op(*self.proto.code.get(fornloop)?))?;
-        if flop != Opcode::FORNLOOP || jump_target(self.proto.code[fornloop], fornloop) != Some(pc + 1)
+        if flop != Opcode::FORNLOOP
+            || jump_target(self.proto.code[fornloop], fornloop) != Some(pc + 1)
         {
             return None;
         }
@@ -533,6 +573,60 @@ impl<'a> Decompiler<'a> {
         Some(exit)
     }
 
+    /// Recognize `x = <cond>` materialized as a conditional jump plus two booleans:
+    /// ```text
+    /// JUMPIF... R -> T          (taken -> the `true` load)
+    /// LOADB Rt <false> +1       (fall-through: Rt = false, skip the true load)
+    /// T: LOADB Rt <true>        (Rt = true)
+    /// ```
+    /// Sets `Rt` to the boolean condition and returns the PC just past the pattern.
+    fn try_bool_materialize(
+        &mut self,
+        pc: usize,
+        hi: usize,
+        stmts: &mut Vec<Stmt>,
+    ) -> Option<usize> {
+        let insn = self.proto.code[pc];
+        let op = Opcode::from_u8(insn_op(insn))?;
+        let target = jump_target(insn, pc)?;
+        let next = pc + op.length().max(1);
+        if next >= hi || target >= hi {
+            return None;
+        }
+        // Fall-through: LOADB with a skip.
+        let false_insn = *self.proto.code.get(next)?;
+        if Opcode::from_u8(insn_op(false_insn)) != Some(Opcode::LOADB) || insn_c(false_insn) == 0 {
+            return None;
+        }
+        let rt = insn_a(false_insn);
+        let b_false = insn_b(false_insn) != 0;
+        let skip_target = next + insn_c(false_insn) as usize + 1;
+        // Taken target must be the very next instruction: the `true` LOADB.
+        if target != next + 1 {
+            return None;
+        }
+        let true_insn = *self.proto.code.get(target)?;
+        if Opcode::from_u8(insn_op(true_insn)) != Some(Opcode::LOADB)
+            || insn_a(true_insn) != rt
+            || insn_c(true_insn) != 0
+        {
+            return None;
+        }
+        let b_true = insn_b(true_insn) != 0;
+        // The false-load must skip exactly over the true-load, and the booleans must differ.
+        if skip_target != target + 1 || b_true == b_false {
+            return None;
+        }
+
+        // Rt = taken ? b_true : b_false. With (true,false) that's the condition; with
+        // (false,true) it's its negation. Materialize it in place (rather than caching) so
+        // the condition's operands are read now, before any later reassignment.
+        let taken = self.taken_condition(op, pc);
+        let expr = if b_true { taken } else { negate(taken) };
+        self.assign(rt, expr, stmts);
+        Some(target + 1)
+    }
+
     /// First conditional jump in `[lo, hi)` whose taken target is `exit` (the loop test).
     fn find_loop_test(&self, lo: usize, hi: usize, exit: usize) -> Option<usize> {
         let mut pc = lo;
@@ -657,7 +751,11 @@ impl<'a> Decompiler<'a> {
             LOADK => self.set_inline(a, self.const_expr(d as usize)),
             LOADKX => self.set_inline(a, self.const_expr(aux as usize)),
             GETIMPORT => self.set_inline(a, self.const_expr(d as usize)),
-            GETGLOBAL => self.set_inline(a, Expr::Var(self.string_const(aux))),
+            GETGLOBAL => {
+                let g = self.string_const(aux);
+                self.globals.insert(g.clone());
+                self.set_inline(a, Expr::Var(g));
+            }
 
             MOVE => self.assign(a, self.reg(b), stmts),
             GETUPVAL => self.assign(a, Expr::Var(self.upval_name(b)), stmts),
@@ -750,8 +848,10 @@ impl<'a> Decompiler<'a> {
                 });
             }
             SETGLOBAL => {
+                let g = self.string_const(aux);
+                self.globals.insert(g.clone());
                 stmts.push(Stmt::Assign {
-                    targets: vec![Expr::Var(self.string_const(aux))],
+                    targets: vec![Expr::Var(g)],
                     values: vec![self.reg(a)],
                 });
             }
@@ -949,7 +1049,7 @@ impl<'a> Decompiler<'a> {
         let mut sub_reports = Vec::new();
         let body = decompile_proto(self.module, child_idx, &mut sub_reports);
         if sub_reports.iter().any(|r| r.partial) {
-            self.partial = true;
+            self.has_partial_child = true;
         }
         // Indent the child body by one level.
         let indented: String = body
@@ -1096,19 +1196,24 @@ impl<'a> Decompiler<'a> {
         }
     }
 
-    /// Names that must not be hoisted as locals: parameters and upvalues.
+    /// Names that must not be hoisted as locals: parameters, upvalues, and globals.
     fn non_local_names(&self) -> BTreeSet<String> {
-        let mut s: BTreeSet<String> =
-            (0..self.proto.num_params).map(|r| self.reg_name(r)).collect();
+        let mut s: BTreeSet<String> = (0..self.proto.num_params)
+            .map(|r| self.reg_name(r))
+            .collect();
         for i in 0..self.proto.num_upvalues {
             s.insert(self.upval_name(i));
         }
+        s.extend(self.globals.iter().cloned());
         s
     }
 
     /// Names of registers captured into child closures (must survive cleanup).
     fn captured_names(&self) -> BTreeSet<String> {
-        self.captured_regs.iter().map(|&r| self.reg_name(r)).collect()
+        self.captured_regs
+            .iter()
+            .map(|&r| self.reg_name(r))
+            .collect()
     }
 
     /// Registers captured by a child closure: the B operand of each VAL/REF CAPTURE that
@@ -1258,10 +1363,7 @@ impl<'a> Decompiler<'a> {
     }
 
     fn mark_partial_goto(&mut self) {
-        if !self.partial {
-            self.partial = true;
-            self.note("control flow rendered with goto/labels (structuring incomplete)");
-        }
+        self.note("control flow rendered with goto/labels (structuring incomplete)");
     }
 
     fn note(&mut self, msg: &str) {

@@ -72,7 +72,102 @@ pub fn smart_rename(stmts: &[Stmt], hoist_names: &[String]) -> BTreeMap<String, 
         reserved.insert(unique.clone());
         map.insert(orig.clone(), unique);
     }
+
+    // Context-based naming for things the defining expression alone can't name.
+    apply_tuple_names(stmts, &candidates, &mut reserved, &mut map);
+    apply_field_sink_names(stmts, &candidates, &mut reserved, &mut map);
     map
+}
+
+/// Conventional names for the destinations of a known multi-value call.
+fn tuple_names_for(callee: &Expr, n: usize) -> Option<Vec<String>> {
+    let name = match callee {
+        Expr::Var(f) => last_segment(f)?,
+        _ => return None,
+    };
+    let base: &[&str] = match name.as_str() {
+        "pcall" | "xpcall" | "resume" => &["ok", "result"],
+        "find" => &["startIndex", "endIndex"],
+        "next" => &["key", "value"],
+        "gsub" => &["replaced", "count"],
+        _ => return None,
+    };
+    Some(
+        (0..n)
+            .map(|i| {
+                base.get(i)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("result{}", i + 1))
+            })
+            .collect(),
+    )
+}
+
+/// `local ok, result = pcall(f)` etc.: name the destinations of known tuple-returning calls.
+fn apply_tuple_names(
+    stmts: &[Stmt],
+    candidates: &BTreeSet<String>,
+    reserved: &mut BTreeSet<String>,
+    map: &mut BTreeMap<String, String>,
+) {
+    for s in stmts {
+        if let Stmt::Assign { targets, values } = s {
+            if values.len() == 1 && targets.len() >= 2 {
+                if let Expr::Call(callee, _) = &values[0] {
+                    if let Some(names) = tuple_names_for(callee, targets.len()) {
+                        for (t, nm) in targets.iter().zip(names.iter()) {
+                            if let Expr::Var(v) = t {
+                                if candidates.contains(v) && !map.contains_key(v) {
+                                    let u = unique_name(nm, reserved);
+                                    reserved.insert(u.clone());
+                                    map.insert(v.clone(), u);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for_each_child_block(s, |b| apply_tuple_names(b, candidates, reserved, map));
+    }
+}
+
+/// A temporary later stored into a field/index gets named after that field
+/// (`x = ...; obj.Health = x` => `health`).
+fn apply_field_sink_names(
+    stmts: &[Stmt],
+    candidates: &BTreeSet<String>,
+    reserved: &mut BTreeSet<String>,
+    map: &mut BTreeMap<String, String>,
+) {
+    for s in stmts {
+        if let Stmt::Assign { targets, values } = s {
+            if targets.len() == 1 && values.len() == 1 {
+                if let Expr::Var(name) = &values[0] {
+                    if candidates.contains(name) && !map.contains_key(name) {
+                        let field = match &targets[0] {
+                            Expr::Field(_, f) => Some(f.clone()),
+                            Expr::Index(_, k) => match k.as_ref() {
+                                Expr::Str(lit) => Some(strip_quotes(lit)),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(f) = field {
+                            if f != "Parent" {
+                                if let Some(base) = sanitize(&lower_first(&f)) {
+                                    let u = unique_name(&base, reserved);
+                                    reserved.insert(u.clone());
+                                    map.insert(name.clone(), u);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for_each_child_block(s, |b| apply_field_sink_names(b, candidates, reserved, map));
+    }
 }
 
 /// Fold chained refinements: `x = a.b; x = x.c` -> `x = a.b.c`, the compiler's reuse of one
@@ -429,9 +524,9 @@ pub fn derive_name(e: &Expr) -> Option<String> {
                     }
                 }
             }
-            // Players.LocalPlayer -> localPlayer (a conventional fixed name).
-            if field == "LocalPlayer" {
-                return Some("localPlayer".to_string());
+            // Conventional names for well-known Roblox properties.
+            if let Some(n) = roblox_field_name(field) {
+                return Some(n.to_string());
             }
             // Otherwise the trailing field, read as an instance: player.Character -> character.
             sanitize(&lower_first(field))
@@ -444,6 +539,41 @@ pub fn derive_name(e: &Expr) -> Option<String> {
         }
         // #players -> playerCount ; #t -> count
         Expr::Unary(op, inner) if *op == "#" => Some(length_name(inner)),
+        // Boolean-shaped expressions stored in a local: nil checks, emptiness checks.
+        Expr::Binary(op, a, b) => derive_bool_name(op, a, b),
+        _ => None,
+    }
+}
+
+/// Conventional variable name for a well-known Roblox property field.
+fn roblox_field_name(field: &str) -> Option<&'static str> {
+    Some(match field {
+        "LocalPlayer" => "localPlayer",
+        "HumanoidRootPart" => "rootPart",
+        "PrimaryPart" => "primaryPart",
+        "CurrentCamera" => "camera",
+        "CFrame" => "cframe",
+        "Position" => "position",
+        "Velocity" | "AssemblyLinearVelocity" => "velocity",
+        "Parent" => "parent",
+        _ => return None,
+    })
+}
+
+/// Name a boolean-valued local after the shape of its condition.
+fn derive_bool_name(op: &str, a: &Expr, b: &Expr) -> Option<String> {
+    let noun = |e: &Expr| name_from_value(e).map(|n| upper_first(&n));
+    match (op, b) {
+        // x ~= nil -> hasX ; x == nil -> missingX
+        ("~=", Expr::Nil) => noun(a).map(|n| format!("has{n}")),
+        ("==", Expr::Nil) => noun(a).map(|n| format!("missing{n}")),
+        // #t == 0 -> isEmpty ; #t > 0 -> hasItems
+        ("==", Expr::Num(z)) if z == "0" && matches!(a, Expr::Unary("#", _)) => {
+            Some("isEmpty".to_string())
+        }
+        (">", Expr::Num(z)) if z == "0" && matches!(a, Expr::Unary("#", _)) => {
+            Some("hasItems".to_string())
+        }
         _ => None,
     }
 }
@@ -461,6 +591,9 @@ fn derive_from_call(callee: &Expr, args: &[Expr]) -> Option<String> {
             "tostring" => return Some(suffix_base(args.first(), "Str", "str")),
             "tonumber" => return Some(suffix_base(args.first(), "Num", "num")),
             "typeof" | "type" => return Some(suffix_base(args.first(), "Type", "typeName")),
+            "tick" => return Some("now".to_string()),
+            "newproxy" => return Some("proxy".to_string()),
+            "select" => return Some("selected".to_string()),
             _ => {}
         }
     }
@@ -480,12 +613,27 @@ fn derive_from_call(callee: &Expr, args: &[Expr]) -> Option<String> {
         if let Some(n) = datatype_value_name(&owner) {
             return Some(n);
         }
-        // table./math. library results worth naming.
+        // Standard-library results worth naming.
         match (owner.as_str(), member.as_str()) {
             ("table", "remove") => return Some("removed".to_string()),
             ("table", "find") => return Some("index".to_string()),
             ("table", "pack") => return Some("args".to_string()),
+            ("table", "concat") => return Some("joined".to_string()),
+            ("table", "create") => return Some("list".to_string()),
+            ("table", "clone") => return Some("copy".to_string()),
             ("math", "random") => return Some("random".to_string()),
+            ("math", "floor") | ("math", "ceil") | ("math", "round") => {
+                return Some("rounded".to_string())
+            }
+            ("math", "sqrt") => return Some("root".to_string()),
+            ("os", "time") | ("os", "clock") => return Some("now".to_string()),
+            ("os", "date") => return Some("date".to_string()),
+            ("task", "wait") => return Some("dt".to_string()),
+            ("string", "format") => return Some("formatted".to_string()),
+            ("string", "gsub") => return Some("replaced".to_string()),
+            ("string", "split") => return Some("parts".to_string()),
+            ("string", "rep") => return Some("repeated".to_string()),
+            ("string", "sub") => return Some("substring".to_string()),
             _ => {}
         }
         if member == "new" {
@@ -528,8 +676,55 @@ fn derive_from_method(recv: &Expr, method: &str, args: &[Expr]) -> Option<String
         }
         // remote:InvokeServer()/InvokeClient() returns a value.
         "InvokeServer" | "InvokeClient" => Some("result".to_string()),
-        // GetChildren -> children, GetPlayers -> players, IsA -> isClass, etc.
+        // :IsA("BasePart") -> isBasePart (boolean named after the class).
+        "IsA" => match args.first() {
+            Some(Expr::Str(lit)) => sanitize(&format!("is{}", upper_first(&strip_quotes(lit)))),
+            _ => method_to_noun(method),
+        },
+        // :GetAttribute("Speed") -> speed ; :GetPropertyChangedSignal("Health") -> healthChangedSignal.
+        "GetAttribute" => match args.first() {
+            Some(Expr::Str(lit)) => sanitize(&lower_first(&strip_quotes(lit))),
+            _ => None,
+        },
+        "GetPropertyChangedSignal" | "GetAttributeChangedSignal" => match args.first() {
+            Some(Expr::Str(lit)) => {
+                sanitize(&format!("{}ChangedSignal", lower_first(&strip_quotes(lit))))
+            }
+            _ => Some("changedSignal".to_string()),
+        },
+        // Spatial queries.
+        "Raycast" | "Blockcast" | "Shapecast" | "Spherecast" => Some("raycastResult".to_string()),
+        "Dot" => Some("dotProduct".to_string()),
+        "Cross" => Some("crossProduct".to_string()),
+        "Lerp" => Some("lerped".to_string()),
+        "GetMouseLocation" => Some("mouseLocation".to_string()),
+        "GetMouseDelta" => Some("mouseDelta".to_string()),
+        "UserOwnsGamePassAsync" => Some("ownsGamePass".to_string()),
+        "GetUserIdFromNameAsync" => Some("userId".to_string()),
+        // Common Roblox/HTTP/DataStore/stdlib result nouns.
+        "Clone" => Some("clone".to_string()),
+        "GetPivot" => Some("pivot".to_string()),
+        "JSONDecode" => Some("decoded".to_string()),
+        "JSONEncode" => Some("json".to_string()),
+        "GetAsync" => Some("data".to_string()),
+        "SetAsync" | "UpdateAsync" => Some("setResult".to_string()),
+        "GetDataStore" | "GetOrderedDataStore" => Some("store".to_string()),
+        "SubscribeAsync" => Some("subscription".to_string()),
+        "GenerateGUID" => Some("guid".to_string()),
+        "format" => Some("formatted".to_string()),
+        "gsub" => Some("replaced".to_string()),
+        "split" => Some("parts".to_string()),
+        "sub" => Some("substring".to_string()),
+        // GetChildren -> children, GetPlayers -> players, Clone -> clone, etc.
         _ => method_to_noun(method),
+    }
+}
+
+fn upper_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
     }
 }
 
@@ -820,6 +1015,53 @@ mod tests {
         // 40-char string is not truncated.
         let long: Vec<u8> = std::iter::repeat(b'x').take(40).collect();
         assert_eq!(lua_string_literal(&long).len(), 42);
+    }
+
+    #[test]
+    fn derives_more_nouns() {
+        let isa = Expr::MethodCall(
+            Box::new(Expr::Var("part".into())),
+            "IsA".into(),
+            vec![s("BasePart")],
+        );
+        assert_eq!(derive_name(&isa).as_deref(), Some("isBasePart"));
+
+        let clone = Expr::MethodCall(Box::new(Expr::Var("model".into())), "Clone".into(), vec![]);
+        assert_eq!(derive_name(&clone).as_deref(), Some("clone"));
+
+        let attr = Expr::MethodCall(
+            Box::new(Expr::Var("p".into())),
+            "GetAttribute".into(),
+            vec![s("Speed")],
+        );
+        assert_eq!(derive_name(&attr).as_deref(), Some("speed"));
+
+        let raycast = Expr::MethodCall(
+            Box::new(Expr::Var("workspace".into())),
+            "Raycast".into(),
+            vec![],
+        );
+        assert_eq!(derive_name(&raycast).as_deref(), Some("raycastResult"));
+
+        // x ~= nil -> hasX
+        let has = Expr::Binary(
+            "~=",
+            Box::new(Expr::MethodCall(
+                Box::new(Expr::Var("m".into())),
+                "FindFirstChild".into(),
+                vec![s("Seat")],
+            )),
+            Box::new(Expr::Nil),
+        );
+        assert_eq!(derive_name(&has).as_deref(), Some("hasSeat"));
+
+        // string.format(...) -> formatted (dotted-import callee)
+        let fmt = call("string.format", vec![s("%d")]);
+        assert_eq!(derive_name(&fmt).as_deref(), Some("formatted"));
+
+        // os.time() -> now
+        let now = call("os.time", vec![]);
+        assert_eq!(derive_name(&now).as_deref(), Some("now"));
     }
 
     #[test]

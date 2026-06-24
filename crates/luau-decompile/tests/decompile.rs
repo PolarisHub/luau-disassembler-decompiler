@@ -166,18 +166,27 @@ fn recompile_bytes(src: &str, tag: &str) -> Option<Vec<u8>> {
         .arg(&tmp)
         .output()
         .expect("run luau-compile");
-    if out.status.success() && out.stdout.first().map(|&b| (3..=11).contains(&b)).unwrap_or(false) {
+    if out.status.success()
+        && out
+            .stdout
+            .first()
+            .map(|&b| (3..=11).contains(&b))
+            .unwrap_or(false)
+    {
         Some(out.stdout)
     } else {
         None
     }
 }
 
-/// Count control-flow-defining opcodes by category across a module:
-/// [numeric-for, generic-for, while/repeat back-edges, conditional branches].
-fn cf_signature(m: &luau_bytecode::Module) -> [usize; 4] {
+/// Count opcodes by category across a module:
+/// [numeric-for, generic-for, while/repeat back-edges, conditional branches, global access].
+/// The global count guards against a decompiler bug turning a local into an implicit global
+/// (e.g. an undeclared tuple-assignment target) — that still compiles, so only the opcode
+/// profile reveals it.
+fn cf_signature(m: &luau_bytecode::Module) -> [usize; 5] {
     use luau_bytecode::opcode::{insn_op, Opcode};
-    let mut sig = [0usize; 4];
+    let mut sig = [0usize; 5];
     for p in &m.protos {
         let mut pc = 0;
         while pc < p.code.len() {
@@ -190,6 +199,7 @@ fn cf_signature(m: &luau_bytecode::Module) -> [usize; 4] {
                     JUMPIF | JUMPIFNOT | JUMPIFEQ | JUMPIFLE | JUMPIFLT | JUMPIFNOTEQ
                     | JUMPIFNOTLE | JUMPIFNOTLT | JUMPXEQKNIL | JUMPXEQKB | JUMPXEQKN
                     | JUMPXEQKS => sig[3] += 1,
+                    GETGLOBAL | SETGLOBAL => sig[4] += 1,
                     _ => {}
                 }
                 pc += op.length().max(1);
@@ -218,8 +228,12 @@ fn structured_corpus_round_trips() {
         if out.partial {
             continue;
         }
-        let bytes = recompile_bytes(&out.source, &name)
-            .unwrap_or_else(|| panic!("{name}: non-partial output failed to recompile:\n{}", out.source));
+        let bytes = recompile_bytes(&out.source, &name).unwrap_or_else(|| {
+            panic!(
+                "{name}: non-partial output failed to recompile:\n{}",
+                out.source
+            )
+        });
         let recompiled = parse_and_validate(&bytes).unwrap();
         assert_eq!(
             cf_signature(&original),
@@ -231,13 +245,25 @@ fn structured_corpus_round_trips() {
 }
 
 #[test]
-fn stripped_straight_line_recompiles() {
-    // Synthesized + smart-named output for stripped bytecode is still valid Luau.
-    for name in ["02_arith", "09_method_call", "14_string_ops", "16_roblox"] {
-        let module = parse_and_validate(&read_stripped(&format!("{name}.luauc"))).unwrap();
+fn stripped_corpus_recompiles() {
+    // Synthesized + smart-named output for the whole STRIPPED corpus (no debug names) must
+    // still be valid Luau the real compiler accepts.
+    let dir = root().join("corpus").join("bytecode-stripped");
+    if !dir.exists() {
+        return;
+    }
+    let mut files: Vec<PathBuf> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().map(|x| x == "luauc").unwrap_or(false))
+        .collect();
+    files.sort();
+    for path in files {
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let module = parse_and_validate(&fs::read(&path).unwrap()).unwrap();
         let out = decompile(&module);
         if out.partial {
-            continue; // control-flow regions fall back to goto; skip those here
+            continue; // goto fallback isn't valid Luau by design; skip
         }
         assert!(
             recompiles(&out.source, &format!("strip_{name}")),

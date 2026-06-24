@@ -1,0 +1,33 @@
+Function 0 (??):
+; params=0 upvals=1 vararg=false stack=3 line=4
+    0       GETUPVAL R0 0  ; line 5
+    1       LOADK R2 K0 ['Coins']  ; line 5
+    2       NAMECALL R0 R0 K1 ['GetAttribute']  ; line 5
+    4       CALL R0 2 -1  ; line 5
+    5       RETURN R0 -1  ; line 5
+
+Function 1 (process):
+; params=3 upvals=0 vararg=false stack=10 line=3
+    0       GETIMPORT R3 1 [pcall]  ; line 4
+    2       NEWCLOSURE R4 P0  ; line 4
+    3       CAPTURE VAL R0  ; line 4
+    4       CALL R3 1 2  ; line 4
+    5       ADD R5 R1 R2  ; line 7
+    6       GETTABLEKS R6 R0 K2 ['Character']  ; line 8
+    8       GETTABLEKS R6 R6 K3 ['Humanoid']  ; line 8
+   10       SETTABLEKS R5 R6 K4 ['Health']  ; line 8
+   12       GETTABLEKS R7 R0 K2 ['Character']  ; line 9
+   14       JUMPXEQKNIL R7 L0 NOT  ; line 9
+   16       LOADB R6 0 +1  ; line 9
+   17  L0:  LOADB R6 1  ; line 9
+   18  L1:  MOVE R7 R3  ; line 10
+   19       MOVE R8 R4  ; line 10
+   20       MOVE R9 R6  ; line 10
+   21       RETURN R7 3  ; line 10
+
+Function 2 (??):
+; params=0 upvals=0 vararg=true stack=1 line=1
+    0       PREPVARARGS 0  ; line 1
+    1       DUPCLOSURE R0 K0 ['process']  ; line 3
+    2       RETURN R0 1  ; line 12
+

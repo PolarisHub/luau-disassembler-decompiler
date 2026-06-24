@@ -1,0 +1,74 @@
+{
+  "summary": "Merged design vs naming.rs. Defining-expr rules slot into derive_name (derive_from_call L451, derive_from_method L506), first-match-wins, most-specific-first, reusing call_owner_member, trailing_noun, datatype_value_name, lower_first, sanitize, singular. Context rules need a use-site scan run only when derive_name is None. Generic Field-lowerCamel L437 and Get-strip L532 already fire so noop entries dropped. Datatype ctors fire only on member new today so fromRGB and Signal.new are real adds. Single-def guard L57-63 blocks accumulators unless exempted.",
+  "defining_expr_rules": [
+    {
+      "match": "Extend datatype_value_name to non-new ctors and new owners: Color3 fromRGB/fromHSV/fromHex; new owner RaycastParams/OverlapParams/TeleportOptions/Random; Signal/GoodSignal=signal, Maid/Janitor/Trove=lowerFirst(owner), Promise=promise; Vector literal=vector",
+      "name": "color raycastParams signal vector",
+      "example": "local color = Color3.fromRGB()"
+    },
+    {
+      "match": "MethodCall by method name: Raycast/Blockcast/Shapecast/Spherecast=raycastResult; Create where recv noun is TweenService=tween; Clone empty=recvNoun+Clone; CFrame ToWorldSpace=world*/ToObjectSpace=object*/Lerp=lerped; Vector Dot=dotProduct Cross=crossProduct; self-returning Init/Start/Setup and Set/With/Add chain=recv noun",
+      "name": "raycastResult tween dotProduct sourceClone",
+      "example": "local raycastResult = workspace:Raycast()"
+    },
+    {
+      "match": "literal-arg and receiver-disambiguated async: GetAttribute=lowerFirst(name); GetPropertyChangedSignal/GetAttributeChangedSignal=name+ChangedSignal; IsA=is+Pascal(arg); Marketplace UserOwnsGamePassAsync=ownsGamePass; UIS GetMouseLocation/GetMouseDelta/GetLastInputType; Players GetUserIdFromNameAsync=userId",
+      "name": "attrName keyChangedSignal isClass ownsGamePass mouseLocation userId",
+      "example": "local spawnCost = part:GetAttribute(SpawnCost)"
+    },
+    {
+      "match": "DataStore handle (recv ends Store) GetAsync=key+Data else savedData, SetAsync=setResult, GetDataStore=name+Store, GetOrderedDataStore=name+Store; HttpService recv GetAsync/PostAsync=response, JSONDecode=decoded, JSONEncode=arg+Json, GenerateGUID=guid; MemoryStore GetSortedMap=arg+SortedMap, SubscribeAsync=topic+Subscription",
+      "name": "savedData nameStore response guid subscription",
+      "example": "local savedData = playerDataStore:GetAsync(k)"
+    },
+    {
+      "match": "stdlib and OOP: string format=formatted gsub=replaced sub=arg+Sub split=arg+Parts (colon form gated to known methods); table concat=joined clone=copy create=items freeze=enum/config/frozen; math floor/round=rounded clamp=arg+Clamped sqrt=root huge=infinity; os time=timestamp; task wait=elapsed spawn=thread; coroutine wrap=resumeFn; assert=derive arg0; setmetatable empty __index=self, class C=lowerFirst(C), __newindex=proxy, __call=callable; non-datatype ctor new/From/fromData Pascal owner=lowerFirst(owner); Knit GetService literal not game=lowerFirst(name); role-suffix require keep full lowerFirst; Enum path=lowerFirst(leaf)",
+      "name": "formatted joined rounded timestamp self lowerCamelOwner enumItem",
+      "example": "local self = setmetatable({}, {__index=Class})"
+    },
+    {
+      "match": "Field beats generic and table shapes: HumanoidRootPart=rootPart PrimaryPart=primaryPart CurrentCamera=camera; CFrame base camera=cameraCFrame base root/hrp=rootCFrame Position=rootPosition; Value with base noun=baseNoun+Value (WaitForChild literal then Value=child+Value); raycast base Position/Normal/Distance/Material/Instance=hit*; InputObject base KeyCode/UserInputType/Position/Delta=keyCode/inputType/inputPosition/inputDelta; Table empty=result numeric-keys=enum closure-or-__index=class majority-GetService=services all-num=values all-str=names all-vector=points mixed=list keyed-only=map named-record=config Vararg=args",
+      "name": "rootPart camera baseValue hitPosition keyCode result enum class config",
+      "example": "local rootPart = character.HumanoidRootPart"
+    }
+  ],
+  "context_rules": [
+    {
+      "match": "Multi-target Local/Assign from one multi-value Call; or GenericFor over pairs/ipairs/next/gmatch with synthetic vars",
+      "context": "pcall/xpcall/resume=ok,result; find=startIndex,endIndex; gsub=replaced,replacements; next=key,value; ReserveServer=accessCode,privateServerId; GetUserThumbnailAsync=thumbnail,isReady; queue ReadAsync=items,readId; pairs=key,value; ipairs=index,singular(coll); GetChildren=child; GetPlayers=player; gmatch word-like=word; relabel synthetic vN only",
+      "name": "tuple-destructure and loop-iterator-vars",
+      "example": "local ok, result = pcall(fn)"
+    },
+    {
+      "match": "Init 0/1 or empty table self-assigned in a loop body; or local whose primary use is a value assigned to a field incl self.F or a numeric property or a named field in a later table",
+      "context": "Accumulator NEEDS single-def-guard exemption for the exact init-plus-self-write shape: plus-one=count, plus-other=total, times=product, concat=result or text, table.insert/index=items. Field-sink=lowerFirst(F) normalized (CFrame=cframe); self.F high-confidence OOP; skip Parent; numeric map WalkSpeed/JumpPower/Health/Transparency/Volume; first occurrence wins",
+      "name": "loop-accumulator and assigned-to-field-sink",
+      "example": "model.PrimaryPart = primaryPart"
+    },
+    {
+      "match": "Local passed as an arg: Nth positional with known params, to a remote Fire/Invoke, or as the TweenService Create goal table",
+      "context": "Known params task.delay(delay,callback), task.spawn(callback), setmetatable(t,meta), math.clamp(value,min,max), os.date(format,time); extend to local fns with real param names. Remote payload=payload if table else data, FireClient first arg=player, SetAsync value=dataToSave key=dataKey. Tween arg0=instance arg1=tweenInfo arg2 table=goal. Lowest priority",
+      "name": "nth-arg-known-fn, remote-arg-payload, tween-create-args",
+      "example": "task.delay(delay, fn)"
+    },
+    {
+      "match": "Closure attached to a known signal via Connect/Once/ConnectParallel or assigned to OnServerInvoke/OnClientInvoke; or a closure passed as the last arg",
+      "context": "Rename synthetic pN: Touched/TouchEnded=otherPart, PlayerAdded/Removing=player, CharacterAdded=character, Child/DescendantAdded=child, Changed/PropertyChanged=property, InputBegan/Ended/Changed=input,gameProcessed, OnServerEvent/OnServerInvoke first=player, Heartbeat/RenderStepped/PreSimulation=deltaTime, Stepped=elapsedTime,deltaTime, SubscribeAsync first=message; GUARDS OnClientEvent/OnClientInvoke first NOT player, BindableEvent Event generic; PARAMETER RENAME. Closure-arg Connect=on-event else handler, sort 2nd=comparator, Filter/Find/Where/Some/Every=predicate, else callback",
+      "name": "connect-closure-params and closure-arg-role",
+      "example": "part.Touched:Connect(function(otherPart) end)"
+    },
+    {
+      "match": "Local boolean used as if/while cond; or wait on a stepping signal; or base of repeated typed member accesses; or subtraction whose Magnitude is read; plus lowest-priority fallbacks",
+      "context": "Bool ne-nil=hasNoun, eq-nil=missingNoun, len-zero=isEmpty, len-positive=hasItems, ge-max=isFull, not=isAlive/notNoun, else condition; gate on if/while. Wait task.wait=elapsed, Heartbeat/Stepped Wait=deltaTime. Type-from-members part/humanoid/gui/remote/input/mouse by member set, need a strong member. Distance difference=offset, Magnitude=distance. Fallbacks: sole-return=fn-name noun or result; table key=key or argNoun+Key; error/assert msg=errorMessage; Destroy/Debris=instance; NumericFor=limit/start/step; setmetatable returned=self; module returned=ClassName or module; JSONDecode field-accessed=data over decoded",
+      "name": "bool-cond, wait-dt, type-from-members, distance, fallbacks",
+      "example": "local isEmpty = #queue == 0"
+    }
+  ],
+  "pitfalls": [
+    "Parameter renames (connect-closure-params, OOP self-receiver) are not covered by the local-rename safety argument; the brief leaves pN untouched by default. Safe only on the exact positional slot, de-duped against the closure scope, gated to handler closures, skipping debug-named params, touching only synthetic pN; never rename a real self or a real debug param.",
+    "Accumulator/counter/mul/concat rules require exempting the local from the single-definition guard (naming.rs L57-63) and matching the exact init-plus-self-write shape; a loose check could collapse unrelated register reuse into one name. The rename stays behavior-safe; the risk is value-grouping correctness.",
+    "The suppress-plus-drop-binding idea for void Fire/Publish results: returning None for naming is safe, but dropping the binding changes the AST and is safe only when the register is provably single-def and zero-read; respect existing liveness/single-def guards and keep it out of the naming layer.",
+    "type-from-members and distance-from-magnitude are shape heuristics that can misidentify type; keep lowest priority, require a strong-signal member, never override a real defining-expr name. GetAsync disambiguation (HttpService=response vs DataStore=savedData) depends on the receiver being named first; else fall back to a neutral default.",
+    "self is in LUAU_KEYWORDS so unique_name suffixes a genuine collision to self2; never overwrite an actual self param. The string colon-form rule must be gated to the known string method set or a user split/find method gets a misleading name. assert-passthrough borrows arg0 safely since the call is preserved. Many entries are noops vs the generic Field-lowerCamel L437 and Get-strip L532 (Health, Text, Character, GetState, GetProductInfo, GetMouse, AbsoluteSize); keep only output-beating variants."
+  ]
+}

@@ -22,11 +22,23 @@ use crate::naming::is_pure;
 pub fn assigned_locals(root: &[Stmt], exclude: &BTreeSet<String>) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut order = Vec::new();
-    fn walk(stmts: &[Stmt], exclude: &BTreeSet<String>, seen: &mut BTreeSet<String>, order: &mut Vec<String>) {
+    fn walk(
+        stmts: &[Stmt],
+        exclude: &BTreeSet<String>,
+        seen: &mut BTreeSet<String>,
+        order: &mut Vec<String>,
+    ) {
         for s in stmts {
-            if let Some((name, _)) = sole_var_assign(s) {
-                if !exclude.contains(&name) && seen.insert(name.clone()) {
-                    order.push(name);
+            // Every bare-Var assignment target needs a declaration, including the multiple
+            // targets of a tuple assignment (`a, b = pcall(f)`) — otherwise they leak as
+            // globals.
+            if let Stmt::Assign { targets, .. } = s {
+                for t in targets {
+                    if let Expr::Var(name) = t {
+                        if !exclude.contains(name) && seen.insert(name.clone()) {
+                            order.push(name.clone());
+                        }
+                    }
                 }
             }
             for_each_block(s, |b| walk(b, exclude, seen, order));
@@ -74,6 +86,94 @@ pub fn drop_unreachable(root: &mut Vec<Stmt>) {
     }
 }
 
+/// Recover the `z = COND and X or Y` short-circuit ternary from the diamond the compiler
+/// emits (a conditional write to one register on both paths, rejoining at a label):
+///
+/// ```text
+/// if COND then z = X; if z then goto L end end
+/// z = Y
+/// ::L::
+/// ```
+///
+/// becomes `z = COND and X or Y`. This is purely structural recovery of the and/or idiom.
+pub fn recover_and_or(root: &mut Vec<Stmt>) {
+    for s in root.iter_mut() {
+        for_each_block_mut(s, recover_and_or);
+    }
+    let mut i = 0;
+    while i + 2 < root.len() {
+        if let Some(rewritten) = match_and_or(&root[i], &root[i + 1], &root[i + 2]) {
+            root[i] = rewritten;
+            root.remove(i + 2);
+            root.remove(i + 1);
+            // Re-check at i so `a and b and c or d` style chains collapse.
+            continue;
+        }
+        i += 1;
+    }
+}
+
+fn match_and_or(s0: &Stmt, s1: &Stmt, s2: &Stmt) -> Option<Stmt> {
+    // s0: if COND then z = X; if z then goto L end end   (no else)
+    let Stmt::If {
+        cond,
+        then_body,
+        else_body,
+    } = s0
+    else {
+        return None;
+    };
+    if !else_body.is_empty() || then_body.len() != 2 {
+        return None;
+    }
+    let (z, x) = match &then_body[0] {
+        Stmt::Assign { targets, values } if targets.len() == 1 && values.len() == 1 => {
+            match &targets[0] {
+                Expr::Var(z) => (z.clone(), values[0].clone()),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let label = match &then_body[1] {
+        Stmt::If {
+            cond: Expr::Var(zc),
+            then_body: gt,
+            else_body: ge,
+        } if *zc == z && ge.is_empty() && gt.len() == 1 => match &gt[0] {
+            Stmt::Goto(l) => l.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    // s1: z = Y
+    let y = match s1 {
+        Stmt::Assign { targets, values }
+            if targets.len() == 1
+                && values.len() == 1
+                && matches!(&targets[0], Expr::Var(z2) if *z2 == z) =>
+        {
+            values[0].clone()
+        }
+        _ => return None,
+    };
+    // s2: ::L::
+    match s2 {
+        Stmt::Label(l) if *l == label => {}
+        _ => return None,
+    }
+
+    let expr = Expr::Binary(
+        "or",
+        Box::new(Expr::Binary("and", Box::new(cond.clone()), Box::new(x))),
+        Box::new(y),
+    );
+    Some(Stmt::Assign {
+        targets: vec![Expr::Var(z)],
+        values: vec![expr],
+    })
+}
+
 // --- inlining --------------------------------------------------------------------------
 
 fn inline_in_block(
@@ -119,17 +219,16 @@ fn inline_in_block(
 
         // Interference check on the statements strictly between def and use.
         let mut safe = true;
-        for k in (i + 1)..j {
-            if matches!(block[k], Stmt::Label(_) | Stmt::Goto(_)) {
+        for stmt in &block[i + 1..j] {
+            if matches!(stmt, Stmt::Label(_) | Stmt::Goto(_)) {
                 safe = false;
                 break;
             }
-            let writes = writes_of_stmt(&block[k]);
-            if !writes.is_disjoint(&inputs) {
+            if !writes_of_stmt(stmt).is_disjoint(&inputs) {
                 safe = false;
                 break;
             }
-            if has_table_read && stmt_effectful(&block[k]) {
+            if has_table_read && stmt_effectful(stmt) {
                 safe = false;
                 break;
             }
@@ -355,14 +454,18 @@ fn stmt_effectful(s: &Stmt) -> bool {
     match s {
         Stmt::Call(_) => true,
         Stmt::Assign { targets, values } => {
-            targets.iter().any(|t| !matches!(t, Expr::Var(_)) || expr_effectful(t))
+            targets
+                .iter()
+                .any(|t| !matches!(t, Expr::Var(_)) || expr_effectful(t))
                 || values.iter().any(expr_effectful)
         }
         Stmt::Return(es) => es.iter().any(expr_effectful),
-        Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::Repeat { cond, .. } => {
-            expr_effectful(cond) || true
-        }
-        Stmt::NumericFor { .. } | Stmt::GenericFor { .. } => true,
+        // A nested control-flow block may do anything; treat it as effectful.
+        Stmt::If { .. }
+        | Stmt::While { .. }
+        | Stmt::Repeat { .. }
+        | Stmt::NumericFor { .. }
+        | Stmt::GenericFor { .. } => true,
         _ => false,
     }
 }
@@ -383,14 +486,18 @@ fn reads_table(e: &Expr) -> bool {
 /// Replace the first `Var(name)` read inside a statement with `repl` (taken once).
 fn replace_first_var(s: &mut Stmt, name: &str, repl: &mut Option<Expr>) {
     match s {
-        Stmt::Local { values, .. } => values.iter_mut().for_each(|e| replace_in_expr(e, name, repl)),
+        Stmt::Local { values, .. } => values
+            .iter_mut()
+            .for_each(|e| replace_in_expr(e, name, repl)),
         Stmt::Assign { targets, values } => {
             for t in targets.iter_mut() {
                 if !matches!(t, Expr::Var(_)) {
                     replace_in_expr(t, name, repl);
                 }
             }
-            values.iter_mut().for_each(|e| replace_in_expr(e, name, repl));
+            values
+                .iter_mut()
+                .for_each(|e| replace_in_expr(e, name, repl));
         }
         Stmt::Call(e) => replace_in_expr(e, name, repl),
         Stmt::Return(es) => es.iter_mut().for_each(|e| replace_in_expr(e, name, repl)),
@@ -406,9 +513,9 @@ fn replace_first_var(s: &mut Stmt, name: &str, repl: &mut Option<Expr>) {
                 replace_in_expr(s, name, repl);
             }
         }
-        Stmt::GenericFor { exprs, .. } => {
-            exprs.iter_mut().for_each(|e| replace_in_expr(e, name, repl))
-        }
+        Stmt::GenericFor { exprs, .. } => exprs
+            .iter_mut()
+            .for_each(|e| replace_in_expr(e, name, repl)),
         _ => {}
     }
 }
