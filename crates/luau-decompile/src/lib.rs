@@ -144,7 +144,13 @@ fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoRep
     // scope regardless of how control flow nests.
     let mut out = String::new();
     if !hoist_names.is_empty() {
-        out.push_str(&format!("local {}\n", hoist_names.join(", ")));
+        if hoist_names.len() > 4 {
+            for name in &hoist_names {
+                out.push_str(&format!("local {name}\n"));
+            }
+        } else {
+            out.push_str(&format!("local {}\n", hoist_names.join(", ")));
+        }
     }
     out.push_str(&render_block(&stmts, 0));
     out
@@ -403,8 +409,12 @@ impl<'a> Decompiler<'a> {
         body
     }
 
-    fn maybe_label(&self, pc: usize, stmts: &mut Vec<Stmt>) {
+    fn maybe_label(&mut self, pc: usize, stmts: &mut Vec<Stmt>) {
         if let Some(id) = self.labels.get(pc).copied().flatten() {
+            // A label is a control-flow join. Cached inline expressions only describe the
+            // current fall-through path; materialize them before the label so a jump into the
+            // same PC reads the merged register name instead of one predecessor's value.
+            self.flush_inline(stmts);
             stmts.push(Stmt::Label(format!("L{id}")));
         }
     }

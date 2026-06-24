@@ -134,24 +134,29 @@ fn render_stmt(out: &mut String, s: &Stmt, indent: usize) {
             pad(out, indent);
             let _ = write!(out, "local {}", names.join(", "));
             if !values.is_empty() {
-                let _ = write!(out, " = {}", join_exprs(values));
+                let _ = write!(out, " = {}", join_exprs_at(values, indent));
             }
             out.push('\n');
         }
         Stmt::Assign { targets, values } => {
             pad(out, indent);
-            let _ = writeln!(out, "{} = {}", join_exprs(targets), join_exprs(values));
+            let _ = writeln!(
+                out,
+                "{} = {}",
+                join_exprs_at(targets, indent),
+                join_exprs_at(values, indent)
+            );
         }
         Stmt::Call(e) => {
             pad(out, indent);
-            let _ = writeln!(out, "{}", render_expr(e));
+            let _ = writeln!(out, "{}", render_expr_at(e, indent));
         }
         Stmt::Return(exprs) => {
             pad(out, indent);
             if exprs.is_empty() {
                 out.push_str("return\n");
             } else {
-                let _ = writeln!(out, "return {}", join_exprs(exprs));
+                let _ = writeln!(out, "return {}", join_exprs_at(exprs, indent));
             }
         }
         Stmt::Break => {
@@ -168,7 +173,7 @@ fn render_stmt(out: &mut String, s: &Stmt, indent: usize) {
             else_body,
         } => {
             pad(out, indent);
-            let _ = writeln!(out, "if {} then", render_expr(cond));
+            let _ = writeln!(out, "if {} then", render_expr_at(cond, indent));
             out.push_str(&render_block(then_body, indent + 1));
             if !else_body.is_empty() {
                 // Collapse `else { if ... }` into `elseif` for readability.
@@ -191,7 +196,7 @@ fn render_stmt(out: &mut String, s: &Stmt, indent: usize) {
         }
         Stmt::While { cond, body } => {
             pad(out, indent);
-            let _ = writeln!(out, "while {} do", render_expr(cond));
+            let _ = writeln!(out, "while {} do", render_expr_at(cond, indent));
             out.push_str(&render_block(body, indent + 1));
             pad(out, indent);
             out.push_str("end\n");
@@ -201,7 +206,7 @@ fn render_stmt(out: &mut String, s: &Stmt, indent: usize) {
             out.push_str("repeat\n");
             out.push_str(&render_block(body, indent + 1));
             pad(out, indent);
-            let _ = writeln!(out, "until {}", render_expr(cond));
+            let _ = writeln!(out, "until {}", render_expr_at(cond, indent));
         }
         Stmt::NumericFor {
             var,
@@ -216,17 +221,17 @@ fn render_stmt(out: &mut String, s: &Stmt, indent: usize) {
                     let _ = writeln!(
                         out,
                         "for {var} = {}, {}, {} do",
-                        render_expr(start),
-                        render_expr(limit),
-                        render_expr(s)
+                        render_expr_at(start, indent),
+                        render_expr_at(limit, indent),
+                        render_expr_at(s, indent)
                     );
                 }
                 None => {
                     let _ = writeln!(
                         out,
                         "for {var} = {}, {} do",
-                        render_expr(start),
-                        render_expr(limit)
+                        render_expr_at(start, indent),
+                        render_expr_at(limit, indent)
                     );
                 }
             }
@@ -236,7 +241,12 @@ fn render_stmt(out: &mut String, s: &Stmt, indent: usize) {
         }
         Stmt::GenericFor { vars, exprs, body } => {
             pad(out, indent);
-            let _ = writeln!(out, "for {} in {} do", vars.join(", "), join_exprs(exprs));
+            let _ = writeln!(
+                out,
+                "for {} in {} do",
+                vars.join(", "),
+                join_exprs_at(exprs, indent)
+            );
             out.push_str(&render_block(body, indent + 1));
             pad(out, indent);
             out.push_str("end\n");
@@ -260,59 +270,147 @@ fn join_exprs(exprs: &[Expr]) -> String {
     exprs.iter().map(render_expr).collect::<Vec<_>>().join(", ")
 }
 
+fn join_exprs_at(exprs: &[Expr], indent: usize) -> String {
+    exprs
+        .iter()
+        .map(|e| render_expr_at(e, indent))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub fn render_expr(e: &Expr) -> String {
+    render_expr_at(e, 0)
+}
+
+fn render_expr_at(e: &Expr, indent: usize) -> String {
     match e {
         Expr::Nil => "nil".to_string(),
         Expr::Bool(b) => b.to_string(),
         Expr::Num(s) | Expr::Str(s) | Expr::Vector(s) | Expr::Var(s) | Expr::Raw(s) => s.clone(),
-        Expr::Closure { text, .. } => text.clone(),
+        Expr::Closure { text, .. } => indent_multiline(text, indent),
         Expr::Vararg => "...".to_string(),
-        Expr::Index(t, k) => format!("{}[{}]", prefix(t), render_expr(k)),
-        Expr::Field(t, f) => format!("{}.{}", prefix(t), f),
-        Expr::Call(f, args) => format!("{}({})", prefix(f), join_exprs(args)),
+        Expr::Index(t, k) => format!("{}[{}]", prefix_at(t, indent), render_expr_at(k, indent)),
+        Expr::Field(t, f) => format!("{}.{}", prefix_at(t, indent), f),
+        Expr::Call(f, args) => format!("{}({})", prefix_at(f, indent), join_exprs_at(args, indent)),
         Expr::MethodCall(o, m, args) => {
-            format!("{}:{}({})", prefix(o), m, join_exprs(args))
+            format!(
+                "{}:{}({})",
+                prefix_at(o, indent),
+                m,
+                join_exprs_at(args, indent)
+            )
         }
         Expr::Unary(op, a) => {
             // `not` needs a space; symbolic ops don't.
             if *op == "not " {
-                format!("not {}", paren(a))
+                format!("not {}", paren_at(a, indent))
             } else {
-                format!("{op}{}", paren(a))
+                format!("{op}{}", paren_at(a, indent))
             }
         }
         Expr::Binary(op, a, b) => {
             // `and`/`or` are associative and left-grouped by the compiler; a same-operator
             // left operand doesn't need parens (`a and b and c`, not `(a and b) and c`).
             let lhs = match (a.as_ref(), *op) {
-                (Expr::Binary(inner, ..), "and") if *inner == "and" => render_expr(a),
-                (Expr::Binary(inner, ..), "or") if *inner == "or" => render_expr(a),
-                _ => paren(a),
+                (Expr::Binary(inner, ..), "and") if *inner == "and" => render_expr_at(a, indent),
+                (Expr::Binary(inner, ..), "or") if *inner == "or" => render_expr_at(a, indent),
+                _ => paren_at(a, indent),
             };
-            format!("{lhs} {op} {}", paren(b))
+            format!("{lhs} {op} {}", paren_at(b, indent))
         }
-        Expr::Table(fields) => {
-            let parts: Vec<String> = fields
-                .iter()
-                .map(|fld| match fld {
-                    TableField::Item(e) => render_expr(e),
-                    TableField::Named(n, e) => format!("{n} = {}", render_expr(e)),
-                    TableField::Keyed(k, v) => {
-                        format!("[{}] = {}", render_expr(k), render_expr(v))
-                    }
-                })
-                .collect();
-            format!("{{{}}}", parts.join(", "))
+        Expr::Table(fields) => render_table(fields, indent),
+    }
+}
+
+fn render_table(fields: &[TableField], indent: usize) -> String {
+    if fields.is_empty() {
+        return "{}".to_string();
+    }
+    if !table_needs_multiline(fields) {
+        let parts: Vec<String> = fields
+            .iter()
+            .map(|fld| render_table_field(fld, indent))
+            .collect();
+        return format!("{{{}}}", parts.join(", "));
+    }
+
+    let mut out = String::new();
+    out.push_str("{\n");
+    for fld in fields {
+        pad(&mut out, indent + 1);
+        out.push_str(&render_table_field(fld, indent + 1));
+        out.push_str(",\n");
+    }
+    pad(&mut out, indent);
+    out.push('}');
+    out
+}
+
+fn render_table_field(fld: &TableField, indent: usize) -> String {
+    match fld {
+        TableField::Item(e) => render_expr_at(e, indent),
+        TableField::Named(n, e) => format!("{n} = {}", render_expr_at(e, indent)),
+        TableField::Keyed(k, v) => {
+            format!(
+                "[{}] = {}",
+                render_expr_at(k, indent),
+                render_expr_at(v, indent)
+            )
         }
     }
+}
+
+fn table_needs_multiline(fields: &[TableField]) -> bool {
+    fields.len() > 3
+        || fields.iter().any(|f| match f {
+            TableField::Item(e) | TableField::Named(_, e) => expr_needs_multiline(e),
+            TableField::Keyed(k, v) => expr_needs_multiline(k) || expr_needs_multiline(v),
+        })
+}
+
+fn expr_needs_multiline(e: &Expr) -> bool {
+    match e {
+        Expr::Closure { .. } | Expr::Table(_) => true,
+        Expr::Index(t, k) => expr_needs_multiline(t) || expr_needs_multiline(k),
+        Expr::Field(t, _) => expr_needs_multiline(t),
+        Expr::Call(f, args) => expr_needs_multiline(f) || args.iter().any(expr_needs_multiline),
+        Expr::MethodCall(o, _, args) => {
+            expr_needs_multiline(o) || args.iter().any(expr_needs_multiline)
+        }
+        Expr::Unary(_, a) => expr_needs_multiline(a),
+        Expr::Binary(_, a, b) => expr_needs_multiline(a) || expr_needs_multiline(b),
+        _ => false,
+    }
+}
+
+fn indent_multiline(text: &str, indent: usize) -> String {
+    if !text.contains('\n') || indent == 0 {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    for (i, line) in text.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+            pad(&mut out, indent);
+        }
+        out.push_str(line);
+    }
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 /// Parenthesize a sub-expression when needed to keep precedence unambiguous. We are
 /// conservative: wrap any binary/unary operand that is itself a binary/unary expression.
 fn paren(e: &Expr) -> String {
+    paren_at(e, 0)
+}
+
+fn paren_at(e: &Expr, indent: usize) -> String {
     match e {
-        Expr::Binary(..) | Expr::Unary(..) => format!("({})", render_expr(e)),
-        _ => render_expr(e),
+        Expr::Binary(..) | Expr::Unary(..) => format!("({})", render_expr_at(e, indent)),
+        _ => render_expr_at(e, indent),
     }
 }
 
@@ -321,14 +419,18 @@ fn paren(e: &Expr) -> String {
 /// parenthesized expression there, so anything else (a function literal, string, table,
 /// binary op, …) must be wrapped: `(function() end)()`, `("s"):upper()`, `({}).x`.
 fn prefix(e: &Expr) -> String {
+    prefix_at(e, 0)
+}
+
+fn prefix_at(e: &Expr, indent: usize) -> String {
     match e {
         Expr::Var(_)
         | Expr::Raw(_)
         | Expr::Index(..)
         | Expr::Field(..)
         | Expr::Call(..)
-        | Expr::MethodCall(..) => render_expr(e),
-        _ => format!("({})", render_expr(e)),
+        | Expr::MethodCall(..) => render_expr_at(e, indent),
+        _ => format!("({})", render_expr_at(e, indent)),
     }
 }
 

@@ -310,19 +310,17 @@ fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool 
         if block[i + 1..next_def].iter().any(is_control_flow) {
             continue; // a branch/loop may use the value on a path we can't see; be safe
         }
-        // If the next write reads `name` in its own value (`x = x.foo`), that's a refinement
-        // handled by fold_refinements; don't inline past it.
-        if next_def < block.len() && stmt_reads_var(&block[next_def], &name) {
+        let reads: Vec<(usize, usize)> = ((i + 1)..next_def)
+            .filter_map(|k| {
+                let count = stmt_read_count(&block[k], &name);
+                (count > 0).then_some((k, count))
+            })
+            .collect();
+        if reads.is_empty() {
             continue;
         }
-
-        let reads: Vec<usize> = ((i + 1)..next_def)
-            .filter(|&k| stmt_reads_var(&block[k], &name))
-            .collect();
-        if reads.len() != 1 {
-            continue; // inline only genuinely single-use values
-        }
-        let j = reads[0];
+        let total_reads: usize = reads.iter().map(|(_, count)| *count).sum();
+        let (j, reads_in_stmt) = reads[0];
 
         // Interference check on the statements strictly between def and use.
         let inputs = reads_of_expr(&val);
@@ -350,9 +348,25 @@ fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool 
             continue;
         }
 
+        // If this logical value has exactly one read and the next definition doesn't also
+        // read it (`x = x.foo`), the materializing assignment can disappear entirely.
+        let can_remove_def = total_reads == 1
+            && !(next_def < block.len() && stmt_reads_var(&block[next_def], &name));
+        if stmt_reads_var_in_assignment_target(&block[j], &name) {
+            continue;
+        }
+        if !can_remove_def && !is_duplicable_leaf(&val) {
+            continue;
+        }
+        if !can_remove_def && reads_in_stmt != 1 {
+            continue; // don't partially inline `x` inside `x and x.y`
+        }
+
         let mut v = Some(val);
         replace_first_var(&mut block[j], &name, &mut v);
-        block.remove(i);
+        if can_remove_def {
+            block.remove(i);
+        }
         return true;
     }
     false
@@ -554,9 +568,36 @@ fn sole_var_assign(s: &Stmt) -> Option<(String, Expr)> {
 }
 
 fn stmt_reads_var(s: &Stmt, name: &str) -> bool {
+    stmt_read_count(s, name) > 0
+}
+
+fn stmt_reads_var_in_assignment_target(s: &Stmt, name: &str) -> bool {
+    match s {
+        Stmt::Assign { targets, .. } => targets.iter().any(|t| match t {
+            Expr::Var(_) => false,
+            other => reads_of_expr(other).contains(name),
+        }),
+        _ => false,
+    }
+}
+
+fn stmt_read_count(s: &Stmt, name: &str) -> usize {
     let mut counts = BTreeMap::new();
     count_uses_stmt(s, &mut counts);
-    counts.get(name).copied().unwrap_or(0) > 0
+    counts.get(name).copied().unwrap_or(0)
+}
+
+fn is_duplicable_leaf(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Nil
+            | Expr::Bool(_)
+            | Expr::Num(_)
+            | Expr::Str(_)
+            | Expr::Vector(_)
+            | Expr::Var(_)
+            | Expr::Vararg
+    )
 }
 
 /// All bare-Var names assigned by a statement, including inside nested blocks.

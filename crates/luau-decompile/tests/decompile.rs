@@ -18,6 +18,26 @@ fn read(name: &str) -> Vec<u8> {
     fs::read(root().join("corpus").join("bytecode").join(name)).unwrap()
 }
 
+fn compile_source(name: &str) -> Option<Vec<u8>> {
+    let luau = root().join("tools").join("luau-compile.exe");
+    if !luau.exists() {
+        return None;
+    }
+    let source = root().join("corpus").join("src").join(name);
+    let output = Command::new(&luau)
+        .arg("--binary")
+        .arg(&source)
+        .output()
+        .expect("run luau-compile");
+    let ok = output.status.success()
+        && output
+            .stdout
+            .first()
+            .map(|&b| (3..=11).contains(&b))
+            .unwrap_or(false);
+    ok.then_some(output.stdout)
+}
+
 fn all_files() -> Vec<PathBuf> {
     let dir = root().join("corpus").join("bytecode");
     let mut v: Vec<PathBuf> = fs::read_dir(&dir)
@@ -27,6 +47,10 @@ fn all_files() -> Vec<PathBuf> {
         .collect();
     v.sort();
     v
+}
+
+fn compact_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[test]
@@ -56,14 +80,16 @@ fn straight_line_functions_are_not_partial() {
 fn table_literals_reconstructed() {
     // NEWTABLE + SETLIST/SETTABLEKS fills should fold back into table literals.
     let arr = decompile(&parse_and_validate(&read("01_literals.luauc")).unwrap()).source;
+    let arr_compact = compact_ws(&arr);
     assert!(
-        arr.contains("{1, 2, 3}"),
+        arr_compact.contains("{1, 2, 3}"),
         "array literal not rebuilt:\n{arr}"
     );
 
     let mixed = decompile(&parse_and_validate(&read("10_tables.luauc")).unwrap()).source;
+    let mixed_compact = compact_ws(&mixed);
     assert!(
-        mixed.contains("{10, 20, 30, 40}"),
+        mixed_compact.contains("{ 10, 20, 30, 40, }") || mixed_compact.contains("{10, 20, 30, 40}"),
         "array not rebuilt:\n{mixed}"
     );
     assert!(
@@ -155,6 +181,36 @@ fn guard_chains_recovered() {
     assert!(
         recompiles(&out, "guards"),
         "guard output must recompile:\n{out}"
+    );
+}
+
+#[test]
+fn short_circuit_return_recovered_without_goto() {
+    let Some(bytes) = compile_source("22_short_circuit_return.luau") else {
+        eprintln!("skipping: compiler not present");
+        return;
+    };
+    let module = parse_and_validate(&bytes).unwrap();
+    let out = decompile(&module);
+    assert!(
+        !out.partial,
+        "short-circuit return stayed partial:\n{}",
+        out.source
+    );
+    assert!(
+        !out.source.contains("goto"),
+        "goto left in output:\n{}",
+        out.source
+    );
+    assert!(
+        out.source.contains("return (v1 and v1.icon) or"),
+        "and/or return not rebuilt cleanly:\n{}",
+        out.source
+    );
+    assert!(
+        recompiles(&out.source, "short_circuit_return"),
+        "short-circuit output must recompile:\n{}",
+        out.source
     );
 }
 

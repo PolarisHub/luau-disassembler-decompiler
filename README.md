@@ -94,6 +94,23 @@ It binds **loopback only** and refuses any non-loopback address. Limits: 16 MiB 
 10 s per-request analysis budget, and a `catch_unwind` backstop so a bug becomes a
 structured `500`, never a crash.
 
+## Windows release package
+
+The first Windows release package is under [`release/`](release/):
+
+- `release/bin/luau-server.exe` - production release build of the localhost server.
+- `release/example.luau` - Luau client example for `/health`, `/disassemble`, and
+  `/decompile`.
+- `release/smoke-test.ps1` - starts the packaged executable and checks `/health`.
+- `release/luau-disassembler-v0.1.0-windows-x64.zip` - upload this archive to the GitHub
+  release, along with its `.sha256` checksum.
+
+To rebuild the package:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1
+```
+
 ### Endpoints
 
 `GET /health`
