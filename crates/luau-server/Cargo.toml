@@ -1,0 +1,18 @@
+[package]
+name = "luau-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Thin localhost HTTP server exposing the disassembler/decompiler."
+
+[[bin]]
+name = "luau-server"
+path = "src/main.rs"
+
+[dependencies]
+luau-bytecode.workspace = true
+luau-disasm.workspace = true
+luau-decompile.workspace = true

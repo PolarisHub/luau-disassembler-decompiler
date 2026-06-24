@@ -9,6 +9,9 @@
 /// name in one place so they can never drift apart.
 macro_rules! define_opcodes {
     ($($name:ident = $val:literal),+ $(,)?) => {
+        // Names mirror the LOP_* identifiers (e.g. FORGPREP_INEXT) on purpose so they line
+        // up with Bytecode.h and `luau-compile --text` output.
+        #[allow(non_camel_case_types)]
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         #[repr(u8)]
         pub enum Opcode {

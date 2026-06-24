@@ -1,0 +1,11 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Developer task runner: compile the corpus and refresh snapshots."
+
+[dependencies]
+luau-bytecode.workspace = true
+luau-disasm.workspace = true

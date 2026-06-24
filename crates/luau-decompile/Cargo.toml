@@ -1,0 +1,14 @@
+[package]
+name = "luau-decompile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Reconstructs readable Luau source from the IR."
+
+[dependencies]
+luau-bytecode.workspace = true
+luau-disasm.workspace = true
+luau-ir.workspace = true
