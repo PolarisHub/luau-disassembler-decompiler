@@ -97,7 +97,7 @@ impl<'a> Parser<'a> {
         self.proto_count = proto_count;
         let mut protos = Vec::with_capacity(proto_count as usize);
         for _ in 0..proto_count {
-            protos.push(self.parse_proto(version, types_version)?);
+            protos.push(self.parse_proto(version)?);
         }
 
         // Main proto index. The VM does `protos[mainid]` unchecked; we validate.
@@ -133,7 +133,7 @@ impl<'a> Parser<'a> {
         Ok(StringRef(Some((id - 1) as usize)))
     }
 
-    fn parse_proto(&mut self, version: u8, types_version: u8) -> Result<Proto> {
+    fn parse_proto(&mut self, version: u8) -> Result<Proto> {
         let max_stack_size = self.cur.u8()?;
         let num_params = self.cur.u8()?;
         let num_upvalues = self.cur.u8()?;
@@ -143,8 +143,10 @@ impl<'a> Parser<'a> {
         let mut type_info = Vec::new();
         if version >= 4 {
             flags = self.cur.u8()?;
-            // typesversion is guaranteed to be 1, 2, or 3 here (validated above). All three
-            // encode the block as a varint size followed by that many raw bytes.
+            // The type-info block is present for every bytecode version >= 4. typesversion
+            // (validated to be 1, 2, or 3) only changes how the bytes are interpreted later;
+            // on the wire all three encode it as a varint size followed by that many bytes,
+            // so the reader stores the raw block and the distinction doesn't matter here.
             let type_size = self.cur.varint()?;
             if type_size > 0 {
                 type_info = self.cur.take(type_size as usize)?.to_vec();

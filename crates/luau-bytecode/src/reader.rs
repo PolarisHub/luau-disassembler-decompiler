@@ -27,11 +27,6 @@ impl<'a> Cursor<'a> {
         self.data.len() - self.offset
     }
 
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.offset >= self.data.len()
-    }
-
     /// The rest of the buffer from the current offset, consuming it. Used for the
     /// version-0 compile-error sentinel where the tail is a message.
     pub fn take_rest(&mut self) -> &'a [u8] {
