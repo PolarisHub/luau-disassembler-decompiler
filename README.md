@@ -179,16 +179,24 @@ The decompiler reconstructs both expressions and control-flow structure:
   upvalue writes, and globals are never inlined or eliminated (their mutations are observable
   to other closures).
 - **Structure:** `if`/`elseif`/`else`, `while`, `repeat … until`, numeric `for`, generic
-  `for` (with `pairs`/`ipairs`), and `break` are recovered as native Luau. Loop variables get
-  their debug names (or stable synthesized ones). A **structural round-trip test** recompiles
-  every fully-structured proto and asserts the control-flow shape (count of for/while/if
-  constructs) matches the original — proof the recovery is faithful, not just compilable.
-- **Short-circuits:** `a and b`, `a or c`, and the `z = a and b or c` ternary (recovered
-  from its conditional-write diamond) all come back as expressions.
-- **Honest fallback:** control flow that still doesn't match a pattern (irreducible flow,
-  unusual `and/or` shapes) is emitted with `::label::`/`goto` and the proto is flagged
-  `partial: true` — reflecting the real control flow rather than guessing. All 18 corpus
-  files currently reconstruct fully (no fallback).
+  `for` (with `pairs`/`ipairs`), `break`, and `continue` are recovered as native Luau. Loop
+  variables get their debug names (or stable synthesized ones). A **structural round-trip
+  test** recompiles every fully-structured proto and asserts the control-flow shape (count of
+  for/while/if/jump/global constructs) matches the original — proof the recovery is faithful,
+  not just compilable.
+- **Short-circuits & guards:** `a and b`, `a or c`, the `z = a and b or c` ternary (recovered
+  from its conditional-write diamond), and **guard chains** like `if not (a and b and c) then
+  return end` / `… then break end` (a run of conditional jumps converging on a terminator
+  block) all come back as native expressions/statements.
+- **Multi-value calls:** `f(g())`, `require(x:WaitForChild(y))`, `{g()}`, `return g()` and
+  other multret-to-top pipes are reconstructed as expanding expressions (not truncated to one
+  value or left as a placeholder).
+- **Honest fallback:** control flow that still doesn't match a pattern (irreducible flow, or
+  short-circuit guards whose condition computes an **effectful** value mid-chain — e.g.
+  `panel and panel:FindFirstChild(name)`, where inlining the call would be unsound) is emitted
+  with `::label::`/`goto` and the proto is flagged `partial: true` — reflecting the real
+  control flow rather than guessing. No basic block is ever silently dropped. All 21 corpus
+  files reconstruct fully.
 - Names come from debug info when present; otherwise stable synthesized names (`pN` for
   params, `vN` for locals, `i`/`j`/`k` for loops) plus the recovery heuristics below.
 
