@@ -1,0 +1,33 @@
+Function 0 (pick):
+local 0: reg 0, start pc 0 line 2, end pc 12 line 6
+local 1: reg 1, start pc 0 line 2, end pc 12 line 6
+local 2: reg 2, start pc 0 line 2, end pc 12 line 6
+local 3: reg 3, start pc 1 line 3, end pc 12 line 6
+local 4: reg 4, start pc 2 line 4, end pc 12 line 6
+local 5: reg 5, start pc 6 line 5, end pc 12 line 6
+local 6: reg 6, start pc 12 line 6, end pc 12 line 6
+    2: 	local x = a and b
+AND R3 R0 R1
+    3: 	local y = a or c
+OR R4 R0 R2
+    4: 	local z = a and b or c
+JUMPIFNOT R0 L0
+MOVE R5 R1
+JUMPIF R5 L1
+L0: MOVE R5 R2
+    5: 	local w = (a > 0) and "pos" or "nonpos"
+L1: LOADN R7 0
+JUMPIFNOTLT R7 R0 L2
+LOADK R6 K0 ['pos']
+RETURN R3 4
+L2: LOADK R6 K1 ['nonpos']
+    6: 	return x, y, z, w
+RETURN R3 4
+
+Function 1 (??):
+local 0: reg 0, start pc 2 line 8, end pc 2 line 8
+    1: local function pick(a, b, c)
+DUPCLOSURE R0 K0 ['pick']
+    8: return pick
+RETURN R0 1
+

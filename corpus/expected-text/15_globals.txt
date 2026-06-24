@@ -1,0 +1,20 @@
+Function 0 (increment):
+    3: 	gCounter = gCounter + 1
+GETGLOBAL R1 K1 ['gCounter']
+ADDK R0 R1 K0 [1]
+SETGLOBAL R0 K1 ['gCounter']
+    4: 	return gCounter
+GETGLOBAL R0 K1 ['gCounter']
+RETURN R0 1
+
+Function 1 (??):
+    1: gCounter = 0
+LOADN R0 0
+SETGLOBAL R0 K0 ['gCounter']
+    2: function increment()
+DUPCLOSURE R0 K1 ['increment']
+SETGLOBAL R0 K2 ['increment']
+    6: return increment
+GETGLOBAL R0 K2 ['increment']
+RETURN R0 1
+

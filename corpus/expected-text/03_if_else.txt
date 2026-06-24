@@ -1,0 +1,25 @@
+Function 0 (classify):
+local 0: reg 0, start pc 0 line 2, end pc 11 line 7
+    2: 	if n > 0 then
+LOADN R1 0
+JUMPIFNOTLT R1 R0 L0
+    3: 		return "positive"
+LOADK R1 K0 ['positive']
+RETURN R1 1
+    4: 	elseif n < 0 then
+L0: LOADN R1 0
+JUMPIFNOTLT R0 R1 L1
+    5: 		return "negative"
+LOADK R1 K1 ['negative']
+RETURN R1 1
+    7: 		return "zero"
+L1: LOADK R1 K2 ['zero']
+RETURN R1 1
+
+Function 1 (??):
+local 0: reg 0, start pc 2 line 10, end pc 2 line 10
+    1: local function classify(n)
+DUPCLOSURE R0 K0 ['classify']
+   10: return classify
+RETURN R0 1
+

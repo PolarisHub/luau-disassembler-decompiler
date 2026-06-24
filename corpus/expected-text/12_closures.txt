@@ -1,0 +1,31 @@
+Function 0 (increment):
+local 0: reg 0, start pc 0 line 4, end pc 4 line 5
+    4: 		count = count + by
+GETUPVAL R2 0
+ADD R1 R2 R0
+SETUPVAL R1 0
+    5: 		return count
+GETUPVAL R1 0
+RETURN R1 1
+
+Function 1 (makeCounter):
+local 0: reg 0, start pc 0 line 2, end pc 4 line 7
+local 1: reg 1, start pc 1 line 3, end pc 4 line 7
+local 2: reg 2, start pc 3 line 7, end pc 4 line 7
+    2: 	local count = start
+MOVE R1 R0
+REMARK allocation: closure with 1 upvalues
+    3: 	local function increment(by)
+NEWCLOSURE R2 P0
+CAPTURE REF R1
+    7: 	return increment
+CLOSEUPVALS R1
+RETURN R2 1
+
+Function 2 (??):
+local 0: reg 0, start pc 2 line 9, end pc 2 line 9
+    1: local function makeCounter(start)
+DUPCLOSURE R0 K0 ['makeCounter']
+    9: return makeCounter
+RETURN R0 1
+

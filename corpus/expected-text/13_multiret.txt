@@ -1,0 +1,41 @@
+Function 0 (swap):
+local 0: reg 0, start pc 0 line 2, end pc 2 line 2
+local 1: reg 1, start pc 0 line 2, end pc 2 line 2
+    2: 	return b, a
+MOVE R2 R1
+MOVE R3 R0
+RETURN R2 2
+
+Function 1 (use):
+local 0: reg 0, start pc 4 line 6, end pc 11 line 7
+local 1: reg 1, start pc 4 line 6, end pc 11 line 7
+local 2: reg 2, start pc 11 line 7, end pc 11 line 7
+local 3: reg 3, start pc 11 line 7, end pc 11 line 7
+local 4: reg 4, start pc 11 line 7, end pc 11 line 7
+    5: 	local x, y = swap(1, 2)
+GETUPVAL R0 0
+LOADN R1 1
+LOADN R2 2
+CALL R0 2 2
+    6: 	local p, q, r = swap(x, y), 99
+GETUPVAL R5 0
+MOVE R6 R0
+MOVE R7 R1
+CALL R5 2 1
+MOVE R2 R5
+LOADN R3 99
+LOADNIL R4
+    7: 	return x, y, p, q, r
+RETURN R0 5
+
+Function 2 (??):
+local 0: reg 0, start pc 2 line 4, end pc 4 line 9
+local 1: reg 1, start pc 4 line 9, end pc 4 line 9
+    1: local function swap(a, b)
+DUPCLOSURE R0 K0 ['swap']
+    4: local function use()
+DUPCLOSURE R1 K1 ['use']
+CAPTURE VAL R0
+    9: return use
+RETURN R1 1
+

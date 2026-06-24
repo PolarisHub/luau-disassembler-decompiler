@@ -1,0 +1,20 @@
+Function 0 (grow):
+local 0: reg 0, start pc 0 line 2, end pc 5 line 6
+local 1: reg 1, start pc 1 line 4, end pc 5 line 6
+    2: 	local x = 1
+LOADN R1 1
+    4: 		x = x * 2
+L0: MULK R1 R1 K0 [2]
+    5: 	until x > n
+JUMPIFLT R0 R1 L1
+JUMPBACK L0
+    6: 	return x
+L1: RETURN R1 1
+
+Function 1 (??):
+local 0: reg 0, start pc 2 line 8, end pc 2 line 8
+    1: local function grow(n)
+DUPCLOSURE R0 K0 ['grow']
+    8: return grow
+RETURN R0 1
+

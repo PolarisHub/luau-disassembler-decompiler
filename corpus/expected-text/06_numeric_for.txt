@@ -1,0 +1,35 @@
+Function 0 (sumto):
+local 0: reg 4, start pc 5 line 4, end pc 5 line 4
+local 1: reg 4, start pc 11 line 7, end pc 11 line 7
+local 2: reg 0, start pc 0 line 2, end pc 13 line 9
+local 3: reg 1, start pc 1 line 3, end pc 13 line 9
+    2: 	local total = 0
+LOADN R1 0
+    3: 	for i = 1, n do
+LOADN R4 1
+MOVE R2 R0
+LOADN R3 1
+FORNPREP R2 L1
+    4: 		total = total + i
+L0: ADD R1 R1 R4
+    3: 	for i = 1, n do
+FORNLOOP R2 L0
+    6: 	for j = n, 1, -2 do
+L1: MOVE R4 R0
+LOADN R2 1
+LOADN R3 -2
+FORNPREP R2 L3
+    7: 		total = total - j
+L2: SUB R1 R1 R4
+    6: 	for j = n, 1, -2 do
+FORNLOOP R2 L2
+    9: 	return total
+L3: RETURN R1 1
+
+Function 1 (??):
+local 0: reg 0, start pc 2 line 11, end pc 2 line 11
+    1: local function sumto(n)
+DUPCLOSURE R0 K0 ['sumto']
+   11: return sumto
+RETURN R0 1
+

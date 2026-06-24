@@ -1,0 +1,28 @@
+Function 0 (variadic):
+local 0: reg 0, start pc 2 line 3, end pc 13 line 5
+local 1: reg 1, start pc 7 line 4, end pc 13 line 5
+local 2: reg 2, start pc 13 line 5, end pc 13 line 5
+    2: 	local first = ...
+GETVARARGS R0 1
+REMARK allocation: table array 0
+    3: 	local packed = { ... }
+NEWTABLE R1 0 0
+GETVARARGS R2 -1
+SETLIST R1 R2 -1 [1]
+REMARK builtin select/2+
+    4: 	local n = select("#", ...)
+LOADK R3 K0 ['#']
+FASTCALL1 57 R3 L0
+GETIMPORT R2 2 [select]
+GETVARARGS R4 -1
+CALL R2 -1 1
+    5: 	return first, packed, n
+L0: RETURN R0 3
+
+Function 1 (??):
+local 0: reg 0, start pc 2 line 7, end pc 2 line 7
+    1: local function variadic(...)
+DUPCLOSURE R0 K0 ['variadic']
+    7: return variadic
+RETURN R0 1
+
