@@ -1,0 +1,29 @@
+Function 0 (swap):
+; params=2 upvals=0 vararg=false stack=4 line=1
+    0       MOVE R2 R1  ; line 2
+    1       MOVE R3 R0  ; line 2
+    2       RETURN R2 2  ; line 2
+
+Function 1 (use):
+; params=0 upvals=1 vararg=false stack=8 line=4
+    0       GETUPVAL R0 0  ; line 5
+    1       LOADN R1 1  ; line 5
+    2       LOADN R2 2  ; line 5
+    3       CALL R0 2 2  ; line 5
+    4       GETUPVAL R5 0  ; line 6
+    5       MOVE R6 R0  ; line 6
+    6       MOVE R7 R1  ; line 6
+    7       CALL R5 2 1  ; line 6
+    8       MOVE R2 R5  ; line 6
+    9       LOADN R3 99  ; line 6
+   10       LOADNIL R4  ; line 6
+   11       RETURN R0 5  ; line 7
+
+Function 2 (??):
+; params=0 upvals=0 vararg=true stack=2 line=1
+    0       PREPVARARGS 0  ; line 1
+    1       DUPCLOSURE R0 K0 ['swap']  ; line 1
+    2       DUPCLOSURE R1 K1 ['use']  ; line 4
+    3       CAPTURE VAL R0  ; line 4
+    4       RETURN R1 1  ; line 9
+

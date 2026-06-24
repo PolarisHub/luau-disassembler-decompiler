@@ -43,7 +43,7 @@ impl<'a> Parser<'a> {
             ));
         }
 
-        if version < LBC_VERSION_MIN || version > LBC_VERSION_MAX {
+        if !(LBC_VERSION_MIN..=LBC_VERSION_MAX).contains(&version) {
             return Err(Error::new(
                 0,
                 ErrorKind::UnsupportedVersion {
@@ -58,7 +58,7 @@ impl<'a> Parser<'a> {
         let mut types_version = 0u8;
         if version >= 4 {
             types_version = self.cur.u8()?;
-            if types_version < LBC_TYPE_VERSION_MIN || types_version > LBC_TYPE_VERSION_MAX {
+            if !(LBC_TYPE_VERSION_MIN..=LBC_TYPE_VERSION_MAX).contains(&types_version) {
                 return Err(self.err(ErrorKind::UnsupportedTypesVersion {
                     got: types_version,
                     min: LBC_TYPE_VERSION_MIN,
@@ -124,7 +124,8 @@ impl<'a> Parser<'a> {
         if id == 0 {
             return Ok(StringRef(None));
         }
-        if id - 1 >= self.string_count {
+        // id is 1-based and non-zero here, so id > count means out of range.
+        if id > self.string_count {
             return Err(self.err(ErrorKind::StringIndexOutOfRange {
                 id,
                 count: self.string_count,
@@ -300,7 +301,8 @@ impl<'a> Parser<'a> {
             }
             constant_tag::TABLE_WITH_CONSTANTS => {
                 let keys_len = self.cur.varint()?;
-                self.cur.guard_count(keys_len, 5, "table template entries")?;
+                self.cur
+                    .guard_count(keys_len, 5, "table template entries")?;
                 let mut entries = Vec::with_capacity(keys_len as usize);
                 for _ in 0..keys_len {
                     let key = self.cur.varint()?;
@@ -328,13 +330,13 @@ impl<'a> Parser<'a> {
                 self.check_const_index(name, size_k)?;
                 let num_properties = self.cur.varint()?;
                 let num_methods = self.cur.varint()?;
-                let num_members = num_methods
-                    .checked_add(num_properties)
-                    .ok_or_else(|| self.err(ErrorKind::ImplausibleLength {
+                let num_members = num_methods.checked_add(num_properties).ok_or_else(|| {
+                    self.err(ErrorKind::ImplausibleLength {
                         what: "class members",
                         count: num_methods as u64 + num_properties as u64,
                         remaining: self.cur.remaining(),
-                    }))?;
+                    })
+                })?;
                 self.cur.guard_count(num_members, 1, "class members")?;
                 let mut members = Vec::with_capacity(num_members as usize);
                 for _ in 0..num_members {

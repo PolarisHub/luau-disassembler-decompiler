@@ -1,0 +1,19 @@
+Function 0 (classify):
+; params=1 upvals=0 vararg=false stack=2 line=1
+    0       LOADN R1 0  ; line 2
+    1       JUMPIFNOTLT R1 R0 L0  ; line 2
+    3       LOADK R1 K0 ['positive']  ; line 3
+    4       RETURN R1 1  ; line 3
+    5  L0:  LOADN R1 0  ; line 4
+    6       JUMPIFNOTLT R0 R1 L1  ; line 4
+    8       LOADK R1 K1 ['negative']  ; line 5
+    9       RETURN R1 1  ; line 5
+   10  L1:  LOADK R1 K2 ['zero']  ; line 7
+   11       RETURN R1 1  ; line 7
+
+Function 1 (??):
+; params=0 upvals=0 vararg=true stack=1 line=1
+    0       PREPVARARGS 0  ; line 1
+    1       DUPCLOSURE R0 K0 ['classify']  ; line 1
+    2       RETURN R0 1  ; line 10
+

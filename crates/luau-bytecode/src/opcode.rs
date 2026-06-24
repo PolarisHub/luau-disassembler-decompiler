@@ -185,7 +185,10 @@ impl Opcode {
     /// `isFastCall`: C is a jump offset to the following CALL (target = pc + C + 2).
     pub fn is_fastcall(self) -> bool {
         use Opcode::*;
-        matches!(self, FASTCALL | FASTCALL1 | FASTCALL2 | FASTCALL2K | FASTCALL3)
+        matches!(
+            self,
+            FASTCALL | FASTCALL1 | FASTCALL2 | FASTCALL2K | FASTCALL3
+        )
     }
 
     /// `isSkipC`: LOADB optionally jumps by C (target = pc + C + 1 when C != 0).

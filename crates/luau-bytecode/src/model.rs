@@ -109,7 +109,12 @@ pub enum Constant {
     Nil,
     Boolean(bool),
     Number(f64),
-    Vector { x: f32, y: f32, z: f32, w: f32 },
+    Vector {
+        x: f32,
+        y: f32,
+        z: f32,
+        w: f32,
+    },
     /// Index into the module string table.
     String(StringRef),
     /// `id` is the packed import id; `path` holds the `count` constant-table indices
@@ -120,12 +125,18 @@ pub enum Constant {
         path: Vec<u32>,
     },
     /// Table template: array of constant-table indices used as keys.
-    Table { keys: Vec<u32> },
+    Table {
+        keys: Vec<u32>,
+    },
     /// Table template with pre-filled values: (key constant index, value constant index or
     /// -1 for "no value").
-    TableWithConstants { entries: Vec<(u32, i32)> },
+    TableWithConstants {
+        entries: Vec<(u32, i32)>,
+    },
     /// Closure built from a child proto (index into the module proto table).
-    Closure { proto: u32 },
+    Closure {
+        proto: u32,
+    },
     ClassShape {
         name: u32,
         num_properties: u32,

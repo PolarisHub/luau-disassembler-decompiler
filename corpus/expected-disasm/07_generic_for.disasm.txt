@@ -1,0 +1,23 @@
+Function 0 (dump):
+; params=1 upvals=0 vararg=false stack=7 line=1
+    0       NEWTABLE R1 0 0  ; line 2
+    2       GETIMPORT R2 1 [ipairs]  ; line 3
+    4       MOVE R3 R0  ; line 3
+    5       CALL R2 1 3  ; line 3
+    6       FORGPREP_INEXT R2 L1  ; line 3
+    7  L0:  SETTABLE R6 R1 R5  ; line 4
+    8  L1:  FORGLOOP R2 L0 2 [inext]  ; line 3
+   10       GETIMPORT R2 3 [pairs]  ; line 6
+   12       MOVE R3 R0  ; line 6
+   13       CALL R2 1 3  ; line 6
+   14       FORGPREP_NEXT R2 L3  ; line 6
+   15  L2:  SETTABLE R6 R1 R5  ; line 7
+   16  L3:  FORGLOOP R2 L2 2  ; line 6
+   18       RETURN R1 1  ; line 9
+
+Function 1 (??):
+; params=0 upvals=0 vararg=true stack=1 line=1
+    0       PREPVARARGS 0  ; line 1
+    1       DUPCLOSURE R0 K0 ['dump']  ; line 1
+    2       RETURN R0 1  ; line 11
+

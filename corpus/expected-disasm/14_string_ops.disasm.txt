@@ -1,0 +1,29 @@
+Function 0 (work):
+; params=2 upvals=0 vararg=false stack=8 line=1
+    0       LOADN R4 1  ; line 2
+    1       FASTCALL3 45 R0 R4 R1 L0  ; line 2
+    3       MOVE R3 R0  ; line 2
+    4       MOVE R5 R1  ; line 2
+    5       GETIMPORT R2 2 [string.sub]  ; line 2
+    7       CALL R2 3 1  ; line 2
+    8  L0:  FASTCALL1 43 R0 L1  ; line 3
+    9       MOVE R4 R0  ; line 3
+   10       GETIMPORT R3 4 [string.len]  ; line 3
+   12       CALL R3 1 1  ; line 3
+   13  L1:  FASTCALL1 12 R1 L2  ; line 4
+   14       MOVE R5 R1  ; line 4
+   15       GETIMPORT R4 7 [math.floor]  ; line 4
+   17       CALL R4 1 1  ; line 4
+   18  L2:  FASTCALL2 18 R1 R3 L3  ; line 5
+   20       MOVE R6 R1  ; line 5
+   21       MOVE R7 R3  ; line 5
+   22       GETIMPORT R5 9 [math.max]  ; line 5
+   24       CALL R5 2 1  ; line 5
+   25  L3:  RETURN R2 4  ; line 6
+
+Function 1 (??):
+; params=0 upvals=0 vararg=true stack=1 line=1
+    0       PREPVARARGS 0  ; line 1
+    1       DUPCLOSURE R0 K0 ['work']  ; line 1
+    2       RETURN R0 1  ; line 8
+

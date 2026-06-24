@@ -1,0 +1,21 @@
+Function 0 (pick):
+; params=3 upvals=0 vararg=false stack=8 line=1
+    0       AND R3 R0 R1  ; line 2
+    1       OR R4 R0 R2  ; line 3
+    2       JUMPIFNOT R0 L0  ; line 4
+    3       MOVE R5 R1  ; line 4
+    4       JUMPIF R5 L1  ; line 4
+    5  L0:  MOVE R5 R2  ; line 4
+    6  L1:  LOADN R7 0  ; line 5
+    7       JUMPIFNOTLT R7 R0 L2  ; line 5
+    9       LOADK R6 K0 ['pos']  ; line 5
+   10       RETURN R3 4  ; line 5
+   11  L2:  LOADK R6 K1 ['nonpos']  ; line 5
+   12       RETURN R3 4  ; line 6
+
+Function 1 (??):
+; params=0 upvals=0 vararg=true stack=1 line=1
+    0       PREPVARARGS 0  ; line 1
+    1       DUPCLOSURE R0 K0 ['pick']  ; line 1
+    2       RETURN R0 1  ; line 8
+

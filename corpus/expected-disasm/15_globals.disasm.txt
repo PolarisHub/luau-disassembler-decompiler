@@ -1,0 +1,18 @@
+Function 0 (increment):
+; params=0 upvals=0 vararg=false stack=2 line=2
+    0       GETGLOBAL R1 K1 ['gCounter']  ; line 3
+    2       ADDK R0 R1 K0 [1]  ; line 3
+    3       SETGLOBAL R0 K1 ['gCounter']  ; line 3
+    5       GETGLOBAL R0 K1 ['gCounter']  ; line 4
+    7       RETURN R0 1  ; line 4
+
+Function 1 (??):
+; params=0 upvals=0 vararg=true stack=1 line=1
+    0       PREPVARARGS 0  ; line 1
+    1       LOADN R0 0  ; line 1
+    2       SETGLOBAL R0 K0 ['gCounter']  ; line 1
+    4       DUPCLOSURE R0 K1 ['increment']  ; line 2
+    5       SETGLOBAL R0 K2 ['increment']  ; line 2
+    7       GETGLOBAL R0 K2 ['increment']  ; line 6
+    9       RETURN R0 1  ; line 6
+

@@ -4,8 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "Developer task runner: compile the corpus and refresh snapshots."
+description = "Developer task runner: inspect bytecode (disasm / cfg listings)."
 
 [dependencies]
 luau-bytecode.workspace = true
 luau-disasm.workspace = true
+luau-ir.workspace = true

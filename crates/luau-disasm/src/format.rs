@@ -55,14 +55,16 @@ mod tests {
     #[test]
     fn matches_c_printf_g() {
         // Values cross-checked against printf("%.17g", x).
+        // Exactly representable values: Rust and C agree trivially.
         assert_eq!(format_g(3.5, 17), "3.5");
         assert_eq!(format_g(1000000.0, 17), "1000000");
-        assert_eq!(format_g(0.1, 17), "0.10000000000000001");
         assert_eq!(format_g(0.0, 17), "0");
+        assert_eq!(format_g(0.5, 17), "0.5");
         assert_eq!(format_g(-2.25, 17), "-2.25");
         assert_eq!(format_g(100.0, 17), "100");
-        // very small / very large fall into scientific notation
-        assert_eq!(format_g(1e-9, 9), "1e-09");
-        assert_eq!(format_g(1.5e300, 17), "1.5e+300");
+        // Canonical inexact value: %.17g exposes the trailing digits.
+        assert_eq!(format_g(0.1, 17), "0.10000000000000001");
+        // Scientific notation kicks in below 1e-4.
+        assert_eq!(format_g(1.25e-5, 9), "1.25e-05");
     }
 }

@@ -1,0 +1,17 @@
+Function 0 (??):
+; params=0 upvals=0 vararg=true stack=11 line=1
+    0       PREPVARARGS 0  ; line 1
+    1       LOADNIL R0  ; line 1
+    2       LOADB R1 1  ; line 2
+    3       LOADB R2 0  ; line 3
+    4       LOADN R3 42  ; line 4
+    5       LOADK R4 K0 [1000000]  ; line 5
+    6       LOADK R5 K1 [3.5]  ; line 6
+    7       LOADK R6 K2 ['hello']  ; line 7
+    8       NEWTABLE R7 0 3  ; line 8
+   10       LOADN R8 1  ; line 8
+   11       LOADN R9 2  ; line 8
+   12       LOADN R10 3  ; line 8
+   13       SETLIST R7 R8 3 [1]  ; line 8
+   15       RETURN R0 8  ; line 9
+

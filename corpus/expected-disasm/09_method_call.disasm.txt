@@ -1,0 +1,17 @@
+Function 0 (shout):
+; params=1 upvals=0 vararg=false stack=5 line=1
+    0       NAMECALL R1 R0 K0 ['upper']  ; line 2
+    2       CALL R1 1 1  ; line 2
+    3       LOADN R4 2  ; line 3
+    4       NAMECALL R2 R1 K1 ['rep']  ; line 3
+    6       CALL R2 2 1  ; line 3
+    7       NAMECALL R3 R2 K2 ['len']  ; line 4
+    9       CALL R3 1 -1  ; line 4
+   10       RETURN R3 -1  ; line 4
+
+Function 1 (??):
+; params=0 upvals=0 vararg=true stack=1 line=1
+    0       PREPVARARGS 0  ; line 1
+    1       DUPCLOSURE R0 K0 ['shout']  ; line 1
+    2       RETURN R0 1  ; line 6
+

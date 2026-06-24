@@ -1,0 +1,22 @@
+Function 0 (calc):
+; params=2 upvals=0 vararg=false stack=14 line=1
+    0       ADD R2 R0 R1  ; line 2
+    1       SUB R3 R0 R1  ; line 3
+    2       MUL R4 R0 R1  ; line 4
+    3       DIV R5 R0 R1  ; line 5
+    4       IDIV R6 R0 R1  ; line 6
+    5       MOD R7 R0 R1  ; line 7
+    6       POW R8 R0 R1  ; line 8
+    7       MINUS R9 R0  ; line 9
+    8       LENGTH R10 R1  ; line 10
+    9       MOVE R12 R0  ; line 11
+   10       MOVE R13 R1  ; line 11
+   11       CONCAT R11 R12 R13  ; line 11
+   12       RETURN R2 10  ; line 12
+
+Function 1 (??):
+; params=0 upvals=0 vararg=true stack=1 line=1
+    0       PREPVARARGS 0  ; line 1
+    1       DUPCLOSURE R0 K0 ['calc']  ; line 1
+    2       RETURN R0 1  ; line 14
+

@@ -1,0 +1,22 @@
+Function 0 (increment):
+; params=1 upvals=1 vararg=false stack=3 line=3
+    0       GETUPVAL R2 0  ; line 4
+    1       ADD R1 R2 R0  ; line 4
+    2       SETUPVAL R1 0  ; line 4
+    3       GETUPVAL R1 0  ; line 5
+    4       RETURN R1 1  ; line 5
+
+Function 1 (makeCounter):
+; params=1 upvals=0 vararg=false stack=3 line=1
+    0       MOVE R1 R0  ; line 2
+    1       NEWCLOSURE R2 P0  ; line 3
+    2       CAPTURE REF R1  ; line 3
+    3       CLOSEUPVALS R1  ; line 7
+    4       RETURN R2 1  ; line 7
+
+Function 2 (??):
+; params=0 upvals=0 vararg=true stack=1 line=1
+    0       PREPVARARGS 0  ; line 1
+    1       DUPCLOSURE R0 K0 ['makeCounter']  ; line 1
+    2       RETURN R0 1  ; line 9
+

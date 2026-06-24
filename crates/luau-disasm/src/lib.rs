@@ -144,11 +144,7 @@ impl fmt::Display for Disassembly {
                     Some(n) => format!("  ; line {n}"),
                     None => String::new(),
                 };
-                writeln!(
-                    f,
-                    "{:>5}  {:<5}{}{}",
-                    line.pc, label, line.text, line_anno
-                )?;
+                writeln!(f, "{:>5}  {:<5}{}{}", line.pc, label, line.text, line_anno)?;
             }
             writeln!(f)?;
         }

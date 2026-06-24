@@ -26,7 +26,10 @@ fn corpus_files() -> Vec<PathBuf> {
         .filter(|p| p.extension().map(|x| x == "luauc").unwrap_or(false))
         .collect();
     files.sort();
-    assert!(!files.is_empty(), "no corpus bytecode found; run scripts/compile-corpus.sh");
+    assert!(
+        !files.is_empty(),
+        "no corpus bytecode found; run scripts/compile-corpus.sh"
+    );
     files
 }
 
@@ -34,8 +37,8 @@ fn corpus_files() -> Vec<PathBuf> {
 fn parses_and_validates_whole_corpus() {
     for path in corpus_files() {
         let bytes = fs::read(&path).unwrap();
-        let module = parse_and_validate(&bytes)
-            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let module =
+            parse_and_validate(&bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 
         assert_eq!(module.version, 7, "{} should be v7", path.display());
         assert!(
@@ -45,7 +48,11 @@ fn parses_and_validates_whole_corpus() {
         );
         // Every proto's instruction stream should have decoded cleanly during validation;
         // re-confirm there is at least one proto with at least one instruction.
-        assert!(module.protos.iter().any(|p| !p.code.is_empty()), "{}", path.display());
+        assert!(
+            module.protos.iter().any(|p| !p.code.is_empty()),
+            "{}",
+            path.display()
+        );
     }
 }
 

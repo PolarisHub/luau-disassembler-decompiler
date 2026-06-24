@@ -1,0 +1,20 @@
+Function 0 (variadic):
+; params=0 upvals=0 vararg=true stack=5 line=1
+    0       PREPVARARGS 0  ; line 1
+    1       GETVARARGS R0 1  ; line 2
+    2       NEWTABLE R1 0 0  ; line 3
+    4       GETVARARGS R2 -1  ; line 3
+    5       SETLIST R1 R2 -1 [1]  ; line 3
+    7       LOADK R3 K0 ['#']  ; line 4
+    8       FASTCALL1 57 R3 L0  ; line 4
+    9       GETIMPORT R2 2 [select]  ; line 4
+   11       GETVARARGS R4 -1  ; line 4
+   12       CALL R2 -1 1  ; line 4
+   13  L0:  RETURN R0 3  ; line 5
+
+Function 1 (??):
+; params=0 upvals=0 vararg=true stack=1 line=1
+    0       PREPVARARGS 0  ; line 1
+    1       DUPCLOSURE R0 K0 ['variadic']  ; line 1
+    2       RETURN R0 1  ; line 7
+
