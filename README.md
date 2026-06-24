@@ -162,10 +162,22 @@ The decompiler reconstructs both expressions and control-flow structure:
 
 - **Expressions:** arithmetic, concatenation, comparisons, table constructors and
   reads/writes, field access, method calls (`NAMECALL → obj:m(args)`), calls, multiple
-  returns, varargs, globals/imports/upvalues, and nested closures (with captured locals
-  preserved). Values are materialized into named temporaries, then single-use pure
-  temporaries are inlined and dead stores removed — sound passes that never reorder a side
-  effect or drop a captured/escaping value.
+  returns, varargs, globals/imports/upvalues, and nested closures. Values are materialized
+  into named temporaries, then reduced to a fixpoint by sound passes that never reorder a
+  side effect or drop a captured/escaping value:
+  - **table-literal reconstruction** — a `NEWTABLE`/`DUPTABLE` plus its consecutive
+    `SETLIST`/`SETTABLEKS` fills fold back into a literal (`t = {10, 20, key = v}`), nesting
+    recursively;
+  - **per-definition copy propagation** — a register reused for several unrelated values has
+    each definition inlined independently, collapsing the materialize-everything temporaries
+    (`TweenService:Create(part, info, {CFrame = cf}):Play()` instead of four scratch locals);
+  - **dead-store elimination** for values nothing observes.
+- **Closures:** nested functions are fully reconstructed, and each upvalue is resolved to the
+  **name of the local it captured in the enclosing function** — across multiple levels of
+  nesting (a grandchild that closes over a parent's upvalue still gets the right name) — so
+  closures read `localPlayer:WaitForChild(…)`, not `u0:WaitForChild(…)`. Captured locals,
+  upvalue writes, and globals are never inlined or eliminated (their mutations are observable
+  to other closures).
 - **Structure:** `if`/`elseif`/`else`, `while`, `repeat … until`, numeric `for`, generic
   `for` (with `pairs`/`ipairs`), and `break` are recovered as native Luau. Loop variables get
   their debug names (or stable synthesized ones). A **structural round-trip test** recompiles
@@ -175,7 +187,7 @@ The decompiler reconstructs both expressions and control-flow structure:
   from its conditional-write diamond) all come back as expressions.
 - **Honest fallback:** control flow that still doesn't match a pattern (irreducible flow,
   unusual `and/or` shapes) is emitted with `::label::`/`goto` and the proto is flagged
-  `partial: true` — reflecting the real control flow rather than guessing. All 16 corpus
+  `partial: true` — reflecting the real control flow rather than guessing. All 18 corpus
   files currently reconstruct fully (no fallback).
 - Names come from debug info when present; otherwise stable synthesized names (`pN` for
   params, `vN` for locals, `i`/`j`/`k` for loops) plus the recovery heuristics below.
