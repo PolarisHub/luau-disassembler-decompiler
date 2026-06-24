@@ -105,9 +105,9 @@ fn compute(n: usize, entry: usize, preds: &[Vec<usize>], succ: &[Vec<usize>]) ->
 
     // Unreachable blocks keep idom == MAX; point them at themselves so callers don't index
     // out of range. They have no bearing on real control flow.
-    for b in 0..n {
-        if idom[b] == usize::MAX {
-            idom[b] = b;
+    for (b, d) in idom.iter_mut().enumerate() {
+        if *d == usize::MAX {
+            *d = b;
         }
     }
 

@@ -5,7 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use luau_bytecode::parse_and_validate;
-use luau_ir::{analyze, back_edges, dominators, build_cfg};
+use luau_ir::{analyze, back_edges, build_cfg, dominators};
 
 fn corpus() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

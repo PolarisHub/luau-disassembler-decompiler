@@ -10,3 +10,4 @@ description = "Developer task runner: inspect bytecode (disasm / cfg listings)."
 luau-bytecode.workspace = true
 luau-disasm.workspace = true
 luau-ir.workspace = true
+luau-decompile.workspace = true

@@ -44,6 +44,11 @@ fn main() -> ExitCode {
                 println!();
             }
         }
+        "decompile" => {
+            let result = luau_decompile::decompile(&module);
+            print!("{}", result.source);
+            eprintln!("\n-- partial: {}", result.partial);
+        }
         other => {
             eprintln!("unknown command: {other}");
             return ExitCode::FAILURE;
