@@ -81,6 +81,10 @@ fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoRep
     cleanup::drop_unreachable(&mut stmts);
     // Recover the `z = a and b or c` short-circuit ternary from its goto/label diamond.
     cleanup::recover_and_or(&mut stmts);
+    // Recover common forward-goto guard shapes into structured if/else blocks.
+    cleanup::recover_guard_else_gotos(&mut stmts);
+    cleanup::recover_if_skip_gotos(&mut stmts);
+    cleanup::recover_goto_into_if_gates(&mut stmts);
 
     // Captured registers, upvalues, and globals are excluded from inlining/elimination:
     // closures must keep the variables they close over, and a write to an upvalue or global
@@ -107,6 +111,9 @@ fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoRep
         }
         prev = n;
     }
+    cleanup::recover_goto_into_if_gates(&mut stmts);
+    cleanup::recover_guard_else_gotos(&mut stmts);
+    cleanup::recover_if_skip_gotos(&mut stmts);
     // A constant `1` step on a numeric for is implicit.
     drop_unit_for_steps(&mut stmts);
 
@@ -130,6 +137,7 @@ fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoRep
     // placeholders inside each nested closure to the captured local's name.
     d.resolve_closures(&mut stmts, &rename);
     cleanup::promote_top_level_initializers(&mut stmts, &non_local);
+    cleanup::fold_table_literals(&mut stmts);
     let mut prev = usize::MAX;
     for _ in 0..16 {
         cleanup::single_use_inline(&mut stmts, &protected);
@@ -140,6 +148,10 @@ fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoRep
         }
         prev = n;
     }
+    cleanup::recover_goto_into_if_gates(&mut stmts);
+    cleanup::recover_guard_else_gotos(&mut stmts);
+    cleanup::recover_if_skip_gotos(&mut stmts);
+    cleanup::drop_trailing_empty_return(&mut stmts);
     let hoist_names = cleanup::assigned_locals(&stmts, &non_local);
 
     // Determine `partial` from the FINAL tree: a proto is partial only if some unstructured
@@ -1184,6 +1196,9 @@ impl<'a> Decompiler<'a> {
                         values: vec![value],
                     });
                 }
+                if c == 0 {
+                    self.clear_inline_multret(multret_top);
+                }
             }
             SETTABLE => {
                 let target = Expr::Index(Box::new(self.reg(b)), Box::new(self.reg(c)));
@@ -1283,6 +1298,9 @@ impl<'a> Decompiler<'a> {
                 } else {
                     (0..b as i32 - 1).map(|i| self.reg(a + i as u8)).collect()
                 };
+                if b == 0 {
+                    self.clear_inline_multret(multret_top);
+                }
                 stmts.push(Stmt::Return(vals));
             }
 
@@ -1672,6 +1690,7 @@ impl<'a> Decompiler<'a> {
         // top of the stack — the value left by the preceding multret instruction — so the
         // final argument is itself a multi-value expression.
         let last: Option<u8> = if b == 0 { multret_top } else { Some(a + b - 1) };
+        let consumed_multret = if b == 0 { multret_top } else { None };
         let collect_args = |me: &mut Self, first: u8| -> Vec<Expr> {
             match last {
                 Some(last) if last >= first => (first..=last).map(|r| me.reg(r)).collect(),
@@ -1696,6 +1715,7 @@ impl<'a> Decompiler<'a> {
                 Expr::Call(Box::new(callee), args)
             }
         };
+        self.clear_inline_multret(consumed_multret);
 
         if nresults < 0 {
             // Multret result (C==0): the call's values extend to the top of the stack and are
@@ -1740,6 +1760,14 @@ impl<'a> Decompiler<'a> {
     fn set_inline(&mut self, r: u8, e: Expr) {
         if let Some(slot) = self.regs.get_mut(r as usize) {
             *slot = Some(e);
+        }
+    }
+
+    fn clear_inline_multret(&mut self, r: Option<u8>) {
+        if let Some(r) = r {
+            if let Some(slot) = self.regs.get_mut(r as usize) {
+                *slot = None;
+            }
         }
     }
 

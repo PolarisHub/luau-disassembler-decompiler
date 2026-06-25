@@ -146,20 +146,9 @@ pub fn fold_table_literals(root: &mut Vec<Stmt>) {
     }
     let mut i = 0;
     while i < root.len() {
-        let (t, mut fields) = match &root[i] {
-            Stmt::Assign { targets, values } if targets.len() == 1 && values.len() == 1 => {
-                match (&targets[0], &values[0]) {
-                    (Expr::Var(t), Expr::Table(base)) => (t.clone(), base.clone()),
-                    _ => {
-                        i += 1;
-                        continue;
-                    }
-                }
-            }
-            _ => {
-                i += 1;
-                continue;
-            }
+        let Some((t, mut fields)) = table_init(&root[i]) else {
+            i += 1;
+            continue;
         };
         let mut array_next = 1 + fields
             .iter()
@@ -176,13 +165,40 @@ pub fn fold_table_literals(root: &mut Vec<Stmt>) {
             }
         }
         if j > i + 1 {
-            root[i] = Stmt::Assign {
-                targets: vec![Expr::Var(t)],
-                values: vec![Expr::Table(fields)],
-            };
+            replace_table_init(&mut root[i], fields);
             root.drain(i + 1..j);
         }
         i += 1;
+    }
+}
+
+fn table_init(s: &Stmt) -> Option<(String, Vec<TableField>)> {
+    match s {
+        Stmt::Assign { targets, values } if targets.len() == 1 && values.len() == 1 => {
+            match (&targets[0], &values[0]) {
+                (Expr::Var(t), Expr::Table(base)) => Some((t.clone(), base.clone())),
+                _ => None,
+            }
+        }
+        Stmt::Local { names, values } if names.len() == 1 && values.len() == 1 => {
+            match &values[0] {
+                Expr::Table(base) => Some((names[0].clone(), base.clone())),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn replace_table_init(s: &mut Stmt, fields: Vec<TableField>) {
+    match s {
+        Stmt::Assign { targets, values } if targets.len() == 1 && values.len() == 1 => {
+            values[0] = Expr::Table(fields);
+        }
+        Stmt::Local { names, values } if names.len() == 1 && values.len() == 1 => {
+            values[0] = Expr::Table(fields);
+        }
+        _ => {}
     }
 }
 
@@ -220,7 +236,7 @@ fn table_fill_field(s: &Stmt, t: &str, array_next: &mut usize) -> Option<TableFi
     }
 }
 
-/// Drop statements after a `return`/`break`/`continue` in each block. A flush of the inline
+/// Drop statements after a `return`/`break`/`continue`/`goto` in each block. A flush of the inline
 /// cache can append assignments after a terminator; that code is both unreachable and (for
 /// `return`) not even valid Luau, so it must go. Statements at or after a `::label::` are kept,
 /// however — they may be reached by a `goto` that jumps over the terminator (a guard like
@@ -232,7 +248,10 @@ pub fn drop_unreachable(root: &mut Vec<Stmt>) {
     }
     let mut i = 0;
     while i < root.len() {
-        if matches!(root[i], Stmt::Return(_) | Stmt::Break | Stmt::Continue) {
+        if matches!(
+            root[i],
+            Stmt::Return(_) | Stmt::Break | Stmt::Continue | Stmt::Goto(_)
+        ) {
             let mut j = i + 1;
             while j < root.len() && !matches!(root[j], Stmt::Label(_)) {
                 j += 1;
@@ -240,6 +259,15 @@ pub fn drop_unreachable(root: &mut Vec<Stmt>) {
             root.drain(i + 1..j);
         }
         i += 1;
+    }
+}
+
+/// A final bare `return` at the end of a function is equivalent to falling off the end of
+/// the function. Drop only the current function body's trailing empty return; do not recurse
+/// into nested control-flow blocks, where a branch-local `return` may guard outer code.
+pub fn drop_trailing_empty_return(root: &mut Vec<Stmt>) {
+    if matches!(root.last(), Some(Stmt::Return(values)) if values.is_empty()) {
+        root.pop();
     }
 }
 
@@ -329,6 +357,346 @@ fn match_and_or(s0: &Stmt, s1: &Stmt, s2: &Stmt) -> Option<Stmt> {
         targets: vec![Expr::Var(z)],
         values: vec![expr],
     })
+}
+
+/// Recover simple forward gotos used only to skip a block:
+///
+/// ```text
+/// if COND then goto L end
+/// <body>
+/// ::L::
+/// ```
+///
+/// becomes `if not COND then <body> end`. Nested guard chains are folded into a combined
+/// condition when the target label has no other incoming gotos.
+pub fn recover_if_skip_gotos(root: &mut Vec<Stmt>) {
+    for s in root.iter_mut() {
+        for_each_block_mut(s, recover_if_skip_gotos);
+    }
+    while recover_if_skip_once(root) {}
+}
+
+fn recover_if_skip_once(root: &mut Vec<Stmt>) -> bool {
+    for i in 0..root.len() {
+        let Some((cond, label)) = conditional_goto_expr(&root[i], None) else {
+            continue;
+        };
+        if count_gotos_named(root, &label) != 1 {
+            continue;
+        }
+        let Some(label_idx) = root[i + 1..]
+            .iter()
+            .position(|s| matches!(s, Stmt::Label(name) if name == &label))
+            .map(|offset| i + 1 + offset)
+        else {
+            continue;
+        };
+        if contains_label_or_goto(&root[i + 1..label_idx]) {
+            continue;
+        }
+        if !direct_local_scope_safe(&root[i + 1..label_idx], &root[label_idx + 1..]) {
+            continue;
+        }
+
+        if label_idx == i + 1 {
+            root.drain(i..=label_idx);
+            return true;
+        }
+
+        let skipped_body = root[i + 1..label_idx].to_vec();
+        root[i] = Stmt::If {
+            cond: negate_condition(cond),
+            then_body: skipped_body,
+            else_body: Vec::new(),
+        };
+        root.drain(i + 1..=label_idx);
+        return true;
+    }
+    false
+}
+
+/// Recover loop-body guard diamonds where one path jumps to a trailing error/fallback block:
+///
+/// ```text
+/// if INVALID then goto L end
+/// <accepted body>
+/// continue
+/// ::L::
+/// <fallback body>
+/// ```
+///
+/// becomes `if not INVALID then <accepted body> else <fallback body> end`. The rewrite only
+/// fires when the accepted path terminates with `continue`, so all remaining statements in
+/// the current loop block are known to belong to the fallback path.
+pub fn recover_guard_else_gotos(root: &mut Vec<Stmt>) {
+    for s in root.iter_mut() {
+        for_each_block_mut(s, recover_guard_else_gotos);
+    }
+    while recover_guard_else_once(root) {}
+}
+
+fn recover_guard_else_once(root: &mut Vec<Stmt>) -> bool {
+    for i in 0..root.len() {
+        let labels = goto_names_in_stmt(&root[i]);
+        for label in labels {
+            let guard_gotos = count_gotos_named_stmt(&root[i], &label);
+            if guard_gotos == 0 || count_gotos_named(root, &label) != guard_gotos {
+                continue;
+            }
+            let Some((invalid_cond, _)) = conditional_goto_expr(&root[i], Some(&label)) else {
+                continue;
+            };
+            let Some(label_idx) = root[i + 1..]
+                .iter()
+                .position(|s| matches!(s, Stmt::Label(name) if name == &label))
+                .map(|offset| i + 1 + offset)
+            else {
+                continue;
+            };
+            if label_idx <= i + 1 || !matches!(root[label_idx - 1], Stmt::Continue) {
+                continue;
+            }
+            if contains_label_or_goto(&root[i + 1..label_idx - 1]) {
+                continue;
+            }
+            if !direct_local_scope_safe(&root[i + 1..label_idx - 1], &root[label_idx + 1..]) {
+                continue;
+            }
+
+            let then_body = root[i + 1..label_idx - 1].to_vec();
+            let else_body = root[label_idx + 1..].to_vec();
+            root[i] = Stmt::If {
+                cond: negate_condition(invalid_cond),
+                then_body,
+                else_body,
+            };
+            root.truncate(i + 1);
+            return true;
+        }
+    }
+    false
+}
+
+/// Recover a validation branch that jumps into a labeled `if` body:
+///
+/// ```text
+/// if ACCEPT_A then goto L end
+/// if ACCEPT_B then
+///     ::L::
+///     <accepted body>
+/// end
+/// ```
+///
+/// becomes `if ACCEPT_A or ACCEPT_B then <accepted body> end`. This is common after the
+/// reducing passes inline temporaries like `v = typeof(x)` back into the guard tests.
+pub fn recover_goto_into_if_gates(root: &mut Vec<Stmt>) {
+    for s in root.iter_mut() {
+        for_each_block_mut(s, recover_goto_into_if_gates);
+    }
+    while recover_goto_into_if_gate_once(root) {}
+}
+
+fn recover_goto_into_if_gate_once(root: &mut Vec<Stmt>) -> bool {
+    let mut i = 0;
+    while i + 1 < root.len() {
+        let Some((goto_cond, label)) = conditional_goto_expr(&root[i], None) else {
+            i += 1;
+            continue;
+        };
+        let guard_gotos = count_gotos_named_stmt(&root[i], &label);
+        if guard_gotos == 0 || count_gotos_named(root, &label) != guard_gotos {
+            i += 1;
+            continue;
+        }
+
+        let Stmt::If {
+            cond: target_cond,
+            then_body,
+            else_body,
+        } = &root[i + 1]
+        else {
+            i += 1;
+            continue;
+        };
+        if !else_body.is_empty()
+            || !matches!(then_body.first(), Some(Stmt::Label(name)) if name == &label)
+            || contains_label_or_goto(&then_body[1..])
+        {
+            i += 1;
+            continue;
+        }
+
+        let accepted_body = then_body[1..].to_vec();
+        root[i + 1] = Stmt::If {
+            cond: Expr::Binary("or", Box::new(goto_cond), Box::new(target_cond.clone())),
+            then_body: accepted_body,
+            else_body: Vec::new(),
+        };
+        root.remove(i);
+        return true;
+    }
+    false
+}
+
+fn conditional_goto_expr(stmt: &Stmt, required_label: Option<&str>) -> Option<(Expr, String)> {
+    let Stmt::If {
+        cond,
+        then_body,
+        else_body,
+    } = stmt
+    else {
+        return None;
+    };
+    if !else_body.is_empty() {
+        return None;
+    }
+    let (body_cond, label) = guard_body_goto_expr(then_body, required_label)?;
+    let cond = if matches!(body_cond, Expr::Bool(true)) {
+        cond.clone()
+    } else {
+        Expr::Binary("and", Box::new(cond.clone()), Box::new(body_cond))
+    };
+    Some((cond, label))
+}
+
+fn guard_body_goto_expr(stmts: &[Stmt], required_label: Option<&str>) -> Option<(Expr, String)> {
+    let mut conds = Vec::new();
+    let mut target = required_label.map(str::to_string);
+    for stmt in stmts {
+        let (cond, label) = match stmt {
+            Stmt::Goto(label) => (Expr::Bool(true), label.clone()),
+            _ => conditional_goto_expr(stmt, required_label)?,
+        };
+        if let Some(required) = required_label {
+            if label != required {
+                return None;
+            }
+        }
+        match &target {
+            Some(existing) if existing != &label => return None,
+            None => target = Some(label.clone()),
+            _ => {}
+        }
+        conds.push(cond);
+    }
+    let label = target?;
+    Some((or_all(conds)?, label))
+}
+
+fn or_all(mut conds: Vec<Expr>) -> Option<Expr> {
+    let first = conds.pop()?;
+    Some(conds.into_iter().rev().fold(first, |acc, cond| {
+        Expr::Binary("or", Box::new(cond), Box::new(acc))
+    }))
+}
+
+fn negate_condition(e: Expr) -> Expr {
+    match e {
+        Expr::Binary("==", a, b) => Expr::Binary("~=", a, b),
+        Expr::Binary("~=", a, b) => Expr::Binary("==", a, b),
+        Expr::Binary("<", a, b) => Expr::Binary(">=", a, b),
+        Expr::Binary("<=", a, b) => Expr::Binary(">", a, b),
+        Expr::Binary(">", a, b) => Expr::Binary("<=", a, b),
+        Expr::Binary(">=", a, b) => Expr::Binary("<", a, b),
+        Expr::Binary("and", a, b) => Expr::Binary(
+            "or",
+            Box::new(negate_condition(*a)),
+            Box::new(negate_condition(*b)),
+        ),
+        Expr::Binary("or", a, b) => Expr::Binary(
+            "and",
+            Box::new(negate_condition(*a)),
+            Box::new(negate_condition(*b)),
+        ),
+        Expr::Unary("not ", inner) => *inner,
+        other => Expr::Unary("not ", Box::new(other)),
+    }
+}
+
+fn contains_label_or_goto(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        Stmt::Label(_) | Stmt::Goto(_) => true,
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => contains_label_or_goto(then_body) || contains_label_or_goto(else_body),
+        Stmt::While { body, .. }
+        | Stmt::Repeat { body, .. }
+        | Stmt::NumericFor { body, .. }
+        | Stmt::GenericFor { body, .. } => contains_label_or_goto(body),
+        _ => false,
+    })
+}
+
+fn direct_local_scope_safe(moved: &[Stmt], following: &[Stmt]) -> bool {
+    let locals: BTreeSet<String> = moved
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::Local { names, .. } => Some(names.iter().cloned()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    locals.is_empty()
+        || !following
+            .iter()
+            .any(|stmt| locals.iter().any(|name| stmt_reads_var(stmt, name)))
+}
+
+fn count_gotos_named(stmts: &[Stmt], label: &str) -> usize {
+    stmts
+        .iter()
+        .map(|stmt| count_gotos_named_stmt(stmt, label))
+        .sum()
+}
+
+fn count_gotos_named_stmt(stmt: &Stmt, label: &str) -> usize {
+    match stmt {
+        Stmt::Goto(name) if name == label => 1,
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => count_gotos_named(then_body, label) + count_gotos_named(else_body, label),
+        Stmt::While { body, .. }
+        | Stmt::Repeat { body, .. }
+        | Stmt::NumericFor { body, .. }
+        | Stmt::GenericFor { body, .. } => count_gotos_named(body, label),
+        _ => 0,
+    }
+}
+
+fn goto_names_in_stmt(stmt: &Stmt) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    collect_goto_names(stmt, &mut names);
+    names
+}
+
+fn collect_goto_names(stmt: &Stmt, names: &mut BTreeSet<String>) {
+    match stmt {
+        Stmt::Goto(name) => {
+            names.insert(name.clone());
+        }
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            for stmt in then_body.iter().chain(else_body.iter()) {
+                collect_goto_names(stmt, names);
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::Repeat { body, .. }
+        | Stmt::NumericFor { body, .. }
+        | Stmt::GenericFor { body, .. } => {
+            for stmt in body {
+                collect_goto_names(stmt, names);
+            }
+        }
+        _ => {}
+    }
 }
 
 // --- inlining --------------------------------------------------------------------------
@@ -553,6 +921,9 @@ fn dead_overwritten_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>
             .iter()
             .any(|stmt| stmt_reads_var(stmt, &name))
         {
+            continue;
+        }
+        if stmt_reads_var(&block[next_def], &name) {
             continue;
         }
         block.remove(i);
@@ -937,5 +1308,276 @@ fn for_each_block_mut(s: &mut Stmt, mut f: impl FnMut(&mut Vec<Stmt>)) {
         | Stmt::NumericFor { body, .. }
         | Stmt::GenericFor { body, .. } => f(body),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::render_block;
+
+    #[test]
+    fn folds_fields_into_local_table_literals() {
+        let mut stmts = vec![
+            Stmt::Local {
+                names: vec!["object".into()],
+                values: vec![Expr::Table(vec![TableField::Named(
+                    "Camera".into(),
+                    Expr::Var("camera".into()),
+                )])],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Field(
+                    Box::new(Expr::Var("object".into())),
+                    "Looped".into(),
+                )],
+                values: vec![Expr::Binary(
+                    "or",
+                    Box::new(Expr::Var("looped".into())),
+                    Box::new(Expr::Bool(false)),
+                )],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Field(
+                    Box::new(Expr::Var("object".into())),
+                    "Speed".into(),
+                )],
+                values: vec![Expr::Binary(
+                    "or",
+                    Box::new(Expr::Var("speed".into())),
+                    Box::new(Expr::Num("1".into())),
+                )],
+            },
+            Stmt::Return(vec![Expr::Var("object".into())]),
+        ];
+
+        fold_table_literals(&mut stmts);
+
+        assert_eq!(stmts.len(), 2);
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("Camera = camera"), "{rendered}");
+        assert!(rendered.contains("Looped = looped or false"), "{rendered}");
+        assert!(rendered.contains("Speed = speed or 1"), "{rendered}");
+        assert!(!rendered.contains("object.Looped"), "{rendered}");
+        assert!(!rendered.contains("object.Speed"), "{rendered}");
+    }
+
+    #[test]
+    fn keeps_copy_when_overwrite_reads_same_name() {
+        let mut stmts = vec![
+            Stmt::Local {
+                names: vec!["fn".into()],
+                values: vec![Expr::Var("fn".into())],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("fn".into()), Expr::Var("result".into())],
+                values: vec![Expr::Call(
+                    Box::new(Expr::Var("fn".into())),
+                    vec![Expr::Num("1".into())],
+                )],
+            },
+            Stmt::Return(vec![Expr::Var("fn".into()), Expr::Var("result".into())]),
+        ];
+
+        dead_store_elim(&mut stmts, &BTreeSet::new());
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("local fn = fn"), "{rendered}");
+        assert!(rendered.contains("fn, result = fn(1)"), "{rendered}");
+    }
+
+    #[test]
+    fn drops_unreachable_after_goto_until_next_label() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("cond".into()),
+                then_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("value".into())],
+                        values: vec![Expr::Num("1".into())],
+                    },
+                    Stmt::Goto("done".into()),
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("value".into())],
+                        values: vec![Expr::Num("2".into())],
+                    },
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::Label("done".into()),
+            Stmt::Return(vec![Expr::Var("value".into())]),
+        ];
+
+        drop_unreachable(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("goto done"), "{rendered}");
+        assert!(rendered.contains("::done::"), "{rendered}");
+        assert!(rendered.contains("value = 1"), "{rendered}");
+        assert!(!rendered.contains("value = 2"), "{rendered}");
+    }
+
+    #[test]
+    fn drops_only_function_body_trailing_empty_return() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("ok".into()),
+                then_body: vec![Stmt::Return(Vec::new())],
+                else_body: Vec::new(),
+            },
+            Stmt::Return(Vec::new()),
+        ];
+
+        drop_trailing_empty_return(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("return"), "{rendered}");
+        assert!(rendered.trim_end().ends_with("end"), "{rendered}");
+    }
+
+    #[test]
+    fn recovers_nested_if_skip_goto() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Binary(
+                    "==",
+                    Box::new(Expr::Var("kind".into())),
+                    Box::new(Expr::Str("\"Vector3\"".into())),
+                ),
+                then_body: vec![Stmt::If {
+                    cond: Expr::Var("point".into()),
+                    then_body: vec![Stmt::Goto("done".into())],
+                    else_body: Vec::new(),
+                }],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("value".into())],
+                values: vec![Expr::Field(
+                    Box::new(Expr::Var("point".into())),
+                    "Position".into(),
+                )],
+            },
+            Stmt::Label("done".into()),
+            Stmt::Return(vec![Expr::Var("value".into())]),
+        ];
+
+        recover_if_skip_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(
+            rendered.contains("if kind ~= \"Vector3\" or not point then"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("value = point.Position"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+        assert!(!rendered.contains("::done::"), "{rendered}");
+    }
+
+    #[test]
+    fn recovers_loop_guard_else_goto() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Binary(
+                    "~=",
+                    Box::new(Expr::Var("kind".into())),
+                    Box::new(Expr::Str("\"Vector3\"".into())),
+                ),
+                then_body: vec![
+                    Stmt::If {
+                        cond: Expr::Binary(
+                            "~=",
+                            Box::new(Expr::Var("kind".into())),
+                            Box::new(Expr::Str("\"Instance\"".into())),
+                        ),
+                        then_body: vec![Stmt::Goto("bad".into())],
+                        else_body: Vec::new(),
+                    },
+                    Stmt::If {
+                        cond: Expr::Unary("not ", Box::new(Expr::Var("isBasePart".into()))),
+                        then_body: vec![Stmt::Goto("bad".into())],
+                        else_body: Vec::new(),
+                    },
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::Call(Expr::MethodCall(
+                Box::new(Expr::Var("bezier".into())),
+                "AddBezierPoint".into(),
+                vec![Expr::Var("point".into())],
+            )),
+            Stmt::Continue,
+            Stmt::Label("bad".into()),
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Var("error".into())),
+                vec![Expr::Str("\"bad point\"".into())],
+            )),
+        ];
+
+        recover_guard_else_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(
+            rendered
+                .contains("if kind == \"Vector3\" or (kind == \"Instance\" and isBasePart) then"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("bezier:AddBezierPoint(point)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("else\n\terror(\"bad point\")"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("goto"), "{rendered}");
+        assert!(!rendered.contains("::bad::"), "{rendered}");
+        assert!(!rendered.contains("continue"), "{rendered}");
+    }
+
+    #[test]
+    fn recovers_goto_into_labeled_if_gate() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("isInstance".into()),
+                then_body: vec![Stmt::If {
+                    cond: Expr::Var("isBasePart".into()),
+                    then_body: vec![Stmt::Goto("accept".into())],
+                    else_body: Vec::new(),
+                }],
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Var("isVector".into()),
+                then_body: vec![
+                    Stmt::Label("accept".into()),
+                    Stmt::Call(Expr::MethodCall(
+                        Box::new(Expr::Var("bezier".into())),
+                        "AddBezierPoint".into(),
+                        vec![Expr::Var("point".into())],
+                    )),
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Var("error".into())),
+                vec![Expr::Str("\"bad point\"".into())],
+            )),
+        ];
+
+        recover_goto_into_if_gates(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(
+            rendered.contains("if (isInstance and isBasePart) or isVector then"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("bezier:AddBezierPoint(point)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("error(\"bad point\")"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+        assert!(!rendered.contains("::accept::"), "{rendered}");
     }
 }

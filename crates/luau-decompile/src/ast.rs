@@ -116,10 +116,40 @@ pub enum Stmt {
 
 pub fn render_block(stmts: &[Stmt], indent: usize) -> String {
     let mut out = String::new();
-    for s in stmts {
+    for (index, s) in stmts.iter().enumerate() {
+        if index > 0 && wants_blank_line_between(&stmts[index - 1], s) {
+            out.push('\n');
+        }
         render_stmt(&mut out, s, indent);
     }
     out
+}
+
+fn wants_blank_line_between(prev: &Stmt, next: &Stmt) -> bool {
+    renders_as_function(prev)
+        || renders_as_function(next)
+        || renders_as_block(prev)
+        || renders_as_block(next)
+        || matches!(next, Stmt::Return(_))
+}
+
+fn renders_as_function(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Local { names, values } => local_function_text(names, values, 0).is_some(),
+        Stmt::Assign { targets, values } => assignment_function_text(targets, values, 0).is_some(),
+        _ => false,
+    }
+}
+
+fn renders_as_block(stmt: &Stmt) -> bool {
+    matches!(
+        stmt,
+        Stmt::If { .. }
+            | Stmt::While { .. }
+            | Stmt::Repeat { .. }
+            | Stmt::NumericFor { .. }
+            | Stmt::GenericFor { .. }
+    )
 }
 
 fn pad(out: &mut String, indent: usize) {
@@ -257,7 +287,7 @@ fn render_stmt(out: &mut String, s: &Stmt, indent: usize) {
                 out,
                 "for {} in {} do",
                 vars.join(", "),
-                join_exprs_at(exprs, indent)
+                join_generic_for_exprs_at(exprs, indent)
             );
             out.push_str(&render_block(body, indent + 1));
             pad(out, indent);
@@ -326,6 +356,14 @@ fn join_exprs_at(exprs: &[Expr], indent: usize) -> String {
         .join(", ")
 }
 
+fn join_generic_for_exprs_at(exprs: &[Expr], indent: usize) -> String {
+    let mut end = exprs.len();
+    while end > 1 && matches!(exprs[end - 1], Expr::Nil) {
+        end -= 1;
+    }
+    join_exprs_at(&exprs[..end], indent)
+}
+
 pub fn render_expr(e: &Expr) -> String {
     render_expr_at(e, 0)
 }
@@ -362,17 +400,32 @@ fn render_expr_at(e: &Expr, indent: usize) -> String {
                     return format!("{} {flipped} {}", paren_at(b, indent), paren_at(a, indent));
                 }
             }
-            // `and`/`or` are associative and left-grouped by the compiler; a same-operator
-            // left operand doesn't need parens (`a and b and c`, not `(a and b) and c`).
-            let lhs = match (a.as_ref(), *op) {
-                (Expr::Binary(inner, ..), "and") if *inner == "and" => render_expr_at(a, indent),
-                (Expr::Binary(inner, ..), "or") if *inner == "or" => render_expr_at(a, indent),
-                _ => paren_at(a, indent),
-            };
-            format!("{lhs} {op} {}", paren_at(b, indent))
+            let lhs = binary_operand_at(a, op, false, indent);
+            let rhs = binary_operand_at(b, op, true, indent);
+            format!("{lhs} {op} {rhs}")
         }
         Expr::Table(fields) => render_table(fields, indent),
     }
+}
+
+fn binary_operand_at(e: &Expr, parent_op: &str, is_rhs: bool, indent: usize) -> String {
+    match (parent_op, e) {
+        // `and`/`or` conditions read best without wrapping simple comparisons and unary
+        // checks: `a ~= b or not c`, not `(a ~= b) or (not c)`.
+        ("and" | "or", Expr::Binary(op, ..)) if is_comparison_op(op) => render_expr_at(e, indent),
+        ("and" | "or", Expr::Unary(..)) => render_expr_at(e, indent),
+        // Same-operator logical chains are associative in Luau.
+        ("and", Expr::Binary("and", ..)) | ("or", Expr::Binary("or", ..)) => {
+            render_expr_at(e, indent)
+        }
+        // Keep a mixed logical rhs grouped for readability (`a or (b and c)`).
+        ("or", Expr::Binary("and", ..)) if is_rhs => format!("({})", render_expr_at(e, indent)),
+        _ => paren_at(e, indent),
+    }
+}
+
+fn is_comparison_op(op: &str) -> bool {
+    matches!(op, "==" | "~=" | "<" | "<=" | ">" | ">=")
 }
 
 fn flipped_comparison(op: &str) -> Option<&'static str> {
@@ -463,7 +516,9 @@ fn indent_multiline(text: &str, indent: usize) -> String {
     for (i, line) in text.lines().enumerate() {
         if i > 0 {
             out.push('\n');
-            pad(&mut out, indent);
+            if !line.is_empty() {
+                pad(&mut out, indent);
+            }
         }
         out.push_str(line);
     }
@@ -576,6 +631,64 @@ mod tests {
     }
 
     #[test]
+    fn trims_generic_for_trailing_nil_iterators() {
+        let rendered = render_block(
+            &[Stmt::GenericFor {
+                vars: vec!["i".into(), "j".into()],
+                exprs: vec![Expr::Var("value".into()), Expr::Nil, Expr::Nil],
+                body: vec![Stmt::Call(Expr::Call(
+                    Box::new(Expr::Var("print".into())),
+                    vec![Expr::Var("j".into())],
+                ))],
+            }],
+            0,
+        );
+
+        assert!(rendered.contains("for i, j in value do"), "{rendered}");
+        assert!(!rendered.contains("value, nil, nil"), "{rendered}");
+    }
+
+    #[test]
+    fn prints_blank_lines_around_blocks_and_returns() {
+        let rendered = render_block(
+            &[
+                Stmt::Local {
+                    names: vec!["value".into()],
+                    values: vec![Expr::Num("0".into())],
+                },
+                Stmt::If {
+                    cond: Expr::Var("ok".into()),
+                    then_body: vec![Stmt::Assign {
+                        targets: vec![Expr::Var("value".into())],
+                        values: vec![Expr::Num("1".into())],
+                    }],
+                    else_body: Vec::new(),
+                },
+                Stmt::Assign {
+                    targets: vec![Expr::Var("value".into())],
+                    values: vec![Expr::Binary(
+                        "+",
+                        Box::new(Expr::Var("value".into())),
+                        Box::new(Expr::Num("1".into())),
+                    )],
+                },
+                Stmt::Return(vec![Expr::Var("value".into())]),
+            ],
+            0,
+        );
+
+        assert!(
+            rendered.contains("local value = 0\n\nif ok then"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("end\n\nvalue = value + 1"), "{rendered}");
+        assert!(
+            rendered.contains("value = value + 1\n\nreturn value"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn prints_function_sugar() {
         let closure = Expr::Closure {
             text: "function(x)\n\treturn x\nend".into(),
@@ -599,5 +712,28 @@ mod tests {
         );
         assert!(rendered.contains("local function id(x)"));
         assert!(rendered.contains("function module.id(x)"));
+        assert!(
+            rendered.contains("end\n\nfunction module.id(x)"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn indented_function_literals_keep_blank_lines_empty() {
+        let rendered = render_expr_at(
+            &Expr::Closure {
+                text: "function()\n\tif ok then\n\t\treturn true\n\tend\n\n\treturn false\nend"
+                    .into(),
+                captures: Vec::new(),
+            },
+            2,
+        );
+
+        for line in rendered.lines() {
+            assert!(
+                line.is_empty() || !line.chars().all(|ch| ch == '\t' || ch == ' '),
+                "blank line has indentation: {rendered:?}"
+            );
+        }
     }
 }

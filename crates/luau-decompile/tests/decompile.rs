@@ -150,6 +150,30 @@ fn multret_call_args_reconstructed() {
 }
 
 #[test]
+fn multret_method_arg_is_not_duplicated() {
+    let Some(bytes) = compile_source("23_multret_method_arg.luau") else {
+        eprintln!("skipping: compiler not present");
+        return;
+    };
+    let module = parse_and_validate(&bytes).unwrap();
+    let out = decompile(&module).source;
+
+    assert!(
+        out.contains("table.insert(result, p0:GetPoint(i))"),
+        "method call argument not rebuilt:\n{out}"
+    );
+    assert_eq!(
+        out.matches("p0:GetPoint(i)").count(),
+        1,
+        "method call argument was duplicated:\n{out}"
+    );
+    assert!(
+        recompiles(&out, "multret_method_arg"),
+        "method arg output must recompile:\n{out}"
+    );
+}
+
+#[test]
 fn loop_break_and_continue_recovered() {
     // Conditional jumps to a loop's exit / continue point must lower to native `break` /
     // `continue` keywords (this Luau dialect has no goto), and the result must recompile.
@@ -429,6 +453,23 @@ fn overwritten_pure_temp_stores_are_removed() {
     assert!(
         recompiles(&out, "overwritten_stripped_store"),
         "cleaned stripped output must recompile:\n{out}"
+    );
+}
+
+#[test]
+fn overwritten_copy_stores_that_feed_calls_are_kept() {
+    let out = decompile(&parse_and_validate(&read_stripped("13_multiret.luauc")).unwrap()).source;
+    assert!(
+        out.contains("local v0 = v0"),
+        "copy from outer function must survive before same-name overwrite:\n{out}"
+    );
+    assert!(
+        !out.contains("local v0, v1"),
+        "hoisted local must not shadow the function before it is copied:\n{out}"
+    );
+    assert!(
+        recompiles(&out, "overwritten_copy_store"),
+        "copy-preserving output must recompile:\n{out}"
     );
 }
 
