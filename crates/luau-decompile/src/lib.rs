@@ -210,6 +210,7 @@ fn decompile_proto(
     cleanup::recover_if_else_gotos(&mut stmts);
     cleanup::recover_top_test_while_gotos(&mut stmts);
     cleanup::recover_backward_goto_while(&mut stmts);
+    cleanup::recover_natural_loops(&mut stmts);
     cleanup::merge_leading_while_break_guards(&mut stmts);
     cleanup::recover_loop_carried_call_updates(&mut stmts);
     cleanup::simplify_repeat_return_guards(&mut stmts);

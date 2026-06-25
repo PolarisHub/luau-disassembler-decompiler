@@ -1330,6 +1330,124 @@ pub fn recover_top_test_while_gotos(root: &mut Vec<Stmt>) {
     while recover_top_test_while_once(root) {}
 }
 
+/// General fallback loop recovery: turn any remaining backward-goto loop into
+/// `while true do … end`. A label that is the target of a *backward* goto (one appearing
+/// after the label, in the same block) is a loop header. The body spans from just after the
+/// header to the last statement containing a back-edge; back-edges to the header become
+/// `continue`, a bare unconditional trailing back-edge is dropped (it is the natural loop
+/// edge), and the implicit fall-through past the body — which in goto form exits the loop —
+/// becomes an explicit `break`. A single forward jump to a label after the loop becomes a
+/// `break` too. The specialized passes recover prettier `while <cond>` / `repeat` forms
+/// first; this catches whatever they leave behind (loops whose only exits are `return`s or
+/// nested conditional back-edges) so no `goto`/label survives.
+pub fn recover_natural_loops(root: &mut Vec<Stmt>) {
+    for s in root.iter_mut() {
+        for_each_block_mut(s, recover_natural_loops);
+    }
+    while recover_natural_loop_once(root) {}
+}
+
+fn recover_natural_loop_once(root: &mut Vec<Stmt>) -> bool {
+    for i in 0..root.len() {
+        let Stmt::Label(label) = &root[i] else {
+            continue;
+        };
+        let label = label.clone();
+
+        // There must be at least one back-edge (a `goto` after the header) and no forward
+        // entry (a `goto` before it), so the region from the header onward is a clean loop.
+        if count_gotos_named(&root[i + 1..], &label) == 0 {
+            continue;
+        }
+        if count_gotos_named(&root[..i], &label) != 0 {
+            continue;
+        }
+
+        // The loop body ends at the last top-level statement that still holds a back-edge.
+        let Some(loop_end) = (i + 1..root.len())
+            .rev()
+            .find(|&j| count_gotos_named_stmt(&root[j], &label) > 0)
+        else {
+            continue;
+        };
+
+        let mut body: Vec<Stmt> = root[i + 1..=loop_end].to_vec();
+
+        // A back-edge inside a *nested* loop would have to `continue` the outer loop, which a
+        // single `continue` cannot express — leave it unstructured.
+        if has_goto_in_nested_loop(&body, &label, false) {
+            continue;
+        }
+
+        // Residual forward jumps (after the continue rewrite) must all target one label that
+        // sits after the loop — a `break`. Anything else we cannot structure cleanly.
+        let mut exits = BTreeSet::new();
+        for s in &body {
+            collect_goto_names(s, &mut exits);
+        }
+        exits.remove(&label);
+        let exit_label = match exits.len() {
+            0 => None,
+            1 => {
+                let exit = exits.into_iter().next().unwrap();
+                let after = (loop_end + 1..root.len())
+                    .any(|j| matches!(&root[j], Stmt::Label(l) if l == &exit));
+                if !after || has_goto_in_nested_loop(&body, &exit, false) {
+                    continue;
+                }
+                Some(exit)
+            }
+            _ => continue,
+        };
+
+        // Drop a bare unconditional trailing back-edge (the natural loop edge). Otherwise the
+        // body can fall off the end, which in goto form exits — make that an explicit break.
+        let trailing_backedge = matches!(body.last(), Some(Stmt::Goto(l)) if l == &label);
+        if trailing_backedge {
+            body.pop();
+        }
+        replace_gotos_with_continue(&mut body, &label);
+        if let Some(exit) = &exit_label {
+            replace_gotos_with_break(&mut body, exit);
+        }
+        // Represent the implicit fall-through exit as an explicit `break` — but only when the
+        // body can actually fall off its end. If it already ends in a terminator (`return` /
+        // `break` / `continue`), control never reaches past it, and appending `break` after a
+        // `return` would not even be valid Luau (a `return` must end its block).
+        let ends_terminated = matches!(
+            body.last(),
+            Some(Stmt::Return(_) | Stmt::Break | Stmt::Continue)
+        );
+        if !trailing_backedge && !ends_terminated {
+            body.push(Stmt::Break);
+        }
+
+        if contains_label_or_goto(&body) {
+            continue;
+        }
+
+        root[i] = Stmt::While {
+            cond: Expr::Bool(true),
+            body,
+        };
+        root.drain(i + 1..=loop_end);
+
+        // Drop the exit label if the recovered breaks were its only references.
+        if let Some(exit) = exit_label {
+            if count_gotos_named(root, &exit) == 0 {
+                if let Some(pos) = root
+                    .iter()
+                    .position(|s| matches!(s, Stmt::Label(l) if l == &exit))
+                {
+                    root.remove(pos);
+                }
+            }
+        }
+        return true;
+    }
+    false
+}
+
 /// Merge a leading `if <cond> then break end` guard into the enclosing while condition.
 /// Luau often emits `while a do if not b then break end ... end` for `while a and b do`.
 pub fn merge_leading_while_break_guards(root: &mut [Stmt]) {
@@ -1370,25 +1488,78 @@ fn recover_top_test_while_once(root: &mut Vec<Stmt>) -> bool {
             i += 1;
             continue;
         };
-        if count_gotos_named(root, label) != 1 {
+        let label = label.clone();
+        if count_gotos_named(root, &label) != 1 {
             i += 1;
             continue;
         }
 
-        let Some((cond, body)) = top_test_while_body(&root[i + 1], label) else {
+        let Some((cond, mut body)) = top_test_while_body(&root[i + 1], &label) else {
             i += 1;
             continue;
         };
+
+        // The body's only residual unstructured control flow may be forward `goto <exit>`
+        // jumps that are really `break`s, where <exit> is the label immediately following
+        // this loop. Convert those before deciding the loop is recoverable; anything else
+        // (internal labels, jumps elsewhere) means we can't structure it cleanly.
+        let mut exit_label = None;
         if contains_label_or_goto(&body) {
-            i += 1;
-            continue;
+            let Some(exit) = sole_forward_exit_label(&body, root, i + 1) else {
+                i += 1;
+                continue;
+            };
+            // A `goto <exit>` buried inside a *nested* loop would have to break out of two
+            // loops at once, which a single `break` cannot express — leave it unstructured.
+            if has_goto_in_nested_loop(&body, &exit, false) {
+                i += 1;
+                continue;
+            }
+            replace_gotos_with_break(&mut body, &exit);
+            if contains_label_or_goto(&body) {
+                i += 1;
+                continue;
+            }
+            exit_label = Some(exit);
         }
 
         root[i] = Stmt::While { cond, body };
         root.remove(i + 1);
+
+        // Drop the exit label if the recovered `break`s were its only references.
+        if let Some(exit) = exit_label {
+            if count_gotos_named(root, &exit) == 0 {
+                if let Some(pos) = root
+                    .iter()
+                    .position(|s| matches!(s, Stmt::Label(l) if l == &exit))
+                {
+                    root.remove(pos);
+                }
+            }
+        }
         return true;
     }
     false
+}
+
+/// If every `goto` in `body` targets a single label, and that label is defined in `root` at
+/// some index strictly after `loop_idx` (so it is a forward jump *out* of the loop), return
+/// it. Returns `None` when `body` defines its own labels or jumps to more than one place —
+/// cases a single `break` cannot capture.
+fn sole_forward_exit_label(body: &[Stmt], root: &[Stmt], loop_idx: usize) -> Option<String> {
+    let mut targets = BTreeSet::new();
+    for stmt in body {
+        collect_goto_names(stmt, &mut targets);
+    }
+    if targets.len() != 1 {
+        return None;
+    }
+    let exit = targets.into_iter().next().unwrap();
+    let defined_after = root
+        .iter()
+        .enumerate()
+        .any(|(idx, s)| idx > loop_idx && matches!(s, Stmt::Label(l) if l == &exit));
+    defined_after.then_some(exit)
 }
 
 fn top_test_while_body(stmt: &Stmt, label: &str) -> Option<(Expr, Vec<Stmt>)> {
@@ -2697,6 +2868,19 @@ fn replace_gotos_with_break(stmts: &mut [Stmt], target_label: &str) {
             }
             _ => {
                 for_each_block_mut(s, |b| replace_gotos_with_break(b, target_label));
+            }
+        }
+    }
+}
+
+fn replace_gotos_with_continue(stmts: &mut [Stmt], target_label: &str) {
+    for s in stmts.iter_mut() {
+        match s {
+            Stmt::Goto(name) if name == target_label => {
+                *s = Stmt::Continue;
+            }
+            _ => {
+                for_each_block_mut(s, |b| replace_gotos_with_continue(b, target_label));
             }
         }
     }
