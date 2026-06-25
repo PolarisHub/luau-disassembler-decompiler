@@ -401,6 +401,37 @@ fn stripped_index_reads_get_readable_names() {
     );
 }
 
+#[test]
+fn overwritten_pure_temp_stores_are_removed() {
+    let out = decompile(&parse_and_validate(&read("14_string_ops.luauc")).unwrap()).source;
+    assert!(
+        !out.contains("local floor = 1"),
+        "dead register initializer survived before overwrite:\n{out}"
+    );
+    assert!(
+        out.contains("local floor = math.floor(n)"),
+        "real assignment should be promoted after dead-store removal:\n{out}"
+    );
+    assert!(
+        recompiles(&out, "overwritten_debug_store"),
+        "cleaned debug output must recompile:\n{out}"
+    );
+
+    let out = decompile(&parse_and_validate(&read_stripped("14_string_ops.luauc")).unwrap()).source;
+    assert!(
+        !out.contains("local v4 = 1"),
+        "dead stripped register initializer survived before overwrite:\n{out}"
+    );
+    assert!(
+        out.contains("local rounded = math.floor(p1)"),
+        "stripped math.floor result should be named after the real assignment:\n{out}"
+    );
+    assert!(
+        recompiles(&out, "overwritten_stripped_store"),
+        "cleaned stripped output must recompile:\n{out}"
+    );
+}
+
 /// Recompile `src`, returning the resulting bytecode, or `None` when the compiler is absent.
 fn recompile_bytes(src: &str, tag: &str) -> Option<Vec<u8>> {
     let luau = root().join("tools").join("luau-compile.exe");

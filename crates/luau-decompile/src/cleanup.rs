@@ -119,7 +119,7 @@ pub fn single_use_inline(root: &mut Vec<Stmt>, protected: &BTreeSet<String>) {
 pub fn dead_store_elim(root: &mut Vec<Stmt>, protected: &BTreeSet<String>) {
     loop {
         let uses = count_uses(root);
-        if !dead_in_block(root, &uses, protected) {
+        if !dead_in_block(root, &uses, protected) && !dead_overwritten_in_block(root, protected) {
             break;
         }
     }
@@ -521,6 +521,46 @@ fn dead_in_block(
     false
 }
 
+fn dead_overwritten_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool {
+    for s in block.iter_mut() {
+        let mut changed = false;
+        for_each_block_mut(s, |b| {
+            if !changed {
+                changed = dead_overwritten_in_block(b, protected);
+            }
+        });
+        if changed {
+            return true;
+        }
+    }
+
+    for i in 0..block.len() {
+        let Some((name, val)) = sole_var_assign(&block[i]) else {
+            continue;
+        };
+        if protected.contains(&name) || !is_pure(&val) {
+            continue;
+        }
+        let Some(next_def) =
+            ((i + 1)..block.len()).find(|&k| directly_writes_var(&block[k], &name))
+        else {
+            continue;
+        };
+        if block[i + 1..next_def].iter().any(is_control_flow) {
+            continue;
+        }
+        if block[i + 1..next_def]
+            .iter()
+            .any(|stmt| stmt_reads_var(stmt, &name))
+        {
+            continue;
+        }
+        block.remove(i);
+        return true;
+    }
+    false
+}
+
 // --- counting --------------------------------------------------------------------------
 
 fn count_uses(root: &[Stmt]) -> BTreeMap<String, usize> {
@@ -641,6 +681,16 @@ fn sole_var_assign(s: &Stmt) -> Option<(String, Expr)> {
 
 fn stmt_reads_var(s: &Stmt, name: &str) -> bool {
     stmt_read_count(s, name) > 0
+}
+
+fn directly_writes_var(s: &Stmt, name: &str) -> bool {
+    match s {
+        Stmt::Assign { targets, .. } => targets
+            .iter()
+            .any(|target| matches!(target, Expr::Var(target_name) if target_name == name)),
+        Stmt::Local { names, .. } => names.iter().any(|target_name| target_name == name),
+        _ => false,
+    }
 }
 
 fn stmt_reads_var_in_assignment_target(s: &Stmt, name: &str) -> bool {
