@@ -174,6 +174,37 @@ fn multret_method_arg_is_not_duplicated() {
 }
 
 #[test]
+fn captured_service_locals_survive_smart_rename() {
+    let Some(bytes) = compile_source("24_captured_services.luau") else {
+        eprintln!("skipping: compiler not present");
+        return;
+    };
+    let module = parse_and_validate(&bytes).unwrap();
+    let out = decompile(&module).source;
+
+    assert!(
+        out.contains("local Debris = game:GetService(\"Debris\")"),
+        "captured Debris service assignment was dropped:\n{out}"
+    );
+    assert!(
+        out.contains("local TweenService = game:GetService(\"TweenService\")"),
+        "captured TweenService assignment was dropped:\n{out}"
+    );
+    assert!(
+        !out.contains("unhandled op CALLFB"),
+        "CALLFB should decompile as a normal call:\n{out}"
+    );
+    assert!(
+        out.contains("Debris:AddItem"),
+        "upvalue use missing:\n{out}"
+    );
+    assert!(
+        recompiles(&out, "captured_services"),
+        "captured service output must recompile:\n{out}"
+    );
+}
+
+#[test]
 fn loop_break_and_continue_recovered() {
     // Conditional jumps to a loop's exit / continue point must lower to native `break` /
     // `continue` keywords (this Luau dialect has no goto), and the result must recompile.

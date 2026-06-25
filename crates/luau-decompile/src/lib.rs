@@ -132,6 +132,14 @@ fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoRep
             *n = new.clone();
         }
     }
+    for new in protected
+        .iter()
+        .filter_map(|name| rename.get(name))
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        protected.insert(new);
+    }
 
     // Now that this function's locals have their final names, rewrite the `u0`/`u1`/… upvalue
     // placeholders inside each nested closure to the captured local's name.
@@ -1283,7 +1291,7 @@ impl<'a> Decompiler<'a> {
                 let method = self.string_const(aux);
                 *pending_namecall = Some((a, self.reg(b), method));
             }
-            CALL => self.emit_call(a, b, c, multret_top, stmts, pending_namecall),
+            CALL | CALLFB => self.emit_call(a, b, c, multret_top, stmts, pending_namecall),
             RETURN => {
                 // B-1 values from R(A). B==0 means "to top": return R(A) up to the preceding
                 // multret value (e.g. `return f(...)` tail position).
