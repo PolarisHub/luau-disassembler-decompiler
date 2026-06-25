@@ -10,9 +10,8 @@
 //! results, length, field access). It is structured as a single first-match-wins
 //! `derive_name` so more rules slot in cleanly.
 
+use crate::ast::{Capture, Expr, Stmt, TableField};
 use std::collections::{BTreeMap, BTreeSet};
-
-use crate::ast::{Expr, Stmt, TableField};
 
 /// Names matching this shape are decompiler-synthesized locals and may be renamed. Debug
 /// names and parameters (`pN`) are left untouched.
@@ -20,63 +19,546 @@ fn is_synthetic(name: &str) -> bool {
     name.len() >= 2 && name.starts_with('v') && name[1..].chars().all(|c| c.is_ascii_digit())
 }
 
-/// Compute a rename map for synthesized locals, keyed by their current name.
-pub fn smart_rename(stmts: &[Stmt], hoist_names: &[String]) -> BTreeMap<String, String> {
-    let candidates: BTreeSet<String> = hoist_names
+fn is_parameter(name: &str) -> bool {
+    name.len() >= 2 && name.starts_with('p') && name[1..].chars().all(|c| c.is_ascii_digit())
+}
+
+fn collect_raw_locked(stmts: &[Stmt], out: &mut BTreeSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Local { values, .. } => {
+                values.iter().for_each(|e| collect_raw_locked_expr(e, out))
+            }
+            Stmt::Assign { targets, values } => {
+                targets.iter().for_each(|e| collect_raw_locked_expr(e, out));
+                values.iter().for_each(|e| collect_raw_locked_expr(e, out));
+            }
+            Stmt::Call(e) => collect_raw_locked_expr(e, out),
+            Stmt::Return(es) => es.iter().for_each(|e| collect_raw_locked_expr(e, out)),
+            Stmt::If { cond, .. } => collect_raw_locked_expr(cond, out),
+            Stmt::While { cond, .. } => collect_raw_locked_expr(cond, out),
+            Stmt::Repeat { cond, .. } => collect_raw_locked_expr(cond, out),
+            _ => {}
+        }
+        for_each_child_block(s, |body| collect_raw_locked(body, out));
+    }
+}
+
+fn collect_raw_locked_expr(e: &Expr, out: &mut BTreeSet<String>) {
+    match e {
+        Expr::Raw(text) => {
+            for word in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+                if is_synthetic(word) || is_parameter(word) {
+                    out.insert(word.to_string());
+                }
+            }
+        }
+        Expr::Index(t, k) => {
+            collect_raw_locked_expr(t, out);
+            collect_raw_locked_expr(k, out);
+        }
+        Expr::Field(t, _) => collect_raw_locked_expr(t, out),
+        Expr::Call(f, args) => {
+            collect_raw_locked_expr(f, out);
+            args.iter().for_each(|a| collect_raw_locked_expr(a, out));
+        }
+        Expr::MethodCall(o, _, args) => {
+            collect_raw_locked_expr(o, out);
+            args.iter().for_each(|a| collect_raw_locked_expr(a, out));
+        }
+        Expr::Unary(_, a) => collect_raw_locked_expr(a, out),
+        Expr::Binary(_, a, b) => {
+            collect_raw_locked_expr(a, out);
+            collect_raw_locked_expr(b, out);
+        }
+        Expr::Table(fields) => {
+            for f in fields {
+                match f {
+                    TableField::Item(e) | TableField::Named(_, e) => {
+                        collect_raw_locked_expr(e, out)
+                    }
+                    TableField::Keyed(k, v) => {
+                        collect_raw_locked_expr(k, out);
+                        collect_raw_locked_expr(v, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_captured_names(stmts: &[Stmt], out: &mut BTreeSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Local { values, .. } => values.iter().for_each(|e| collect_captured_expr(e, out)),
+            Stmt::Assign { targets, values } => {
+                targets.iter().for_each(|e| collect_captured_expr(e, out));
+                values.iter().for_each(|e| collect_captured_expr(e, out));
+            }
+            Stmt::Call(e) => collect_captured_expr(e, out),
+            Stmt::Return(es) => es.iter().for_each(|e| collect_captured_expr(e, out)),
+            Stmt::If { cond, .. } => collect_captured_expr(cond, out),
+            Stmt::While { cond, .. } => collect_captured_expr(cond, out),
+            Stmt::Repeat { cond, .. } => collect_captured_expr(cond, out),
+            _ => {}
+        }
+        for_each_child_block(s, |body| collect_captured_names(body, out));
+    }
+}
+
+fn collect_captured_expr(e: &Expr, out: &mut BTreeSet<String>) {
+    match e {
+        Expr::Closure { captures, .. } => {
+            for cap in captures {
+                if let Capture::Reg(r) = cap {
+                    out.insert(format!("v{r}"));
+                    out.insert(format!("p{r}"));
+                }
+            }
+        }
+        Expr::Index(t, k) => {
+            collect_captured_expr(t, out);
+            collect_captured_expr(k, out);
+        }
+        Expr::Field(t, _) => collect_captured_expr(t, out),
+        Expr::Call(f, args) => {
+            collect_captured_expr(f, out);
+            args.iter().for_each(|a| collect_captured_expr(a, out));
+        }
+        Expr::MethodCall(o, _, args) => {
+            collect_captured_expr(o, out);
+            args.iter().for_each(|a| collect_captured_expr(a, out));
+        }
+        Expr::Unary(_, a) => collect_captured_expr(a, out),
+        Expr::Binary(_, a, b) => {
+            collect_captured_expr(a, out);
+            collect_captured_expr(b, out);
+        }
+        Expr::Table(fields) => {
+            for f in fields {
+                match f {
+                    TableField::Item(e) | TableField::Named(_, e) => collect_captured_expr(e, out),
+                    TableField::Keyed(k, v) => {
+                        collect_captured_expr(k, out);
+                        collect_captured_expr(v, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+struct FactCollector {
+    suggestions: BTreeMap<String, Vec<(String, u32)>>,
+    param_method_receiver: BTreeSet<String>,
+}
+
+impl FactCollector {
+    fn add_suggestion(&mut self, var: &str, name: String, score: u32) {
+        if is_synthetic(var) || is_parameter(var) {
+            self.suggestions
+                .entry(var.to_string())
+                .or_default()
+                .push((name, score));
+        }
+    }
+
+    fn visit_stmts(&mut self, stmts: &[Stmt]) {
+        for s in stmts {
+            match s {
+                Stmt::Local { names, values } => {
+                    for (name, val) in names.iter().zip(values.iter()) {
+                        if let Some(derived) = derive_name(val) {
+                            self.add_suggestion(name, derived, 15);
+                        }
+                        self.visit_expr(val);
+                    }
+                }
+                Stmt::Assign { targets, values } => {
+                    if targets.len() == 1 && values.len() == 1 {
+                        let target = &targets[0];
+                        let value = &values[0];
+
+                        if let Expr::Var(t_name) = target {
+                            if let Some(derived) = derive_name(value) {
+                                self.add_suggestion(t_name, derived, 15);
+                            }
+                        }
+
+                        if let Expr::Field(_, field) = target {
+                            if let Expr::Var(x_name) = value {
+                                self.add_suggestion(x_name, lower_first(field), 8);
+                            }
+                        }
+
+                        if let Expr::Index(_, key) = target {
+                            if let Expr::Str(lit) = key.as_ref() {
+                                if let Expr::Var(x_name) = value {
+                                    self.add_suggestion(x_name, lower_first(&strip_quotes(lit)), 8);
+                                }
+                            }
+                        }
+
+                        if let Expr::Index(base, _) = target {
+                            if let Expr::Var(x_name) = value {
+                                if let Expr::Var(base_name) = base.as_ref() {
+                                    self.add_suggestion(x_name, singular(base_name), 8);
+                                }
+                            }
+                        }
+                    }
+
+                    for t in targets {
+                        self.visit_expr(t);
+                    }
+                    for v in values {
+                        self.visit_expr(v);
+                    }
+                }
+                Stmt::Call(e) => self.visit_expr(e),
+                Stmt::Return(es) => {
+                    for e in es {
+                        self.visit_expr(e);
+                    }
+                }
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    if let Expr::Var(cond_name) = cond {
+                        self.add_suggestion(cond_name, "enabled".to_string(), 5);
+                    }
+                    self.visit_expr(cond);
+                    self.visit_stmts(then_body);
+                    self.visit_stmts(else_body);
+                }
+                Stmt::While { cond, body } => {
+                    self.visit_expr(cond);
+                    self.visit_stmts(body);
+                }
+                Stmt::Repeat { body, cond } => {
+                    self.visit_stmts(body);
+                    self.visit_expr(cond);
+                }
+                Stmt::NumericFor {
+                    var,
+                    start,
+                    limit,
+                    step,
+                    body,
+                } => {
+                    self.add_suggestion(var, "index".to_string(), 8);
+                    self.add_suggestion(var, "i".to_string(), 6);
+                    if let Expr::Var(limit_name) = limit {
+                        self.add_suggestion(limit_name, "limit".to_string(), 6);
+                    }
+                    self.visit_expr(start);
+                    self.visit_expr(limit);
+                    if let Some(s) = step {
+                        self.visit_expr(s);
+                    }
+                    self.visit_stmts(body);
+                }
+                Stmt::GenericFor { vars, exprs, body } => {
+                    if let Some(Expr::Call(callee, args)) = exprs.first() {
+                        if let Expr::Var(callee_name) = callee.as_ref() {
+                            if callee_name == "ipairs" || callee_name == "pairs" {
+                                if let Some(Expr::Var(list_name)) = args.first() {
+                                    self.add_suggestion(list_name, "items".to_string(), 8);
+
+                                    if vars.len() >= 2 {
+                                        self.add_suggestion(&vars[0], "index".to_string(), 8);
+                                        let item_suggestion = singular(list_name);
+                                        self.add_suggestion(&vars[1], item_suggestion, 10);
+                                    }
+                                }
+                            }
+                        }
+                    } else if vars.len() >= 2 {
+                        self.add_suggestion(&vars[0], "key".to_string(), 5);
+                        self.add_suggestion(&vars[1], "value".to_string(), 5);
+                    }
+                    for e in exprs {
+                        self.visit_expr(e);
+                    }
+                    self.visit_stmts(body);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn visit_expr(&mut self, e: &Expr) {
+        match e {
+            Expr::Field(base, field) => {
+                if let Expr::Var(base_name) = base.as_ref() {
+                    match field.as_str() {
+                        "Character" => self.add_suggestion(base_name, "player".to_string(), 8),
+                        "Parent" => {
+                            self.add_suggestion(base_name, "instance".to_string(), 6);
+                            self.add_suggestion(base_name, "part".to_string(), 4);
+                        }
+                        "Name" => {
+                            self.add_suggestion(base_name, "instance".to_string(), 5);
+                        }
+                        "Humanoid" => self.add_suggestion(base_name, "character".to_string(), 8),
+                        "HumanoidRootPart" => {
+                            self.add_suggestion(base_name, "character".to_string(), 8)
+                        }
+                        "Position" | "CFrame" => {
+                            self.add_suggestion(base_name, "part".to_string(), 5);
+                            self.add_suggestion(base_name, "attachment".to_string(), 5);
+                        }
+                        _ => {}
+                    }
+                }
+                self.visit_expr(base);
+            }
+            Expr::MethodCall(recv, method, args) => {
+                if let Expr::Var(recv_name) = recv.as_ref() {
+                    self.param_method_receiver.insert(recv_name.clone());
+
+                    match method.as_str() {
+                        "IsA" => {
+                            self.add_suggestion(recv_name, "instance".to_string(), 8);
+                            self.add_suggestion(recv_name, "part".to_string(), 6);
+                        }
+                        "FindFirstChild" | "WaitForChild" => {
+                            self.add_suggestion(recv_name, "instance".to_string(), 8);
+                        }
+                        "GetChildren" | "GetDescendants" => {
+                            self.add_suggestion(recv_name, "instance".to_string(), 8);
+                        }
+                        "Connect" | "ConnectParallel" | "Once" => {
+                            self.add_suggestion(recv_name, "event".to_string(), 8);
+                        }
+                        "Fire" => {
+                            self.add_suggestion(recv_name, "event".to_string(), 8);
+                        }
+                        "FireServer" | "InvokeServer" => {
+                            self.add_suggestion(recv_name, "remoteEvent".to_string(), 8);
+                        }
+                        _ => {}
+                    }
+                }
+
+                match method.as_str() {
+                    "Connect" | "ConnectParallel" | "Once" => {
+                        if let Some(Expr::Var(arg_name)) = args.first() {
+                            self.add_suggestion(arg_name, "callback".to_string(), 8);
+                        }
+                    }
+                    "FindFirstChild" | "WaitForChild" | "FindFirstAncestor" => {
+                        if let Some(Expr::Var(arg_name)) = args.first() {
+                            self.add_suggestion(arg_name, "name".to_string(), 5);
+                        }
+                    }
+                    _ => {}
+                }
+
+                self.visit_expr(recv);
+                for a in args {
+                    self.visit_expr(a);
+                }
+            }
+            Expr::Call(callee, args) => {
+                if let Expr::Var(callee_name) = callee.as_ref() {
+                    if callee_name == "require" {
+                        if let Some(Expr::Var(arg_name)) = args.first() {
+                            self.add_suggestion(arg_name, "module".to_string(), 8);
+                        }
+                    }
+                }
+                self.visit_expr(callee);
+                for a in args {
+                    self.visit_expr(a);
+                }
+            }
+            Expr::Index(base, key) => {
+                self.visit_expr(base);
+                self.visit_expr(key);
+            }
+            Expr::Unary(_, a) => self.visit_expr(a),
+            Expr::Binary(op, a, b) => {
+                if matches!(*op, "<" | "<=" | ">" | ">=" | "==" | "~=") {
+                    if let Expr::Var(name) = a.as_ref() {
+                        if let Expr::Var(limit_name) = b.as_ref() {
+                            if limit_name.contains("limit") {
+                                self.add_suggestion(name, "index".to_string(), 4);
+                            }
+                        }
+                    }
+                }
+                self.visit_expr(a);
+                self.visit_expr(b);
+            }
+            Expr::Table(fields) => {
+                for f in fields {
+                    match f {
+                        TableField::Item(e) | TableField::Named(_, e) => self.visit_expr(e),
+                        TableField::Keyed(k, v) => {
+                            self.visit_expr(k);
+                            self.visit_expr(v);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn select_name_base(
+    var: &str,
+    suggestions: &[(String, u32)],
+    collector: &FactCollector,
+    is_method: bool,
+) -> Option<String> {
+    if is_parameter(var) && collector.param_method_receiver.contains(var) && var == "p0" && is_method {
+        return Some("self".to_string());
+    }
+
+    if suggestions.is_empty() {
+        return None;
+    }
+
+    let mut scores: BTreeMap<String, u32> = BTreeMap::new();
+    for (name, score) in suggestions {
+        *scores.entry(name.clone()).or_default() += score;
+    }
+
+    let mut best_name: Option<String> = None;
+    let mut max_score = 0;
+    for (name, score) in scores {
+        if score > max_score {
+            max_score = score;
+            best_name = Some(name);
+        }
+    }
+    best_name
+}
+
+/// Compute a rename map for synthesized locals and parameters, keyed by their current name.
+pub fn smart_rename(
+    stmts: &[Stmt],
+    hoist_names: &[String],
+    is_method: bool,
+) -> BTreeMap<String, String> {
+    let mut candidates: BTreeSet<String> = hoist_names
         .iter()
         .filter(|n| is_synthetic(n))
         .cloned()
         .collect();
+
+    let mut all_names = BTreeSet::new();
+    collect_used_names(stmts, &mut all_names);
+    for name in all_names {
+        if is_parameter(&name) {
+            candidates.insert(name);
+        }
+    }
+
     if candidates.is_empty() {
         return BTreeMap::new();
     }
 
-    // All assignments to each candidate, in order.
+    let mut raw_locked = BTreeSet::new();
+    collect_raw_locked(stmts, &mut raw_locked);
+    candidates.retain(|name| !raw_locked.contains(name));
+
     let mut defs: BTreeMap<String, Vec<Expr>> = BTreeMap::new();
     collect_all_defs(stmts, &candidates, &mut defs);
 
-    // Names we must not collide with: everything already in use that we are not renaming,
-    // plus the synthesized names themselves (until each is mapped), plus Luau keywords.
+    let mut collector = FactCollector {
+        suggestions: BTreeMap::new(),
+        param_method_receiver: BTreeSet::new(),
+    };
+    collector.visit_stmts(stmts);
+
     let mut reserved: BTreeSet<String> = BTreeSet::new();
     collect_used_names(stmts, &mut reserved);
-    reserved.extend(LUAU_KEYWORDS.iter().map(|s| s.to_string()));
+    for c in &candidates {
+        reserved.remove(c);
+    }
+    reserved.extend(
+        LUAU_KEYWORDS
+            .iter()
+            .filter(|&&k| k != "self")
+            .map(|s| s.to_string()),
+    );
 
-    let mut map = BTreeMap::new();
-    // Deterministic order by the numeric suffix.
+    let mut base_map = BTreeMap::new();
+
+    let mut captured_names = BTreeSet::new();
+    collect_captured_names(stmts, &mut captured_names);
+
     let mut ordered: Vec<&String> = candidates.iter().collect();
-    ordered.sort_by_key(|n| n[1..].parse::<u32>().unwrap_or(0));
-
-    for orig in ordered {
-        let Some(list) = defs.get(orig) else {
-            continue;
-        };
-        // Single-definition guard (a key correctness/clarity rule): only derive a name for a
-        // register that holds one logical value. A refinement chain — where every later
-        // assignment reads the register it refines, e.g. `x = a.b; x = x.c` — counts as one
-        // value, so we name it from the final form. Truly unrelated reuse stays `vN`.
-        let chosen: &Expr = if list.len() == 1 {
-            &list[0]
-        } else if list[1..].iter().all(|e| expr_references(e, orig)) {
-            list.last().unwrap()
+    ordered.sort_by(|a, b| {
+        let a_is_p = is_parameter(a);
+        let b_is_p = is_parameter(b);
+        if a_is_p != b_is_p {
+            b_is_p.cmp(&a_is_p)
         } else {
-            continue;
-        };
-        let Some(base) = accumulator_name(orig, list).or_else(|| derive_name(chosen)) else {
-            continue;
-        };
-        // Avoid colliding with reserved names and other still-unmapped synthesized names.
-        let mut taken = reserved.clone();
-        taken.extend(candidates.iter().filter(|c| *c != orig).cloned());
-        taken.extend(map.values().cloned());
-        let unique = unique_name(&base, &taken);
-        reserved.insert(unique.clone());
-        map.insert(orig.clone(), unique);
+            let a_is_c = captured_names.contains(*a);
+            let b_is_c = captured_names.contains(*b);
+            if a_is_c != b_is_c {
+                b_is_c.cmp(&a_is_c)
+            } else {
+                let a_num: u32 = a[1..].parse().unwrap_or(0);
+                let b_num: u32 = b[1..].parse().unwrap_or(0);
+                a_num.cmp(&b_num)
+            }
+        }
+    });
+
+    // Pass 1: Derive base names from defs and suggestions
+    for &orig in &ordered {
+        let mut suggs = Vec::new();
+        if let Some(list) = defs.get(orig) {
+            let chosen = if list.len() == 1 {
+                Some(&list[0])
+            } else if list[1..].iter().all(|e| expr_references(e, orig)) {
+                list.last()
+            } else {
+                None
+            };
+            if let Some(c) = chosen {
+                if let Some(derived) = derive_name(c) {
+                    suggs.push((derived, 15));
+                }
+            }
+            if let Some(acc) = accumulator_name(orig, list) {
+                suggs.push((acc, 20));
+            }
+        }
+
+        if let Some(col_list) = collector.suggestions.get(orig) {
+            suggs.extend(col_list.iter().cloned());
+        }
+
+        if let Some(base) = select_name_base(orig, &suggs, &collector, is_method) {
+            base_map.insert(orig.clone(), base);
+        }
     }
 
-    // Context-based naming for things the defining expression alone can't name.
-    apply_tuple_names(stmts, &candidates, &mut reserved, &mut map);
-    apply_field_sink_names(stmts, &candidates, &mut reserved, &mut map);
-    apply_returned_table_names(stmts, &defs, &candidates, &mut reserved, &mut map);
+    // Pass 2: Let special naming helper passes suggest base names for remaining candidates
+    apply_tuple_names(stmts, &candidates, &mut base_map);
+    apply_field_sink_names(stmts, &candidates, &mut base_map);
+    apply_returned_table_names(stmts, &defs, &candidates, &mut base_map);
+
+    // Pass 3: Resolve final unique names in a stable order
+    let mut map = BTreeMap::new();
+    for &orig in &ordered {
+        if let Some(base) = base_map.get(orig).cloned() {
+            let unique = unique_name(&base, &reserved);
+            reserved.insert(unique.clone());
+            map.insert(orig.clone(), unique);
+        }
+    }
+
     map
 }
 
@@ -108,8 +590,7 @@ fn tuple_names_for(callee: &Expr, n: usize) -> Option<Vec<String>> {
 fn apply_tuple_names(
     stmts: &[Stmt],
     candidates: &BTreeSet<String>,
-    reserved: &mut BTreeSet<String>,
-    map: &mut BTreeMap<String, String>,
+    base_map: &mut BTreeMap<String, String>,
 ) {
     for s in stmts {
         if let Stmt::Assign { targets, values } = s {
@@ -118,10 +599,8 @@ fn apply_tuple_names(
                     if let Some(names) = tuple_names_for(callee, targets.len()) {
                         for (t, nm) in targets.iter().zip(names.iter()) {
                             if let Expr::Var(v) = t {
-                                if candidates.contains(v) && !map.contains_key(v) {
-                                    let u = unique_name(nm, reserved);
-                                    reserved.insert(u.clone());
-                                    map.insert(v.clone(), u);
+                                if candidates.contains(v) && !base_map.contains_key(v) {
+                                    base_map.insert(v.clone(), nm.clone());
                                 }
                             }
                         }
@@ -129,7 +608,7 @@ fn apply_tuple_names(
                 }
             }
         }
-        for_each_child_block(s, |b| apply_tuple_names(b, candidates, reserved, map));
+        for_each_child_block(s, |b| apply_tuple_names(b, candidates, base_map));
     }
 }
 
@@ -138,14 +617,13 @@ fn apply_tuple_names(
 fn apply_field_sink_names(
     stmts: &[Stmt],
     candidates: &BTreeSet<String>,
-    reserved: &mut BTreeSet<String>,
-    map: &mut BTreeMap<String, String>,
+    base_map: &mut BTreeMap<String, String>,
 ) {
     for s in stmts {
         if let Stmt::Assign { targets, values } = s {
             if targets.len() == 1 && values.len() == 1 {
                 if let Expr::Var(name) = &values[0] {
-                    if candidates.contains(name) && !map.contains_key(name) {
+                    if candidates.contains(name) && !base_map.contains_key(name) {
                         let field = match &targets[0] {
                             Expr::Field(_, f) => Some(f.clone()),
                             Expr::Index(_, k) => match k.as_ref() {
@@ -157,9 +635,7 @@ fn apply_field_sink_names(
                         if let Some(f) = field {
                             if f != "Parent" {
                                 if let Some(base) = sanitize(&field_to_local_name(&f)) {
-                                    let u = unique_name(&base, reserved);
-                                    reserved.insert(u.clone());
-                                    map.insert(name.clone(), u);
+                                    base_map.insert(name.clone(), base);
                                 }
                             }
                         }
@@ -167,7 +643,7 @@ fn apply_field_sink_names(
                 }
             }
         }
-        for_each_child_block(s, |b| apply_field_sink_names(b, candidates, reserved, map));
+        for_each_child_block(s, |b| apply_field_sink_names(b, candidates, base_map));
     }
 }
 
@@ -177,24 +653,21 @@ fn apply_returned_table_names(
     stmts: &[Stmt],
     defs: &BTreeMap<String, Vec<Expr>>,
     candidates: &BTreeSet<String>,
-    reserved: &mut BTreeSet<String>,
-    map: &mut BTreeMap<String, String>,
+    base_map: &mut BTreeMap<String, String>,
 ) {
     for s in stmts {
         if let Stmt::Return(values) = s {
             if let [Expr::Var(name)] = values.as_slice() {
-                if candidates.contains(name) && !map.contains_key(name) {
+                if candidates.contains(name) && !base_map.contains_key(name) {
                     if let Some([Expr::Table(fields)]) = defs.get(name).map(Vec::as_slice) {
                         let base = returned_table_name(fields);
-                        let u = unique_name(base, reserved);
-                        reserved.insert(u.clone());
-                        map.insert(name.clone(), u);
+                        base_map.insert(name.clone(), base.to_string());
                     }
                 }
             }
         }
         for_each_child_block(s, |b| {
-            apply_returned_table_names(b, defs, candidates, reserved, map)
+            apply_returned_table_names(b, defs, candidates, base_map)
         });
     }
 }
@@ -1061,7 +1534,7 @@ fn sanitize(s: &str) -> Option<String> {
 
 /// Make `base` unique against `taken` by suffixing `2`, `3`, … (and avoiding keywords).
 fn unique_name(base: &str, taken: &BTreeSet<String>) -> String {
-    let base = if LUAU_KEYWORDS.contains(&base) {
+    let base = if base != "self" && LUAU_KEYWORDS.contains(&base) {
         format!("{base}_")
     } else {
         base.to_string()
@@ -1257,7 +1730,7 @@ mod tests {
             },
             Stmt::Return(vec![Expr::Var("v0".into())]),
         ];
-        let map = smart_rename(&stmts, &[String::from("v0")]);
+        let map = smart_rename(&stmts, &[String::from("v0")], false);
         assert_eq!(map.get("v0").map(String::as_str), Some("module"));
     }
 
@@ -1277,7 +1750,7 @@ mod tests {
                 )],
             },
         ];
-        let map = smart_rename(&stmts, &[String::from("v1")]);
+        let map = smart_rename(&stmts, &[String::from("v1")], false);
         assert_eq!(map.get("v1").map(String::as_str), Some("total"));
 
         let stmts = vec![
@@ -1294,7 +1767,87 @@ mod tests {
                 )],
             },
         ];
-        let map = smart_rename(&stmts, &[String::from("v2")]);
+        let map = smart_rename(&stmts, &[String::from("v2")], false);
         assert_eq!(map.get("v2").map(String::as_str), Some("product"));
+    }
+
+    #[test]
+    fn raw_lock_prevents_renaming_v3() {
+        let stmts = vec![Stmt::Assign {
+            targets: vec![Expr::Var("v3".into())],
+            values: vec![Expr::Raw("some text with v3 inside".into())],
+        }];
+        let map = smart_rename(&stmts, &[String::from("v3")], false);
+        assert!(!map.contains_key("v3"));
+    }
+
+    #[test]
+    fn raw_lock_prevents_renaming_p0() {
+        let stmts = vec![Stmt::Assign {
+            targets: vec![Expr::Var("p0".into())],
+            values: vec![Expr::Raw("some text with p0 inside".into())],
+        }];
+        let map = smart_rename(&stmts, &[String::from("p0")], false);
+        assert!(!map.contains_key("p0"));
+    }
+
+    #[test]
+    fn plain_helper_p0_does_not_become_self() {
+        let stmts = vec![Stmt::Return(vec![Expr::Field(
+            Box::new(Expr::Var("p0".into())),
+            "Name".into(),
+        )])];
+        let map = smart_rename(&stmts, &[String::from("p0")], false);
+        assert_ne!(map.get("p0").map(String::as_str), Some("self"));
+    }
+
+    #[test]
+    fn method_assignment_uses_self_safely() {
+        let stmts = vec![Stmt::Call(Expr::MethodCall(
+            Box::new(Expr::Var("p0".into())),
+            "DoSomething".into(),
+            vec![],
+        ))];
+        let map = smart_rename(&stmts, &[String::from("p0")], true);
+        assert_eq!(map.get("p0").map(String::as_str), Some("self"));
+    }
+
+    #[test]
+    fn deterministic_unique_suffixes() {
+        let stmts = vec![
+            Stmt::Assign {
+                targets: vec![Expr::Var("v0".into())],
+                values: vec![Expr::MethodCall(
+                    Box::new(Expr::Var("p0".into())),
+                    "FindFirstChild".into(),
+                    vec![Expr::Str("\"child\"".into())],
+                )],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("v1".into())],
+                values: vec![Expr::MethodCall(
+                    Box::new(Expr::Var("p0".into())),
+                    "FindFirstChild".into(),
+                    vec![Expr::Str("\"child\"".into())],
+                )],
+            },
+        ];
+        let map = smart_rename(&stmts, &[String::from("v0"), String::from("v1")], false);
+        assert_eq!(map.get("v0").map(String::as_str), Some("child"));
+        assert_eq!(map.get("v1").map(String::as_str), Some("child2"));
+    }
+
+    #[test]
+    fn keyword_candidates_are_sanitized() {
+        let stmts = vec![Stmt::Assign {
+            targets: vec![Expr::Var("v0".into())],
+            values: vec![Expr::MethodCall(
+                Box::new(Expr::Var("p0".into())),
+                "FindFirstChild".into(),
+                vec![Expr::Str("\"end\"".into())],
+            )],
+        }];
+        let map = smart_rename(&stmts, &[String::from("v0")], false);
+        assert_eq!(map.get("v0").map(String::as_str), Some("end_"));
     }
 }

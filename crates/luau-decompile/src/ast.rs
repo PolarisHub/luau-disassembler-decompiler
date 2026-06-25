@@ -116,8 +116,9 @@ pub enum Stmt {
 
 pub fn render_block(stmts: &[Stmt], indent: usize) -> String {
     let mut out = String::new();
+    let block_len = stmts.len();
     for (index, s) in stmts.iter().enumerate() {
-        if index > 0 && wants_blank_line_between(&stmts[index - 1], s) {
+        if index > 0 && wants_blank_line_between(&stmts[index - 1], s, block_len, indent) {
             out.push('\n');
         }
         render_stmt(&mut out, s, indent);
@@ -125,7 +126,13 @@ pub fn render_block(stmts: &[Stmt], indent: usize) -> String {
     out
 }
 
-fn wants_blank_line_between(prev: &Stmt, next: &Stmt) -> bool {
+fn wants_blank_line_between(prev: &Stmt, next: &Stmt, block_len: usize, indent: usize) -> bool {
+    if block_len <= 2 && indent > 0 {
+        return renders_as_function(prev) || renders_as_function(next);
+    }
+    if block_len <= 4 && indent > 0 && matches!(next, Stmt::Return(_)) {
+        return false;
+    }
     renders_as_function(prev)
         || renders_as_function(next)
         || renders_as_block(prev)
@@ -181,6 +188,16 @@ fn render_stmt(out: &mut String, s: &Stmt, indent: usize) {
                 out.push('\n');
                 return;
             }
+            if let Some((target, op, rhs)) = compound_assignment_parts(targets, values) {
+                pad(out, indent);
+                let _ = writeln!(
+                    out,
+                    "{} {op}= {}",
+                    render_expr_at(target, indent),
+                    render_expr_at(rhs, indent)
+                );
+                return;
+            }
             pad(out, indent);
             let _ = writeln!(
                 out,
@@ -214,27 +231,7 @@ fn render_stmt(out: &mut String, s: &Stmt, indent: usize) {
             then_body,
             else_body,
         } => {
-            pad(out, indent);
-            let _ = writeln!(out, "if {} then", render_expr_at(cond, indent));
-            out.push_str(&render_block(then_body, indent + 1));
-            if !else_body.is_empty() {
-                // Collapse `else { if ... }` into `elseif` for readability.
-                if else_body.len() == 1 {
-                    if let Stmt::If { .. } = &else_body[0] {
-                        pad(out, indent);
-                        out.push_str("else\n");
-                        out.push_str(&render_block(else_body, indent + 1));
-                        pad(out, indent);
-                        out.push_str("end\n");
-                        return;
-                    }
-                }
-                pad(out, indent);
-                out.push_str("else\n");
-                out.push_str(&render_block(else_body, indent + 1));
-            }
-            pad(out, indent);
-            out.push_str("end\n");
+            render_if_statement(out, cond, then_body, else_body, indent);
         }
         Stmt::While { cond, body } => {
             pad(out, indent);
@@ -308,6 +305,43 @@ fn render_stmt(out: &mut String, s: &Stmt, indent: usize) {
     }
 }
 
+fn render_if_statement(
+    out: &mut String,
+    cond: &Expr,
+    then_body: &[Stmt],
+    else_body: &[Stmt],
+    indent: usize,
+) {
+    pad(out, indent);
+    let _ = writeln!(out, "if {} then", render_expr_at(cond, indent));
+    out.push_str(&render_block(then_body, indent + 1));
+    render_else_tail(out, else_body, indent);
+}
+
+fn render_else_tail(out: &mut String, else_body: &[Stmt], indent: usize) {
+    match else_body {
+        [] => {}
+        [Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        }] => {
+            pad(out, indent);
+            let _ = writeln!(out, "elseif {} then", render_expr_at(cond, indent));
+            out.push_str(&render_block(then_body, indent + 1));
+            render_else_tail(out, else_body, indent);
+            return;
+        }
+        _ => {
+            pad(out, indent);
+            out.push_str("else\n");
+            out.push_str(&render_block(else_body, indent + 1));
+        }
+    }
+    pad(out, indent);
+    out.push_str("end\n");
+}
+
 fn local_function_text(names: &[String], values: &[Expr], indent: usize) -> Option<String> {
     let [name] = names else {
         return None;
@@ -329,9 +363,48 @@ fn assignment_function_text(targets: &[Expr], values: &[Expr], indent: usize) ->
     let [Expr::Closure { text, .. }] = values else {
         return None;
     };
+    if let Some(sugared) = method_colon_sugar(target, text, indent) {
+        return Some(sugared);
+    }
     let name = function_assignment_target(target)?;
     let tail = text.strip_prefix("function")?;
     Some(format!("function {name}{}", indent_multiline(tail, indent)))
+}
+
+fn method_colon_sugar(target: &Expr, text: &str, indent: usize) -> Option<String> {
+    let Expr::Field(base, field) = target else {
+        return None;
+    };
+    let base_name = function_assignment_target(base)?;
+    let tail = text.strip_prefix("function")?;
+    let tail_trimmed = tail.trim_start();
+    if !tail_trimmed.starts_with('(') {
+        return None;
+    }
+    let after_paren = &tail_trimmed[1..];
+    let close_paren_idx = after_paren.find(')')?;
+    let params_part = &after_paren[..close_paren_idx];
+    let params_trimmed = params_part.trim();
+
+    let (new_params, body_part) = if params_trimmed == "self" {
+        ("()".to_string(), &after_paren[close_paren_idx + 1..])
+    } else if let Some(rest) = params_trimmed.strip_prefix("self") {
+        let rest = rest.trim_start();
+        if let Some(remaining) = rest.strip_prefix(',') {
+            let remaining = remaining.trim();
+            (
+                format!("({remaining})"),
+                &after_paren[close_paren_idx + 1..],
+            )
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    let sugar_signature = format!("function {base_name}:{field}{new_params}{body_part}");
+    Some(indent_multiline(&sugar_signature, indent))
 }
 
 fn function_assignment_target(target: &Expr) -> Option<String> {
@@ -342,6 +415,28 @@ fn function_assignment_target(target: &Expr) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn compound_assignment_parts<'a>(
+    targets: &'a [Expr],
+    values: &'a [Expr],
+) -> Option<(&'a Expr, &'static str, &'a Expr)> {
+    let [target @ Expr::Var(name)] = targets else {
+        return None;
+    };
+    let [Expr::Binary(op, left, right)] = values else {
+        return None;
+    };
+    if !compound_assignment_op(op)
+        || !matches!(left.as_ref(), Expr::Var(left_name) if left_name == name)
+    {
+        return None;
+    }
+    Some((target, op, right))
+}
+
+fn compound_assignment_op(op: &str) -> bool {
+    matches!(op, "+" | "-" | "*" | "/" | "//" | "%" | "^" | "..")
 }
 
 fn join_exprs(exprs: &[Expr]) -> String {
@@ -372,7 +467,8 @@ fn render_expr_at(e: &Expr, indent: usize) -> String {
     match e {
         Expr::Nil => "nil".to_string(),
         Expr::Bool(b) => b.to_string(),
-        Expr::Num(s) | Expr::Str(s) | Expr::Vector(s) | Expr::Var(s) | Expr::Raw(s) => s.clone(),
+        Expr::Num(s) => render_number(s),
+        Expr::Str(s) | Expr::Vector(s) | Expr::Var(s) | Expr::Raw(s) => s.clone(),
         Expr::Closure { text, .. } => indent_multiline(text, indent),
         Expr::Vararg => "...".to_string(),
         Expr::Index(t, k) => format!("{}[{}]", prefix_at(t, indent), render_expr_at(k, indent)),
@@ -389,15 +485,17 @@ fn render_expr_at(e: &Expr, indent: usize) -> String {
         Expr::Unary(op, a) => {
             // `not` needs a space; symbolic ops don't.
             if *op == "not " {
-                format!("not {}", paren_at(a, indent))
+                format!("not {}", unary_operand_at(op, a, indent))
             } else {
-                format!("{op}{}", paren_at(a, indent))
+                format!("{op}{}", unary_operand_at(op, a, indent))
             }
         }
         Expr::Binary(op, a, b) => {
             if let Some(flipped) = flipped_comparison(op) {
                 if is_literal_expr(a) && !is_literal_expr(b) {
-                    return format!("{} {flipped} {}", paren_at(b, indent), paren_at(a, indent));
+                    let lhs = binary_operand_at(b, flipped, false, indent);
+                    let rhs = binary_operand_at(a, flipped, true, indent);
+                    return format!("{lhs} {flipped} {rhs}");
                 }
             }
             let lhs = binary_operand_at(a, op, false, indent);
@@ -408,19 +506,92 @@ fn render_expr_at(e: &Expr, indent: usize) -> String {
     }
 }
 
+fn render_number(text: &str) -> String {
+    let Ok(value) = text.parse::<f64>() else {
+        return text.to_string();
+    };
+    if !value.is_finite() {
+        return text.to_string();
+    }
+
+    let candidate = value.to_string();
+    if candidate.len() >= text.len() {
+        return text.to_string();
+    }
+    match candidate.parse::<f64>() {
+        Ok(roundtrip) if roundtrip.to_bits() == value.to_bits() => candidate,
+        _ => text.to_string(),
+    }
+}
+
+fn op_precedence(op: &str) -> usize {
+    match op {
+        "or" => 1,
+        "and" => 2,
+        "==" | "~=" | "<" | "<=" | ">" | ">=" => 3,
+        ".." => 4,
+        "+" | "-" => 5,
+        "*" | "/" | "//" | "%" => 6,
+        "^" => 8,
+        _ => 0,
+    }
+}
+
+fn is_right_associative(op: &str) -> bool {
+    matches!(op, "^" | "..")
+}
+
+fn unary_operand_at(op: &str, a: &Expr, indent: usize) -> String {
+    let needs_paren = match a {
+        Expr::Binary(bin_op, _, _) => op_precedence(bin_op) < 7,
+        Expr::Unary(inner_op, _) => op.trim() == "-" && inner_op.trim() == "-",
+        _ => false,
+    };
+
+    if needs_paren {
+        format!("({})", render_expr_at(a, indent))
+    } else {
+        render_expr_at(a, indent)
+    }
+}
+
 fn binary_operand_at(e: &Expr, parent_op: &str, is_rhs: bool, indent: usize) -> String {
-    match (parent_op, e) {
-        // `and`/`or` conditions read best without wrapping simple comparisons and unary
-        // checks: `a ~= b or not c`, not `(a ~= b) or (not c)`.
-        ("and" | "or", Expr::Binary(op, ..)) if is_comparison_op(op) => render_expr_at(e, indent),
-        ("and" | "or", Expr::Unary(..)) => render_expr_at(e, indent),
-        // Same-operator logical chains are associative in Luau.
-        ("and", Expr::Binary("and", ..)) | ("or", Expr::Binary("or", ..)) => {
-            render_expr_at(e, indent)
+    if !matches!(e, Expr::Binary(..) | Expr::Unary(..)) {
+        return render_expr_at(e, indent);
+    }
+
+    let needs_paren = match e {
+        Expr::Unary(..) => {
+            let p_parent = op_precedence(parent_op);
+            p_parent > 7
         }
-        // Keep a mixed logical rhs grouped for readability (`a or (b and c)`).
-        ("or", Expr::Binary("and", ..)) if is_rhs => format!("({})", render_expr_at(e, indent)),
-        _ => paren_at(e, indent),
+        Expr::Binary(op, _, _) => {
+            let p_parent = op_precedence(parent_op);
+            let p_child = op_precedence(op);
+            if p_child < p_parent {
+                true
+            } else if p_child > p_parent {
+                parent_op == "or" && *op == "and"
+            } else {
+                if is_comparison_op(parent_op) {
+                    true
+                } else {
+                    let right_assoc = is_right_associative(parent_op);
+                    if right_assoc {
+                        !is_rhs
+                    } else {
+                        is_rhs
+                    }
+                }
+            }
+        }
+        _ => false,
+    };
+
+    if needs_paren {
+        format!("({})", render_expr_at(e, indent))
+    } else {
+        render_expr_at(e, indent)
     }
 }
 
@@ -495,7 +666,8 @@ fn table_needs_multiline(fields: &[TableField]) -> bool {
 
 fn expr_needs_multiline(e: &Expr) -> bool {
     match e {
-        Expr::Closure { .. } | Expr::Table(_) => true,
+        Expr::Closure { .. } => true,
+        Expr::Table(fields) => table_needs_multiline(fields),
         Expr::Index(t, k) => expr_needs_multiline(t) || expr_needs_multiline(k),
         Expr::Field(t, _) => expr_needs_multiline(t),
         Expr::Call(f, args) => expr_needs_multiline(f) || args.iter().any(expr_needs_multiline),
@@ -583,7 +755,7 @@ mod tests {
             body: body.clone(),
         };
         let rendered = render_block(&[nf], 0);
-        assert_eq!(rendered, "for i = 1, n do\n\tacc = acc + i\nend\n");
+        assert_eq!(rendered, "for i = 1, n do\n\tacc += i\nend\n");
 
         let iff = Stmt::If {
             cond: Expr::Binary(
@@ -681,11 +853,82 @@ mod tests {
             rendered.contains("local value = 0\n\nif ok then"),
             "{rendered}"
         );
-        assert!(rendered.contains("end\n\nvalue = value + 1"), "{rendered}");
+        assert!(rendered.contains("end\n\nvalue += 1"), "{rendered}");
         assert!(
-            rendered.contains("value = value + 1\n\nreturn value"),
+            rendered.contains("value += 1\n\nreturn value"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn prints_compound_assignments_for_simple_self_updates() {
+        let rendered = render_block(
+            &[
+                Stmt::Assign {
+                    targets: vec![Expr::Var("total".into())],
+                    values: vec![Expr::Binary(
+                        "+",
+                        Box::new(Expr::Var("total".into())),
+                        Box::new(Expr::Num("1".into())),
+                    )],
+                },
+                Stmt::Assign {
+                    targets: vec![Expr::Var("total".into())],
+                    values: vec![Expr::Binary(
+                        "-",
+                        Box::new(Expr::Var("total".into())),
+                        Box::new(Expr::Binary(
+                            "+",
+                            Box::new(Expr::Var("penalty".into())),
+                            Box::new(Expr::Num("1".into())),
+                        )),
+                    )],
+                },
+                Stmt::Assign {
+                    targets: vec![Expr::Var("total".into())],
+                    values: vec![Expr::Binary(
+                        "+",
+                        Box::new(Expr::Var("other".into())),
+                        Box::new(Expr::Num("1".into())),
+                    )],
+                },
+            ],
+            0,
+        );
+
+        assert!(rendered.contains("total += 1"), "{rendered}");
+        assert!(rendered.contains("total -= penalty + 1"), "{rendered}");
+        assert!(rendered.contains("total = other + 1"), "{rendered}");
+    }
+
+    #[test]
+    fn shortens_roundtripping_float_literals() {
+        assert_eq!(render_expr(&Expr::Num("0.90000000000000002".into())), "0.9");
+        assert_eq!(
+            render_expr(&Expr::Num("3.1415926535897931".into())),
+            "3.141592653589793"
+        );
+        assert_eq!(render_expr(&Expr::Num("42".into())), "42");
+    }
+
+    #[test]
+    fn prints_elseif_chains() {
+        let rendered = render_block(
+            &[Stmt::If {
+                cond: Expr::Var("a".into()),
+                then_body: vec![Stmt::Return(vec![Expr::Num("1".into())])],
+                else_body: vec![Stmt::If {
+                    cond: Expr::Var("b".into()),
+                    then_body: vec![Stmt::Return(vec![Expr::Num("2".into())])],
+                    else_body: vec![Stmt::Return(vec![Expr::Num("3".into())])],
+                }],
+            }],
+            0,
+        );
+
+        assert!(rendered.contains("elseif b then"), "{rendered}");
+        assert!(!rendered.contains("else\n\tif b then"), "{rendered}");
+        assert_eq!(rendered.matches("end").count(), 1, "{rendered}");
     }
 
     #[test]
@@ -735,5 +978,195 @@ mod tests {
                 "blank line has indentation: {rendered:?}"
             );
         }
+    }
+
+    #[test]
+    fn prints_precedence_and_associativity() {
+        let a = Box::new(Expr::Var("a".into()));
+        let b = Box::new(Expr::Var("b".into()));
+        let c = Box::new(Expr::Var("c".into()));
+
+        // (a + b) * c
+        let e1 = Expr::Binary(
+            "*",
+            Box::new(Expr::Binary("+", a.clone(), b.clone())),
+            c.clone(),
+        );
+        assert_eq!(render_expr(&e1), "(a + b) * c");
+
+        // a + b * c
+        let e2 = Expr::Binary(
+            "+",
+            a.clone(),
+            Box::new(Expr::Binary("*", b.clone(), c.clone())),
+        );
+        assert_eq!(render_expr(&e2), "a + b * c");
+
+        // a ^ (b ^ c)
+        let e3 = Expr::Binary(
+            "^",
+            a.clone(),
+            Box::new(Expr::Binary("^", b.clone(), c.clone())),
+        );
+        assert_eq!(render_expr(&e3), "a ^ b ^ c");
+
+        // (a ^ b) ^ c
+        let e4 = Expr::Binary(
+            "^",
+            Box::new(Expr::Binary("^", a.clone(), b.clone())),
+            c.clone(),
+        );
+        assert_eq!(render_expr(&e4), "(a ^ b) ^ c");
+
+        // a .. (b .. c)
+        let e5 = Expr::Binary(
+            "..",
+            a.clone(),
+            Box::new(Expr::Binary("..", b.clone(), c.clone())),
+        );
+        assert_eq!(render_expr(&e5), "a .. b .. c");
+
+        // (a .. b) .. c
+        let e6 = Expr::Binary(
+            "..",
+            Box::new(Expr::Binary("..", a.clone(), b.clone())),
+            c.clone(),
+        );
+        assert_eq!(render_expr(&e6), "(a .. b) .. c");
+
+        // not (a and b)
+        let e7 = Expr::Unary("not ", Box::new(Expr::Binary("and", a.clone(), b.clone())));
+        assert_eq!(render_expr(&e7), "not (a and b)");
+
+        // a or (b and c)
+        let e8 = Expr::Binary(
+            "or",
+            a.clone(),
+            Box::new(Expr::Binary("and", b.clone(), c.clone())),
+        );
+        assert_eq!(render_expr(&e8), "a or (b and c)");
+
+        // (a or b) and c
+        let e9 = Expr::Binary(
+            "and",
+            Box::new(Expr::Binary("or", a.clone(), b.clone())),
+            c.clone(),
+        );
+        assert_eq!(render_expr(&e9), "(a or b) and c");
+
+        // not not a
+        let e10 = Expr::Unary("not ", Box::new(Expr::Unary("not ", a.clone())));
+        assert_eq!(render_expr(&e10), "not not a");
+
+        // -(-a)
+        let e11 = Expr::Unary("-", Box::new(Expr::Unary("-", a.clone())));
+        assert_eq!(render_expr(&e11), "-(-a)");
+    }
+
+    #[test]
+    fn prefix_parentheses_on_literals() {
+        let str_lit = Box::new(Expr::Str("\"hello\"".into()));
+        let call1 = Expr::MethodCall(str_lit, "upper".into(), vec![]);
+        assert_eq!(render_expr(&call1), "(\"hello\"):upper()");
+
+        let table_lit = Box::new(Expr::Table(vec![]));
+        let call2 = Expr::MethodCall(table_lit, "insert".into(), vec![]);
+        assert_eq!(render_expr(&call2), "({}):insert()");
+
+        let func_lit = Box::new(Expr::Closure {
+            text: "function() end".into(),
+            captures: vec![],
+        });
+        let call3 = Expr::Call(func_lit, vec![]);
+        assert_eq!(render_expr(&call3), "(function() end)()");
+    }
+
+    #[test]
+    fn table_formatting_styles() {
+        let t1 = Expr::Table(vec![
+            TableField::Item(Expr::Num("1".into())),
+            TableField::Item(Expr::Num("2".into())),
+            TableField::Item(Expr::Num("3".into())),
+        ]);
+        assert_eq!(render_expr(&t1), "{1, 2, 3}");
+
+        let t2 = Expr::Table(vec![
+            TableField::Named("x".into(), Expr::Num("10".into())),
+            TableField::Named("y".into(), Expr::Num("20".into())),
+        ]);
+        assert_eq!(render_expr(&t2), "{x = 10, y = 20}");
+
+        let t3 = Expr::Table(vec![
+            TableField::Item(Expr::Num("1".into())),
+            TableField::Named("key".into(), Expr::Str("\"val\"".into())),
+            TableField::Keyed(Expr::Str("\"other\"".into()), Expr::Bool(true)),
+        ]);
+        assert_eq!(render_expr(&t3), "{1, key = \"val\", [\"other\"] = true}");
+
+        let t4 = Expr::Table(vec![
+            TableField::Item(Expr::Table(vec![TableField::Item(Expr::Num("1".into()))])),
+            TableField::Item(Expr::Table(vec![TableField::Item(Expr::Num("2".into()))])),
+        ]);
+        assert_eq!(render_expr(&t4), "{{1}, {2}}");
+
+        let t5 = Expr::Table(vec![TableField::Item(Expr::Table(vec![
+            TableField::Item(Expr::Num("1".into())),
+            TableField::Item(Expr::Num("2".into())),
+            TableField::Item(Expr::Num("3".into())),
+            TableField::Item(Expr::Num("4".into())),
+        ]))]);
+        let rendered_t5 = render_expr(&t5);
+        assert!(
+            rendered_t5.contains("{\n\t{\n\t\t1,\n\t\t2,\n\t\t3,\n\t\t4,\n\t},\n}"),
+            "{rendered_t5}"
+        );
+
+        let t6 = Expr::Table(vec![TableField::Named(
+            "foo".into(),
+            Expr::Closure {
+                text: "function(x)\n\treturn x\nend".into(),
+                captures: vec![],
+            },
+        )]);
+        let rendered_t6 = render_expr(&t6);
+        assert!(
+            rendered_t6.contains("foo = function(x)\n\t\treturn x\n\tend"),
+            "{rendered_t6}"
+        );
+
+        let t7 = Expr::Table(vec![
+            TableField::Item(Expr::Num("1".into())),
+            TableField::Item(Expr::Num("2".into())),
+            TableField::Item(Expr::Num("3".into())),
+            TableField::Item(Expr::Num("4".into())),
+        ]);
+        assert_eq!(render_expr(&t7), "{\n\t1,\n\t2,\n\t3,\n\t4,\n}");
+    }
+
+    #[test]
+    fn method_colon_sugar_rendering() {
+        let closure = Expr::Closure {
+            text: "function(self, x)\n\treturn x\nend".into(),
+            captures: vec![],
+        };
+        let rendered = render_block(
+            &[Stmt::Assign {
+                targets: vec![Expr::Field(
+                    Box::new(Expr::Var("module".into())),
+                    "foo".into(),
+                )],
+                values: vec![closure],
+            }],
+            0,
+        );
+        assert!(
+            rendered.contains("function module:foo(x)\n\treturn x\nend"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn float_literals_shorten_cleanup() {
+        assert_eq!(render_expr(&Expr::Num("0.80000000000000004".into())), "0.8");
     }
 }

@@ -42,8 +42,14 @@ pub struct ProtoReport {
     pub index: usize,
     pub name: Option<String>,
     pub partial: bool,
+    pub has_unstructured: bool,
     /// Human notes about what was uncertain in this proto.
     pub notes: Vec<String>,
+}
+
+pub struct ProtoDecompileResult {
+    pub body: String,
+    pub params: Vec<String>,
 }
 
 /// Decompile a module, starting from its main proto and inlining child closures where they
@@ -51,13 +57,19 @@ pub struct ProtoReport {
 pub fn decompile(module: &Module) -> Decompiled {
     let mut reports = Vec::new();
     let main = module.main_proto as usize;
-    let body = decompile_proto(module, main, &mut reports);
+    let res = decompile_proto(module, main, false, &mut reports);
+    let body = res.body;
 
     let partial = reports.iter().any(|r| r.partial);
+    let has_gotos_or_labels = reports.iter().any(|r| r.has_unstructured);
     let mut source = String::new();
     if partial {
         source.push_str("-- Decompiled by luau-decompile (best-effort reconstruction).\n");
-        source.push_str("-- Some regions use goto/labels where structuring is incomplete.\n\n");
+        if has_gotos_or_labels {
+            source.push_str("-- Some regions use goto/labels where structuring is incomplete.\n\n");
+        } else {
+            source.push_str("\n");
+        }
     } else {
         source.push_str("-- Decompiled by luau-decompile.\n\n");
     }
@@ -72,19 +84,31 @@ pub fn decompile(module: &Module) -> Decompiled {
 
 /// Decompile one proto into a sequence of top-level statements (used for the main proto)
 /// or a function body. Returns the rendered text.
-fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoReport>) -> String {
+fn decompile_proto(
+    module: &Module,
+    proto_idx: usize,
+    is_method: bool,
+    reports: &mut Vec<ProtoReport>,
+) -> ProtoDecompileResult {
     let proto = &module.protos[proto_idx];
     let mut d = Decompiler::new(module, proto, proto_idx);
     let mut stmts = d.run();
 
     // Remove unreachable code left after returns/breaks by inline-cache flushes.
     cleanup::drop_unreachable(&mut stmts);
+    cleanup::remove_redundant_gotos(&mut stmts);
+    cleanup::remove_trailing_sibling_gotos(&mut stmts);
+    cleanup::remove_unused_labels(&mut stmts);
     // Recover the `z = a and b or c` short-circuit ternary from its goto/label diamond.
     cleanup::recover_and_or(&mut stmts);
     // Recover common forward-goto guard shapes into structured if/else blocks.
     cleanup::recover_guard_else_gotos(&mut stmts);
     cleanup::recover_if_skip_gotos(&mut stmts);
     cleanup::recover_goto_into_if_gates(&mut stmts);
+    cleanup::recover_if_else_gotos(&mut stmts);
+    cleanup::recover_top_test_while_gotos(&mut stmts);
+    cleanup::recover_backward_goto_while(&mut stmts);
+    cleanup::merge_leading_while_break_guards(&mut stmts);
 
     // Captured registers, upvalues, and globals are excluded from inlining/elimination:
     // closures must keep the variables they close over, and a write to an upvalue or global
@@ -103,6 +127,7 @@ fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoRep
     for _ in 0..16 {
         naming::fold_refinements(&mut stmts);
         cleanup::fold_table_literals(&mut stmts);
+        cleanup::inline_table_literal_fill_temps(&mut stmts);
         cleanup::single_use_inline(&mut stmts, &protected);
         cleanup::dead_store_elim(&mut stmts, &protected);
         let n = cleanup::count_stmts(&stmts);
@@ -114,6 +139,8 @@ fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoRep
     cleanup::recover_goto_into_if_gates(&mut stmts);
     cleanup::recover_guard_else_gotos(&mut stmts);
     cleanup::recover_if_skip_gotos(&mut stmts);
+    cleanup::recover_top_test_while_gotos(&mut stmts);
+    cleanup::merge_leading_while_break_guards(&mut stmts);
     // A constant `1` step on a numeric for is implicit.
     drop_unit_for_steps(&mut stmts);
 
@@ -125,7 +152,7 @@ fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoRep
     // Smart-rename synthesized locals from the expressions they hold (require -> module,
     // GetService -> service, etc.). Renaming a local is always semantics-preserving, so this
     // runs after reconstruction and rewrites the AST consistently.
-    let rename = naming::smart_rename(&stmts, &hoist_names);
+    let rename = naming::smart_rename(&stmts, &hoist_names, is_method);
     naming::apply_rename(&mut stmts, &rename);
     for n in hoist_names.iter_mut() {
         if let Some(new) = rename.get(n) {
@@ -146,8 +173,11 @@ fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoRep
     d.resolve_closures(&mut stmts, &rename);
     cleanup::promote_top_level_initializers(&mut stmts, &non_local);
     cleanup::fold_table_literals(&mut stmts);
+    cleanup::inline_table_literal_fill_temps(&mut stmts);
     let mut prev = usize::MAX;
     for _ in 0..16 {
+        cleanup::fold_table_literals(&mut stmts);
+        cleanup::inline_table_literal_fill_temps(&mut stmts);
         cleanup::single_use_inline(&mut stmts, &protected);
         cleanup::dead_store_elim(&mut stmts, &protected);
         let n = cleanup::count_stmts(&stmts);
@@ -156,19 +186,28 @@ fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoRep
         }
         prev = n;
     }
+    cleanup::remove_redundant_gotos(&mut stmts);
+    cleanup::remove_trailing_sibling_gotos(&mut stmts);
+    cleanup::remove_unused_labels(&mut stmts);
     cleanup::recover_goto_into_if_gates(&mut stmts);
     cleanup::recover_guard_else_gotos(&mut stmts);
     cleanup::recover_if_skip_gotos(&mut stmts);
+    cleanup::recover_if_else_gotos(&mut stmts);
+    cleanup::recover_top_test_while_gotos(&mut stmts);
+    cleanup::recover_backward_goto_while(&mut stmts);
+    cleanup::merge_leading_while_break_guards(&mut stmts);
     cleanup::drop_trailing_empty_return(&mut stmts);
     let hoist_names = cleanup::assigned_locals(&stmts, &non_local);
 
     // Determine `partial` from the FINAL tree: a proto is partial only if some unstructured
     // control flow (a goto/label) survived all recovery passes, or a nested closure was partial.
     let partial = contains_unstructured(&stmts) || d.has_partial_child;
+    let has_unstructured = contains_unstructured(&stmts);
     reports.push(ProtoReport {
         index: proto_idx,
         name: module.resolve(proto.debug_name).map(|c| c.into_owned()),
         partial,
+        has_unstructured,
         notes: d.notes.clone(),
     });
 
@@ -185,7 +224,14 @@ fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoRep
         }
     }
     out.push_str(&render_block(&stmts, 0));
-    out
+    let params: Vec<String> = (0..proto.num_params)
+        .map(|r| {
+            let n = d.reg_name(r);
+            rename.get(&n).cloned().unwrap_or(n)
+        })
+        .collect();
+
+    ProtoDecompileResult { body: out, params }
 }
 
 /// Whether the tree still contains unstructured control flow (a `goto`/label), meaning the
@@ -1502,10 +1548,14 @@ impl<'a> Decompiler<'a> {
     fn closure_expr(&mut self, child_idx: usize, pc: usize) -> Expr {
         // Recursively decompile the child proto into a function literal.
         let child = &self.module.protos[child_idx];
-        let params = self.signature_params(child);
         let captures = self.closure_captures(pc);
         let mut sub_reports = Vec::new();
-        let body = decompile_proto(self.module, child_idx, &mut sub_reports);
+        let insn = self.proto.code[pc];
+        let reg_a = insn_a(insn);
+        let is_method = self.is_closure_method_like(pc, reg_a);
+        let res = decompile_proto(self.module, child_idx, is_method, &mut sub_reports);
+        let body = res.body;
+        let params = res.params;
         if sub_reports.iter().any(|r| r.partial) {
             self.has_partial_child = true;
         }
@@ -1673,12 +1723,6 @@ impl<'a> Decompiler<'a> {
             }
             _ => {}
         }
-    }
-
-    fn signature_params(&self, proto: &Proto) -> Vec<String> {
-        (0..proto.num_params)
-            .map(|r| self.named_or(proto, r, format!("p{r}")))
-            .collect()
     }
 
     fn emit_call(
@@ -1922,6 +1966,36 @@ impl<'a> Decompiler<'a> {
         None
     }
 
+    fn is_closure_method_like(&self, pc: usize, reg: u8) -> bool {
+        let code = &self.proto.code;
+        let mut q = pc;
+        if let Some(op) = Opcode::from_u8(insn_op(code[pc])) {
+            q += op.length().max(1);
+        } else {
+            q += 1;
+        }
+        while q < code.len() && q < pc + 20 {
+            let insn = code[q];
+            let op = match Opcode::from_u8(insn_op(insn)) {
+                Some(o) => o,
+                None => {
+                    q += 1;
+                    continue;
+                }
+            };
+            if (op == Opcode::SETTABLEKS || op == Opcode::SETTABLE || op == Opcode::SETTABLEN)
+                && insn_a(insn) == reg
+            {
+                return true;
+            }
+            if writes_register(op, insn, reg) {
+                break;
+            }
+            q += op.length().max(1);
+        }
+        false
+    }
+
     /// A loop variable's name: its debug name if available, else a synthesized one that does
     /// not collide with the `vN`/`pN` synthesized names.
     fn loop_var_name(&mut self, reg: u8, body_pc: usize) -> String {
@@ -1936,10 +2010,6 @@ impl<'a> Decompiler<'a> {
         } else {
             format!("idx{n}")
         }
-    }
-
-    fn named_or(&self, proto: &Proto, r: u8, fallback: String) -> String {
-        self.unique_debug_name(proto, r).unwrap_or(fallback)
     }
 
     /// If a register is associated with exactly one debug local name across the proto, use
@@ -2206,4 +2276,15 @@ fn is_identifier(s: &str) -> bool {
         _ => return false,
     }
     s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn writes_register(op: Opcode, insn: u32, reg: u8) -> bool {
+    use Opcode::*;
+    match op {
+        JUMP | JUMPBACK | JUMPX | JUMPIF | JUMPIFNOT | JUMPIFEQ | JUMPIFLE | JUMPIFLT
+        | JUMPIFNOTEQ | JUMPIFNOTLE | JUMPIFNOTLT | JUMPXEQKNIL | JUMPXEQKB | JUMPXEQKN
+        | JUMPXEQKS | SETTABLE | SETTABLEKS | SETTABLEN | SETUPVAL | SETGLOBAL | RETURN | BREAK
+        | FORNPREP | FORGLOOP | FORGPREP | FORGPREP_INEXT | FORGPREP_NEXT => false,
+        _ => insn_a(insn) == reg,
+    }
 }

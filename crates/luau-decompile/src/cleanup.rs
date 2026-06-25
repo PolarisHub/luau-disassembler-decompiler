@@ -135,6 +135,26 @@ pub fn count_stmts(root: &[Stmt]) -> usize {
     n
 }
 
+fn write_depends_on_between(
+    root: &[Stmt],
+    write_idx: usize,
+    init_idx: usize,
+    key: &Expr,
+    val: &Expr,
+) -> bool {
+    let mut read_vars = reads_of_expr(key);
+    read_vars.extend(reads_of_expr(val));
+
+    for m in (init_idx + 1)..write_idx {
+        let stmt = &root[m];
+        let written = writes_of_stmt(stmt);
+        if !written.is_disjoint(&read_vars) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Fold `t = {}; t[1]=a; t[2]=b; t.k=v` (a NEWTABLE/DUPTABLE followed by its consecutive
 /// SETLIST/SETTABLEKS fills) into a table literal `t = {a, b, k = v}`. Only consecutive fills
 /// of `t` whose key/value don't reference `t` are absorbed, so evaluation order and any later
@@ -144,32 +164,306 @@ pub fn fold_table_literals(root: &mut Vec<Stmt>) {
     for s in root.iter_mut() {
         for_each_block_mut(s, fold_table_literals);
     }
+
     let mut i = 0;
     while i < root.len() {
-        let Some((t, mut fields)) = table_init(&root[i]) else {
+        let Some((t, fields)) = table_init(&root[i]) else {
             i += 1;
             continue;
         };
+
+        let mut writes = Vec::new();
+        let mut stop_idx = root.len();
+
+        for k in (i + 1)..root.len() {
+            let stmt = &root[k];
+            let mut is_write = false;
+            if let Stmt::Assign { targets, values } = stmt {
+                if targets.len() == 1 && values.len() == 1 {
+                    match &targets[0] {
+                        Expr::Index(base, key) => {
+                            if let Expr::Var(base_name) = base.as_ref() {
+                                if base_name == &t {
+                                    if !expr_reads_var(key, &t) && !expr_reads_var(&values[0], &t) {
+                                        if write_depends_on_between(root, k, i, key, &values[0]) {
+                                            stop_idx = k;
+                                            break;
+                                        }
+                                        writes.push((k, TableField::Keyed(*key.clone(), values[0].clone())));
+                                        is_write = true;
+                                    }
+                                }
+                            }
+                        }
+                        Expr::Field(base, field) => {
+                            if let Expr::Var(base_name) = base.as_ref() {
+                                if base_name == &t {
+                                    if !expr_reads_var(&values[0], &t) {
+                                        if write_depends_on_between(root, k, i, &Expr::Nil, &values[0]) {
+                                            stop_idx = k;
+                                            break;
+                                        }
+                                        writes.push((k, TableField::Named(field.clone(), values[0].clone())));
+                                        is_write = true;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if is_write {
+                continue;
+            }
+
+            if is_escape_or_unsafe_read(stmt, &t) || is_control_flow(stmt) {
+                stop_idx = k;
+                break;
+            }
+        }
+
+        writes.retain(|(idx, _)| *idx < stop_idx);
+
+        if writes.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        let mut uses = BTreeMap::new();
+        for k in (i + 1)..root.len() {
+            count_uses_stmt(&root[k], &mut uses);
+        }
+
+        let mut inline_map = BTreeMap::new();
+        let mut def_indices = BTreeSet::new();
+
+        for k in (i + 1)..stop_idx {
+            if let Some((var_name, def_val)) = sole_var_assign(&root[k]) {
+                if uses.get(&var_name).copied().unwrap_or(0) == 1 && is_pure(&def_val) {
+                    let read_in_writes = writes.iter().any(|(_, field)| {
+                        match field {
+                            TableField::Item(e) => expr_reads_var(e, &var_name),
+                            TableField::Named(_, e) => expr_reads_var(e, &var_name),
+                            TableField::Keyed(k, v) => expr_reads_var(k, &var_name) || expr_reads_var(v, &var_name),
+                        }
+                    });
+                    if read_in_writes {
+                        inline_map.insert(var_name, def_val);
+                        def_indices.insert(k);
+                    }
+                }
+            }
+        }
+
+        for (_, field) in writes.iter_mut() {
+            match field {
+                TableField::Item(e) => {
+                    replace_inline_expr(e, &inline_map);
+                }
+                TableField::Named(_, e) => {
+                    replace_inline_expr(e, &inline_map);
+                }
+                TableField::Keyed(k, v) => {
+                    replace_inline_expr(k, &inline_map);
+                    replace_inline_expr(v, &inline_map);
+                }
+            }
+        }
+
+        let mut final_fields = fields.clone();
         let mut array_next = 1 + fields
             .iter()
             .filter(|f| matches!(f, TableField::Item(_)))
             .count();
-        let mut j = i + 1;
-        while j < root.len() {
-            match table_fill_field(&root[j], &t, &mut array_next) {
-                Some(field) => {
-                    fields.push(field);
-                    j += 1;
+
+        for (_, field) in writes.iter() {
+            let normalized_field = match field {
+                TableField::Keyed(Expr::Num(n), val) if n == &array_next.to_string() => {
+                    array_next += 1;
+                    TableField::Item(val.clone())
                 }
-                None => break,
+                other => other.clone(),
+            };
+            final_fields.push(normalized_field);
+        }
+
+        replace_table_init(&mut root[i], final_fields);
+
+        let write_indices: BTreeSet<usize> = writes.iter().map(|(idx, _)| *idx).collect();
+        let indices_to_remove: BTreeSet<usize> = write_indices.union(&def_indices).cloned().collect();
+
+        for idx in indices_to_remove.into_iter().rev() {
+            root.remove(idx);
+        }
+
+        i = 0;
+    }
+}
+
+fn expr_reads_var(e: &Expr, var: &str) -> bool {
+    reads_of_expr(e).contains(var)
+}
+
+fn stmt_reads_var_recursive(s: &Stmt, t: &str) -> bool {
+    if stmt_reads_var(s, t) {
+        return true;
+    }
+    let mut found = false;
+    for_each_block(s, |b| {
+        if !found {
+            found = b.iter().any(|st| stmt_reads_var_recursive(st, t));
+        }
+    });
+    found
+}
+
+fn is_escape_or_unsafe_read(stmt: &Stmt, t: &str) -> bool {
+    if let Stmt::Assign { targets, values } = stmt {
+        if targets.len() == 1 && values.len() == 1 {
+            match &targets[0] {
+                Expr::Index(base, key) => {
+                    if let Expr::Var(base_name) = base.as_ref() {
+                        if base_name == t {
+                            return expr_reads_var(key, t) || expr_reads_var(&values[0], t);
+                        }
+                    }
+                }
+                Expr::Field(base, _) => {
+                    if let Expr::Var(base_name) = base.as_ref() {
+                        if base_name == t {
+                            return expr_reads_var(&values[0], t);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
-        if j > i + 1 {
-            replace_table_init(&mut root[i], fields);
-            root.drain(i + 1..j);
-        }
-        i += 1;
     }
+    stmt_reads_var_recursive(stmt, t)
+}
+
+fn replace_inline_expr(e: &mut Expr, inline_map: &BTreeMap<String, Expr>) {
+    match e {
+        Expr::Var(n) => {
+            if let Some(val) = inline_map.get(n) {
+                *e = val.clone();
+            }
+        }
+        Expr::Index(b, k) => {
+            replace_inline_expr(b, inline_map);
+            replace_inline_expr(k, inline_map);
+        }
+        Expr::Field(b, _) => {
+            replace_inline_expr(b, inline_map);
+        }
+        Expr::Call(c, args) => {
+            replace_inline_expr(c, inline_map);
+            for arg in args {
+                replace_inline_expr(arg, inline_map);
+            }
+        }
+        Expr::MethodCall(o, _, args) => {
+            replace_inline_expr(o, inline_map);
+            for arg in args {
+                replace_inline_expr(arg, inline_map);
+            }
+        }
+        Expr::Unary(_, a) => {
+            replace_inline_expr(a, inline_map);
+        }
+        Expr::Binary(_, a, b) => {
+            replace_inline_expr(a, inline_map);
+            replace_inline_expr(b, inline_map);
+        }
+        Expr::Table(fields) => {
+            for f in fields {
+                match f {
+                    TableField::Item(v) => replace_inline_expr(v, inline_map),
+                    TableField::Named(_, v) => replace_inline_expr(v, inline_map),
+                    TableField::Keyed(k, v) => {
+                        replace_inline_expr(k, inline_map);
+                        replace_inline_expr(v, inline_map);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+
+/// Inline temporary table literals that are immediately stored into another table:
+///
+/// ```lua
+/// tmp = { ... }
+/// parent[key] = tmp
+/// ```
+///
+/// becomes `parent[key] = { ... }` when `tmp` is not read again before it is overwritten.
+/// This removes compiler register temporaries from nested table construction without
+/// changing shared-table behavior.
+pub fn inline_table_literal_fill_temps(root: &mut Vec<Stmt>) {
+    for s in root.iter_mut() {
+        for_each_block_mut(s, inline_table_literal_fill_temps);
+    }
+
+    let mut i = 0;
+    while i + 1 < root.len() {
+        let Some((name, fields)) = sole_table_literal_assign(&root[i]) else {
+            i += 1;
+            continue;
+        };
+        if !assigns_single_var_value(&root[i + 1], &name) {
+            i += 1;
+            continue;
+        }
+        if stmt_reads_var_in_assignment_target(&root[i + 1], &name) {
+            i += 1;
+            continue;
+        }
+        if read_before_next_write(&root[i + 2..], &name) {
+            i += 1;
+            continue;
+        }
+
+        if let Stmt::Assign { values, .. } = &mut root[i + 1] {
+            values[0] = Expr::Table(fields);
+        }
+        root.remove(i);
+    }
+}
+
+fn sole_table_literal_assign(stmt: &Stmt) -> Option<(String, Vec<TableField>)> {
+    let (name, value) = sole_var_assign(stmt)?;
+    match value {
+        Expr::Table(fields) => Some((name, fields)),
+        _ => None,
+    }
+}
+
+fn assigns_single_var_value(stmt: &Stmt, name: &str) -> bool {
+    matches!(
+        stmt,
+        Stmt::Assign { values, .. }
+            if values.len() == 1 && matches!(&values[0], Expr::Var(value) if value == name)
+    )
+}
+
+fn read_before_next_write(stmts: &[Stmt], name: &str) -> bool {
+    for stmt in stmts {
+        if directly_writes_var(stmt, name) {
+            return false;
+        }
+        if stmt_reads_var(stmt, name) {
+            return true;
+        }
+        if is_control_flow(stmt) {
+            return true;
+        }
+    }
+    false
 }
 
 fn table_init(s: &Stmt) -> Option<(String, Vec<TableField>)> {
@@ -202,39 +496,6 @@ fn replace_table_init(s: &mut Stmt, fields: Vec<TableField>) {
     }
 }
 
-/// If `s` is a fill of table `t` (`t[k] = v` or `t.k = v`) safe to absorb into a literal,
-/// return the corresponding field. `array_next` tracks the next positional array index.
-fn table_fill_field(s: &Stmt, t: &str, array_next: &mut usize) -> Option<TableField> {
-    let Stmt::Assign { targets, values } = s else {
-        return None;
-    };
-    if targets.len() != 1 || values.len() != 1 {
-        return None;
-    }
-    let value = &values[0];
-    if reads_of_expr(value).contains(t) {
-        return None; // value reads t — the literal can't capture it
-    }
-    let is_t = |e: &Expr| matches!(e, Expr::Var(n) if n == t);
-    match &targets[0] {
-        Expr::Field(base, name) if is_t(base) => {
-            Some(TableField::Named(name.clone(), value.clone()))
-        }
-        Expr::Index(base, key) if is_t(base) => {
-            if reads_of_expr(key).contains(t) {
-                return None;
-            }
-            if let Expr::Num(n) = key.as_ref() {
-                if *n == array_next.to_string() {
-                    *array_next += 1;
-                    return Some(TableField::Item(value.clone()));
-                }
-            }
-            Some(TableField::Keyed((**key).clone(), value.clone()))
-        }
-        _ => None,
-    }
-}
 
 /// Drop statements after a `return`/`break`/`continue`/`goto` in each block. A flush of the inline
 /// cache can append assignments after a terminator; that code is both unreachable and (for
@@ -494,6 +755,137 @@ pub fn recover_goto_into_if_gates(root: &mut Vec<Stmt>) {
         for_each_block_mut(s, recover_goto_into_if_gates);
     }
     while recover_goto_into_if_gate_once(root) {}
+}
+
+/// Recover top-tested loops that survived the bytecode structurer as a label plus a nested
+/// guard ending in a back-goto:
+///
+/// ```lua
+/// ::L::
+/// if a then
+///     if b then
+///         body()
+///         goto L
+///     end
+/// end
+/// ```
+///
+/// becomes `while a and b do body() end`. Every false guard path falls through to the same
+/// loop exit, and the only goto to the label is the final back-edge, so this is a direct
+/// structured form of the same control flow.
+pub fn recover_top_test_while_gotos(root: &mut Vec<Stmt>) {
+    for s in root.iter_mut() {
+        for_each_block_mut(s, recover_top_test_while_gotos);
+    }
+    while recover_top_test_while_once(root) {}
+}
+
+/// Merge a leading `if <cond> then break end` guard into the enclosing while condition.
+/// Luau often emits `while a do if not b then break end ... end` for `while a and b do`.
+pub fn merge_leading_while_break_guards(root: &mut [Stmt]) {
+    for s in root.iter_mut() {
+        for_each_block_mut(s, |body| merge_leading_while_break_guards(body));
+    }
+
+    for stmt in root.iter_mut() {
+        let Stmt::While { cond, body } = stmt else {
+            continue;
+        };
+        while let Some(first) = body.first() {
+            let Stmt::If {
+                cond: break_cond,
+                then_body,
+                else_body,
+            } = first
+            else {
+                break;
+            };
+            if !else_body.is_empty() || !matches!(then_body.as_slice(), [Stmt::Break]) {
+                break;
+            }
+            *cond = Expr::Binary(
+                "and",
+                Box::new(cond.clone()),
+                Box::new(negate_condition(break_cond.clone())),
+            );
+            body.remove(0);
+        }
+    }
+}
+
+fn recover_top_test_while_once(root: &mut Vec<Stmt>) -> bool {
+    let mut i = 0;
+    while i + 1 < root.len() {
+        let Stmt::Label(label) = &root[i] else {
+            i += 1;
+            continue;
+        };
+        if count_gotos_named(root, label) != 1 {
+            i += 1;
+            continue;
+        }
+
+        let Some((cond, body)) = top_test_while_body(&root[i + 1], label) else {
+            i += 1;
+            continue;
+        };
+        if contains_label_or_goto(&body) {
+            i += 1;
+            continue;
+        }
+
+        root[i] = Stmt::While { cond, body };
+        root.remove(i + 1);
+        return true;
+    }
+    false
+}
+
+fn top_test_while_body(stmt: &Stmt, label: &str) -> Option<(Expr, Vec<Stmt>)> {
+    let Stmt::If {
+        cond,
+        then_body,
+        else_body,
+    } = stmt
+    else {
+        return None;
+    };
+    if !else_body.is_empty() {
+        return None;
+    }
+
+    let (guard, body) = loop_back_body(then_body, label)?;
+    Some(match guard {
+        Some(extra) => (
+            Expr::Binary("and", Box::new(cond.clone()), Box::new(extra)),
+            body,
+        ),
+        None => (cond.clone(), body),
+    })
+}
+
+fn loop_back_body(stmts: &[Stmt], label: &str) -> Option<(Option<Expr>, Vec<Stmt>)> {
+    match stmts {
+        [Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        }] if else_body.is_empty() => {
+            let (inner_cond, body) = loop_back_body(then_body, label)?;
+            let cond = match inner_cond {
+                Some(inner) => Expr::Binary("and", Box::new(cond.clone()), Box::new(inner)),
+                None => cond.clone(),
+            };
+            Some((Some(cond), body))
+        }
+        _ => {
+            let (last, prefix) = stmts.split_last()?;
+            if !matches!(last, Stmt::Goto(target) if target == label) {
+                return None;
+            }
+            Some((None, prefix.to_vec()))
+        }
+    }
 }
 
 fn recover_goto_into_if_gate_once(root: &mut Vec<Stmt>) -> bool {
@@ -1311,6 +1703,281 @@ fn for_each_block_mut(s: &mut Stmt, mut f: impl FnMut(&mut Vec<Stmt>)) {
     }
 }
 
+pub fn remove_redundant_gotos(root: &mut Vec<Stmt>) {
+    for s in root.iter_mut() {
+        for_each_block_mut(s, remove_redundant_gotos);
+    }
+    let mut i = 0;
+    while i < root.len() {
+        if let Stmt::Goto(label) = &root[i] {
+            let label = label.clone();
+            let mut next_idx = i + 1;
+            while next_idx < root.len() {
+                match &root[next_idx] {
+                    Stmt::Comment(_) => {
+                        next_idx += 1;
+                    }
+                    Stmt::Label(target) if target == &label => {
+                        root.remove(i);
+                        break;
+                    }
+                    _ => {
+                        break;
+                    }
+                }
+            }
+            if next_idx < root.len() && matches!(&root[next_idx], Stmt::Label(target) if target == &label) {
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+pub fn remove_trailing_sibling_gotos(root: &mut Vec<Stmt>) {
+    for s in root.iter_mut() {
+        for_each_block_mut(s, remove_trailing_sibling_gotos);
+    }
+
+    let mut i = 0;
+    while i < root.len() {
+        let mut next_label = None;
+        let mut next_idx = i + 1;
+        while next_idx < root.len() {
+            match &root[next_idx] {
+                Stmt::Comment(_) => {
+                    next_idx += 1;
+                }
+                Stmt::Label(name) => {
+                    next_label = Some(name.clone());
+                    break;
+                }
+                _ => {
+                    break;
+                }
+            }
+        }
+
+        if let Some(label_name) = next_label {
+            if let Stmt::If { cond, then_body, else_body } = &mut root[i] {
+                if let Some(Stmt::Goto(name)) = then_body.last() {
+                    if name == &label_name {
+                        then_body.pop();
+                    }
+                }
+                if let Some(Stmt::Goto(name)) = else_body.last() {
+                    if name == &label_name {
+                        else_body.pop();
+                    }
+                }
+
+                if then_body.is_empty() && else_body.is_empty() {
+                    if is_pure(cond) {
+                        root.remove(i);
+                        continue;
+                    } else {
+                        root[i] = Stmt::Call(cond.clone());
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
+pub fn remove_unused_labels(root: &mut Vec<Stmt>) {
+    let mut gotos = BTreeSet::new();
+    fn collect_gotos(stmts: &[Stmt], gotos: &mut BTreeSet<String>) {
+        for s in stmts {
+            match s {
+                Stmt::Goto(name) => {
+                    gotos.insert(name.clone());
+                }
+                _ => {
+                    for_each_block(s, |b| collect_gotos(b, gotos));
+                }
+            }
+        }
+    }
+    collect_gotos(root, &mut gotos);
+
+    fn remove_labels(stmts: &mut Vec<Stmt>, gotos: &BTreeSet<String>) {
+        let mut i = 0;
+        while i < stmts.len() {
+            let mut remove = false;
+            if let Stmt::Label(name) = &stmts[i] {
+                if !gotos.contains(name) {
+                    remove = true;
+                }
+            }
+            if remove {
+                stmts.remove(i);
+            } else {
+                for_each_block_mut(&mut stmts[i], |b| remove_labels(b, gotos));
+                i += 1;
+            }
+        }
+    }
+    remove_labels(root, &gotos);
+}
+
+pub fn recover_if_else_gotos(root: &mut Vec<Stmt>) {
+    for s in root.iter_mut() {
+        for_each_block_mut(s, recover_if_else_gotos);
+    }
+    while recover_if_else_once(root) {}
+}
+
+fn recover_if_else_once(root: &mut Vec<Stmt>) -> bool {
+    for i in 0..root.len() {
+        let Some((exit_cond, l_else)) = conditional_goto_expr(&root[i], None) else {
+            continue;
+        };
+        let Some(else_idx) = root.iter().position(|s| matches!(s, Stmt::Label(l) if l == &l_else)) else {
+            continue;
+        };
+        if else_idx <= i + 1 {
+            continue;
+        }
+        let l_end = match &root[else_idx - 1] {
+            Stmt::Goto(l) => l.clone(),
+            _ => continue,
+        };
+        let Some(end_idx) = root.iter().position(|s| matches!(s, Stmt::Label(l) if l == &l_end)) else {
+            continue;
+        };
+        if end_idx <= else_idx {
+            continue;
+        }
+
+        let then_body = root[i + 1..else_idx - 1].to_vec();
+        let else_body = root[else_idx + 1..end_idx].to_vec();
+
+        let if_stmt = Stmt::If {
+            cond: negate_condition(exit_cond),
+            then_body,
+            else_body,
+        };
+
+        root[i] = if_stmt;
+        root.drain(i + 1..=end_idx);
+        return true;
+    }
+    false
+}
+
+pub fn recover_backward_goto_while(root: &mut Vec<Stmt>) {
+    for s in root.iter_mut() {
+        for_each_block_mut(s, recover_backward_goto_while);
+    }
+    while recover_backward_goto_while_once(root) {}
+}
+
+fn recover_backward_goto_while_once(root: &mut Vec<Stmt>) -> bool {
+    for i in 0..root.len() {
+        let Stmt::Label(label_name) = &root[i] else {
+            continue;
+        };
+        let label_name = label_name.clone();
+        let mut goto_idx = None;
+        for k in (i + 1)..root.len() {
+            if let Stmt::Goto(name) = &root[k] {
+                if name == &label_name {
+                    goto_idx = Some(k);
+                    break;
+                }
+            }
+        }
+        let Some(j) = goto_idx else {
+            continue;
+        };
+        if count_gotos_named(root, &label_name) != 1 {
+            continue;
+        }
+        if i + 1 >= j {
+            continue;
+        }
+        let Some((exit_cond, exit_label)) = conditional_goto_expr(&root[i + 1], None) else {
+            continue;
+        };
+        let Some(exit_idx) = root.iter().position(|s| matches!(s, Stmt::Label(l) if l == &exit_label)) else {
+            continue;
+        };
+        if exit_idx < j {
+            continue;
+        }
+
+        let loop_body = root[i + 2..j].to_vec();
+        if has_goto_in_nested_loop(&loop_body, &exit_label, false) {
+            continue;
+        }
+
+        let mut loop_body = loop_body;
+        replace_gotos_with_break(&mut loop_body, &exit_label);
+
+        let while_stmt = Stmt::While {
+            cond: negate_condition(exit_cond),
+            body: loop_body,
+        };
+
+        root[i] = while_stmt;
+        root.drain(i + 1..=j);
+
+        if count_gotos_named(root, &exit_label) == 0 {
+            if let Some(pos) = root.iter().position(|s| matches!(s, Stmt::Label(l) if l == &exit_label)) {
+                root.remove(pos);
+            }
+        }
+        return true;
+    }
+    false
+}
+
+fn replace_gotos_with_break(stmts: &mut [Stmt], target_label: &str) {
+    for s in stmts.iter_mut() {
+        match s {
+            Stmt::Goto(name) if name == target_label => {
+                *s = Stmt::Break;
+            }
+            _ => {
+                for_each_block_mut(s, |b| replace_gotos_with_break(b, target_label));
+            }
+        }
+    }
+}
+
+fn has_goto_in_nested_loop(stmts: &[Stmt], target_label: &str, in_loop: bool) -> bool {
+    for s in stmts {
+        match s {
+            Stmt::Goto(name) if name == target_label => {
+                if in_loop {
+                    return true;
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::Repeat { body, .. }
+            | Stmt::NumericFor { body, .. }
+            | Stmt::GenericFor { body, .. } => {
+                if has_goto_in_nested_loop(body, target_label, true) {
+                    return true;
+                }
+            }
+            _ => {
+                let mut found = false;
+                for_each_block(s, |b| {
+                    if !found {
+                        found = has_goto_in_nested_loop(b, target_label, in_loop);
+                    }
+                });
+                if found {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1360,6 +2027,46 @@ mod tests {
         assert!(rendered.contains("Speed = speed or 1"), "{rendered}");
         assert!(!rendered.contains("object.Looped"), "{rendered}");
         assert!(!rendered.contains("object.Speed"), "{rendered}");
+    }
+
+    #[test]
+    fn inlines_table_literal_fill_temps() {
+        let mut stmts = vec![
+            Stmt::Local {
+                names: vec!["parent".into()],
+                values: vec![Expr::Table(Vec::new())],
+            },
+            Stmt::Local {
+                names: vec!["tmp".into()],
+                values: vec![Expr::Table(vec![TableField::Named(
+                    "ConstraintType".into(),
+                    Expr::Str("\"Hinge\"".into()),
+                )])],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Index(
+                    Box::new(Expr::Var("parent".into())),
+                    Box::new(Expr::Var("motor".into())),
+                )],
+                values: vec![Expr::Var("tmp".into())],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("tmp".into())],
+                values: vec![Expr::Table(Vec::new())],
+            },
+        ];
+
+        inline_table_literal_fill_temps(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(
+            rendered.contains("parent[motor] = {ConstraintType = \"Hinge\"}"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("local tmp = {ConstraintType"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -1579,5 +2286,310 @@ mod tests {
         assert!(rendered.contains("error(\"bad point\")"), "{rendered}");
         assert!(!rendered.contains("goto"), "{rendered}");
         assert!(!rendered.contains("::accept::"), "{rendered}");
+    }
+
+    #[test]
+    fn recovers_top_test_while_goto() {
+        let mut stmts = vec![
+            Stmt::Local {
+                names: vec!["total".into()],
+                values: vec![Expr::Num("0".into())],
+            },
+            Stmt::Label("loop".into()),
+            Stmt::If {
+                cond: Expr::Binary(
+                    "<",
+                    Box::new(Expr::Var("total".into())),
+                    Box::new(Expr::Var("limit".into())),
+                ),
+                then_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("total".into())],
+                        values: vec![Expr::Binary(
+                            "+",
+                            Box::new(Expr::Var("total".into())),
+                            Box::new(Expr::Num("1".into())),
+                        )],
+                    },
+                    Stmt::Goto("loop".into()),
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::Return(vec![Expr::Var("total".into())]),
+        ];
+
+        recover_top_test_while_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("while total < limit do"), "{rendered}");
+        assert!(rendered.contains("total += 1"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+        assert!(!rendered.contains("::loop::"), "{rendered}");
+    }
+
+    #[test]
+    fn recovers_nested_top_test_while_goto() {
+        let mut stmts = vec![
+            Stmt::Label("L0".into()),
+            Stmt::If {
+                cond: Expr::Binary(
+                    "<",
+                    Box::new(Expr::Var("distance".into())),
+                    Box::new(Expr::Var("magnitude".into())),
+                ),
+                then_body: vec![Stmt::If {
+                    cond: Expr::Binary(
+                        "<=",
+                        Box::new(Expr::Var("total".into())),
+                        Box::new(Expr::Var("limit".into())),
+                    ),
+                    then_body: vec![
+                        Stmt::Assign {
+                            targets: vec![Expr::Var("total".into())],
+                            values: vec![Expr::Binary(
+                                "+",
+                                Box::new(Expr::Var("total".into())),
+                                Box::new(Expr::Num("1".into())),
+                            )],
+                        },
+                        Stmt::Call(Expr::MethodCall(
+                            Box::new(Expr::Var("solver".into())),
+                            "Step".into(),
+                            vec![Expr::Var("target".into())],
+                        )),
+                        Stmt::Goto("L0".into()),
+                    ],
+                    else_body: Vec::new(),
+                }],
+                else_body: Vec::new(),
+            },
+        ];
+
+        recover_top_test_while_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(
+            rendered.contains("while distance < magnitude and total <= limit do"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("solver:Step(target)"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+        assert!(!rendered.contains("::L0::"), "{rendered}");
+    }
+
+    #[test]
+    fn keeps_label_with_multiple_incoming_gotos() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("restart".into()),
+                then_body: vec![Stmt::Goto("L0".into())],
+                else_body: Vec::new(),
+            },
+            Stmt::Label("L0".into()),
+            Stmt::If {
+                cond: Expr::Var("running".into()),
+                then_body: vec![Stmt::Goto("L0".into())],
+                else_body: Vec::new(),
+            },
+        ];
+
+        recover_top_test_while_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("::L0::"), "{rendered}");
+        assert_eq!(rendered.matches("goto L0").count(), 2, "{rendered}");
+    }
+
+    #[test]
+    fn merges_leading_while_break_guard() {
+        let mut stmts = vec![Stmt::While {
+            cond: Expr::Binary(
+                "<",
+                Box::new(Expr::Var("distance".into())),
+                Box::new(Expr::Var("magnitude".into())),
+            ),
+            body: vec![
+                Stmt::If {
+                    cond: Expr::Binary(
+                        ">",
+                        Box::new(Expr::Var("total".into())),
+                        Box::new(Expr::Var("limit".into())),
+                    ),
+                    then_body: vec![Stmt::Break],
+                    else_body: Vec::new(),
+                },
+                Stmt::Assign {
+                    targets: vec![Expr::Var("total".into())],
+                    values: vec![Expr::Binary(
+                        "+",
+                        Box::new(Expr::Var("total".into())),
+                        Box::new(Expr::Num("1".into())),
+                    )],
+                },
+            ],
+        }];
+
+        merge_leading_while_break_guards(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(
+            rendered.contains("while distance < magnitude and total <= limit do"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("break"), "{rendered}");
+        assert!(rendered.contains("total += 1"), "{rendered}");
+    }
+
+    #[test]
+    fn keeps_nonleading_while_break_guard() {
+        let mut stmts = vec![Stmt::While {
+            cond: Expr::Var("running".into()),
+            body: vec![
+                Stmt::Call(Expr::Call(Box::new(Expr::Var("step".into())), Vec::new())),
+                Stmt::If {
+                    cond: Expr::Var("done".into()),
+                    then_body: vec![Stmt::Break],
+                    else_body: Vec::new(),
+                },
+            ],
+        }];
+
+        merge_leading_while_break_guards(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("while running do"), "{rendered}");
+        assert!(rendered.contains("if done then"), "{rendered}");
+        assert!(rendered.contains("break"), "{rendered}");
+    }
+
+    #[test]
+    fn removes_redundant_goto_adjacent_to_label() {
+        let mut stmts = vec![
+            Stmt::Call(Expr::Call(Box::new(Expr::Var("print".into())), vec![Expr::Str("\"hello\"".into())])),
+            Stmt::Goto("L0".into()),
+            Stmt::Comment("some comment".into()),
+            Stmt::Label("L0".into()),
+            Stmt::Call(Expr::Call(Box::new(Expr::Var("print".into())), vec![Expr::Str("\"world\"".into())])),
+        ];
+        remove_redundant_gotos(&mut stmts);
+        let rendered = render_block(&stmts, 0);
+        assert!(!rendered.contains("goto L0"), "{rendered}");
+        assert!(rendered.contains("::L0::"), "{rendered}");
+    }
+
+    #[test]
+    fn removes_trailing_sibling_gotos_in_if() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("enabled".into()),
+                then_body: vec![
+                    Stmt::Call(Expr::Call(Box::new(Expr::Var("print".into())), Vec::new())),
+                    Stmt::Goto("L1".into()),
+                ],
+                else_body: vec![
+                    Stmt::Call(Expr::Call(Box::new(Expr::Var("warn".into())), Vec::new())),
+                    Stmt::Goto("L1".into()),
+                ],
+            },
+            Stmt::Label("L1".into()),
+        ];
+        remove_trailing_sibling_gotos(&mut stmts);
+        let rendered = render_block(&stmts, 0);
+        assert!(!rendered.contains("goto L1"), "{rendered}");
+        assert!(rendered.contains("::L1::"), "{rendered}");
+    }
+
+    #[test]
+    fn removes_unused_labels_recursively() {
+        let mut stmts = vec![
+            Stmt::Label("Unused".into()),
+            Stmt::Call(Expr::Call(Box::new(Expr::Var("print".into())), Vec::new())),
+            Stmt::Label("Used".into()),
+            Stmt::If {
+                cond: Expr::Var("cond".into()),
+                then_body: vec![Stmt::Goto("Used".into())],
+                else_body: Vec::new(),
+            },
+        ];
+        remove_unused_labels(&mut stmts);
+        let rendered = render_block(&stmts, 0);
+        assert!(!rendered.contains("::Unused::"), "{rendered}");
+        assert!(rendered.contains("::Used::"), "{rendered}");
+    }
+
+    #[test]
+    fn recovers_if_else_from_gotos() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("enabled".into()),
+                then_body: vec![Stmt::Goto("L_else".into())],
+                else_body: Vec::new(),
+            },
+            Stmt::Call(Expr::Call(Box::new(Expr::Var("print".into())), vec![Expr::Str("\"then\"".into())])),
+            Stmt::Goto("L_end".into()),
+            Stmt::Label("L_else".into()),
+            Stmt::Call(Expr::Call(Box::new(Expr::Var("print".into())), vec![Expr::Str("\"else\"".into())])),
+            Stmt::Label("L_end".into()),
+        ];
+        recover_if_else_gotos(&mut stmts);
+        remove_unused_labels(&mut stmts);
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("if not enabled then"), "{rendered}");
+        assert!(rendered.contains("print(\"then\")"), "{rendered}");
+        assert!(rendered.contains("else"), "{rendered}");
+        assert!(rendered.contains("print(\"else\")"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+        assert!(!rendered.contains("::L_else::"), "{rendered}");
+        assert!(!rendered.contains("::L_end::"), "{rendered}");
+    }
+
+    #[test]
+    fn recovers_backward_goto_while_loop() {
+        let mut stmts = vec![
+            Stmt::Label("L0".into()),
+            Stmt::If {
+                cond: Expr::Var("exit_cond".into()),
+                then_body: vec![Stmt::Goto("L1".into())],
+                else_body: Vec::new(),
+            },
+            Stmt::Call(Expr::Call(Box::new(Expr::Var("print".into())), vec![Expr::Str("\"body\"".into())])),
+            Stmt::Goto("L0".into()),
+            Stmt::Label("L1".into()),
+        ];
+        recover_backward_goto_while(&mut stmts);
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("while not exit_cond do"), "{rendered}");
+        assert!(rendered.contains("print(\"body\")"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+        assert!(!rendered.contains("::L0::"), "{rendered}");
+        assert!(!rendered.contains("::L1::"), "{rendered}");
+    }
+
+    #[test]
+    fn folds_table_literals_respects_intermediate_dependencies() {
+        let mut stmts = vec![
+            Stmt::Local {
+                names: vec!["t".into()],
+                values: vec![Expr::Table(Vec::new())],
+            },
+            Stmt::Local {
+                names: vec!["temp".into()],
+                values: vec![Expr::Num("1".into())],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Index(
+                    Box::new(Expr::Var("t".into())),
+                    Box::new(Expr::Num("1".into())),
+                )],
+                values: vec![Expr::Var("temp".into())],
+            },
+        ];
+
+        fold_table_literals(&mut stmts);
+
+        // Should NOT fold yet because temp is written in between
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("t[1] = temp"), "{rendered}");
+        assert!(!rendered.contains("t = {temp}"), "{rendered}");
     }
 }
