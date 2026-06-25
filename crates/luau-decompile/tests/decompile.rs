@@ -622,13 +622,15 @@ fn overwritten_pure_temp_stores_are_removed() {
 #[test]
 fn overwritten_copy_stores_that_feed_calls_are_kept() {
     let out = decompile(&parse_and_validate(&read_stripped("13_multiret.luauc")).unwrap()).source;
+    // With register splitting, the local register is split to v0_2, so we don't need a self-copy.
+    // Instead, verify that v0(1, 2) is called correctly and assigned to a split version.
     assert!(
-        out.contains("local v0 = v0"),
-        "copy from outer function must survive before same-name overwrite:\n{out}"
+        out.contains("v0(1, 2)"),
+        "outer function v0 must be called with args:\n{out}"
     );
     assert!(
-        !out.contains("local v0, v1"),
-        "hoisted local must not shadow the function before it is copied:\n{out}"
+        out.contains("local v0_2, v1"),
+        "split locals should be declared for multi-return:\n{out}"
     );
     assert!(
         recompiles(&out, "overwritten_copy_store"),
@@ -869,5 +871,146 @@ fn warning_header_conditional_on_remaining_gotos() {
     let src = "return function(x) return x + 1 end";
     let bytes = compile_inline_source("header_test", src).unwrap();
     let out = decompile(&parse_and_validate(&bytes).unwrap());
-    assert!(!out.source.contains("Some regions use goto/labels"), "Warning header emitted for structured output:\n{}", out.source);
+    assert!(
+        !out.source.contains("Some regions use goto/labels"),
+        "Warning header emitted for structured output:\n{}",
+        out.source
+    );
+}
+
+#[test]
+fn studio_25_quality_checks() {
+    let luau = root().join("tools").join("luau-compile.exe");
+    if !luau.exists() {
+        return; // Skip if compiler is missing
+    }
+
+    let source_path = root()
+        .join("roblox-studio-cases")
+        .join("studio_25_cases.luau");
+    let output = Command::new(&luau)
+        .arg("--binary")
+        .arg("-O1")
+        .arg("-g2")
+        .arg(&source_path)
+        .output()
+        .expect("run luau-compile");
+    assert!(
+        output.status.success(),
+        "Failed to compile studio_25_cases.luau: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let decompiled = decompile(&parse_and_validate(&output.stdout).unwrap());
+
+    // Assert: Studio 25 should be expected to fully structure
+    if decompiled.partial {
+        println!("Decompilation is partial! Printing proto reports:");
+        for report in &decompiled.per_proto {
+            println!(
+                "Proto #{}: {:?} - partial={}, has_unstructured={}",
+                report.index, report.name, report.partial, report.has_unstructured
+            );
+            for note in &report.notes {
+                println!("  Note: {note}");
+            }
+        }
+        panic!("studio_25_cases.luau should be fully structured, but decompile result is partial.");
+    }
+
+    let out = decompiled.source;
+
+    // 1. Output compiles successfully
+    assert!(
+        recompiles(&out, "studio_25_cases"),
+        "Decompiled studio_25_cases must recompile cleanly"
+    );
+
+    // 2. No warning header is emitted (since it structured fully)
+    assert!(
+        !out.contains("-- Some regions use goto/labels"),
+        "Warning header should not be emitted when fully structured"
+    );
+    assert!(
+        !out.contains("goto ") && !out.contains("::L"),
+        "Studio 25 output should not contain raw goto/label fallback:\n{out}"
+    );
+
+    // 3. buttonLoopCapture preserves the captured button variable inside the closure
+    assert!(
+        out.contains("button.Name"),
+        "buttonLoopCapture must preserve the captured button name:\n{out}"
+    );
+
+    // 4. evidenceConfig folds the Evidence table
+    assert!(
+        out.contains("Evidence = {"),
+        "evidenceConfig must fold the Evidence table:\n{out}"
+    );
+    assert!(
+        out.contains("evidenceTypes.GhostOrb"),
+        "evidenceConfig must contain GhostOrb field reference:\n{out}"
+    );
+
+    // 5. signatureInput uses callback names like input
+    assert!(
+        out.contains("Connect(function(input)"),
+        "signatureInput must use callback parameter input:\n{out}"
+    );
+    assert!(
+        out.contains("addStroke(input)"),
+        "signatureInput must keep the accepted mouse-move body:\n{out}"
+    );
+    assert!(
+        out.contains("return Config.forCharacter(player.Character, root)"),
+        "servicesAndRequires must keep the success-path return:\n{out}"
+    );
+
+    // 6. callbackChain keeps the loop-carried state update before the nil guard
+    assert!(
+        out.contains("current = callback(current)"),
+        "callbackChain must preserve loop-carried callback state:\n{out}"
+    );
+    assert!(
+        !out.contains("if callback(current) ~= nil then"),
+        "callbackChain must not inline away the state update:\n{out}"
+    );
+
+    // 7. dataStoreRetry keeps the repeat condition instead of leaking temp comparisons
+    assert!(
+        compact_ws(&out).contains("until saved or tries >= 3"),
+        "dataStoreRetry must recover the repeat-until condition:\n{out}"
+    );
+    assert!(
+        !out.contains("v8 = 3"),
+        "dataStoreRetry must not keep the temporary repeat-limit assignment:\n{out}"
+    );
+    assert!(
+        out.contains("saved = ok"),
+        "dataStoreRetry must preserve the pcall success assignment:\n{out}"
+    );
+
+    // 8. bodyPartCloneWeld/motorOrWeld do not keep dead class-string temps
+    for marker in [
+        "= \"Model\"",
+        "= \"BasePart\"",
+        "= \"UnionOperation\"",
+        "= \"MeshPart\"",
+        "= \"Middle\"",
+    ] {
+        assert!(
+            !out.contains(marker),
+            "dead class-string temp marker {marker} must not survive:\n{out}"
+        );
+    }
+
+    // 9. No obvious dead assignment like map = table.insert survives
+    assert!(
+        !out.contains("map = table.insert"),
+        "obvious dead table.insert assignment must not survive:\n{out}"
+    );
+    assert!(
+        !out.contains("key = 60"),
+        "pure store after a variable's last read must not survive:\n{out}"
+    );
 }

@@ -16,7 +16,20 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Names matching this shape are decompiler-synthesized locals and may be renamed. Debug
 /// names and parameters (`pN`) are left untouched.
 fn is_synthetic(name: &str) -> bool {
-    name.len() >= 2 && name.starts_with('v') && name[1..].chars().all(|c| c.is_ascii_digit())
+    if !name.starts_with('v') || name.len() < 2 {
+        return false;
+    }
+    let rest = &name[1..];
+    if let Some(pos) = rest.find('_') {
+        let before = &rest[..pos];
+        let after = &rest[pos + 1..];
+        !before.is_empty()
+            && before.chars().all(|c| c.is_ascii_digit())
+            && !after.is_empty()
+            && after.chars().all(|c| c.is_ascii_digit())
+    } else {
+        rest.chars().all(|c| c.is_ascii_digit())
+    }
 }
 
 fn is_parameter(name: &str) -> bool {
@@ -263,23 +276,31 @@ impl FactCollector {
                     self.visit_stmts(body);
                 }
                 Stmt::GenericFor { vars, exprs, body } => {
-                    if let Some(Expr::Call(callee, args)) = exprs.first() {
-                        if let Expr::Var(callee_name) = callee.as_ref() {
-                            if callee_name == "ipairs" || callee_name == "pairs" {
-                                if let Some(Expr::Var(list_name)) = args.first() {
-                                    self.add_suggestion(list_name, "items".to_string(), 8);
-
-                                    if vars.len() >= 2 {
-                                        self.add_suggestion(&vars[0], "index".to_string(), 8);
-                                        let item_suggestion = singular(list_name);
-                                        self.add_suggestion(&vars[1], item_suggestion, 10);
-                                    }
+                    if let Some(first_expr) = exprs.first() {
+                        let mut resolved_coll = None;
+                        if let Expr::Call(callee, args) = first_expr {
+                            if let Expr::Var(callee_name) = callee.as_ref() {
+                                if (callee_name == "ipairs" || callee_name == "pairs")
+                                    && !args.is_empty()
+                                {
+                                    resolved_coll = Some(&args[0]);
                                 }
                             }
                         }
-                    } else if vars.len() >= 2 {
-                        self.add_suggestion(&vars[0], "key".to_string(), 5);
-                        self.add_suggestion(&vars[1], "value".to_string(), 5);
+                        let coll_expr = resolved_coll.unwrap_or(first_expr);
+                        if let Some(item_suggestion) = loop_item_suggestion(coll_expr) {
+                            let item_suggestion = lower_first(&item_suggestion);
+                            if vars.len() >= 2 {
+                                self.add_suggestion(&vars[0], "index".to_string(), 8);
+                                self.add_suggestion(&vars[0], "key".to_string(), 5);
+                                self.add_suggestion(&vars[1], item_suggestion, 10);
+                            } else if vars.len() == 1 {
+                                self.add_suggestion(&vars[0], item_suggestion, 10);
+                            }
+                        } else if vars.len() >= 2 {
+                            self.add_suggestion(&vars[0], "key".to_string(), 5);
+                            self.add_suggestion(&vars[1], "value".to_string(), 5);
+                        }
                     }
                     for e in exprs {
                         self.visit_expr(e);
@@ -417,7 +438,11 @@ fn select_name_base(
     collector: &FactCollector,
     is_method: bool,
 ) -> Option<String> {
-    if is_parameter(var) && collector.param_method_receiver.contains(var) && var == "p0" && is_method {
+    if is_parameter(var)
+        && collector.param_method_receiver.contains(var)
+        && var == "p0"
+        && is_method
+    {
         return Some("self".to_string());
     }
 
@@ -442,10 +467,25 @@ fn select_name_base(
 }
 
 /// Compute a rename map for synthesized locals and parameters, keyed by their current name.
+#[allow(dead_code)]
 pub fn smart_rename(
     stmts: &[Stmt],
     hoist_names: &[String],
     is_method: bool,
+) -> BTreeMap<String, String> {
+    smart_rename_with_event(stmts, hoist_names, is_method, None)
+}
+
+fn is_candidate_loop_var(name: &str) -> bool {
+    const LETTERS: &[&str] = &["i", "j", "k", "l", "m", "o", "p", "q", "r", "s"];
+    LETTERS.contains(&name) || name.starts_with("idx")
+}
+
+pub fn smart_rename_with_event(
+    stmts: &[Stmt],
+    hoist_names: &[String],
+    is_method: bool,
+    event_name: Option<&str>,
 ) -> BTreeMap<String, String> {
     let mut candidates: BTreeSet<String> = hoist_names
         .iter()
@@ -456,7 +496,7 @@ pub fn smart_rename(
     let mut all_names = BTreeSet::new();
     collect_used_names(stmts, &mut all_names);
     for name in all_names {
-        if is_parameter(&name) {
+        if is_parameter(&name) || is_synthetic(&name) || is_candidate_loop_var(&name) {
             candidates.insert(name);
         }
     }
@@ -529,6 +569,40 @@ pub fn smart_rename(
                 if let Some(derived) = derive_name(c) {
                     suggs.push((derived, 15));
                 }
+                // Combined property field suggestions (e.g. input.Position -> inputPosition)
+                if let Expr::Field(base, field) = c {
+                    if let Expr::Var(base_name) = base.as_ref() {
+                        let parent_name = base_map
+                            .get(base_name)
+                            .cloned()
+                            .unwrap_or_else(|| base_name.clone());
+                        if parent_name != "self"
+                            && !is_synthetic(&parent_name)
+                            && !is_parameter(&parent_name)
+                        {
+                            suggs.push((format!("{}{}", parent_name, upper_first(field)), 35));
+                        }
+                    }
+                }
+                if let Expr::Index(base, key) = c {
+                    if let Expr::Var(base_name) = base.as_ref() {
+                        if let Expr::Str(lit) = key.as_ref() {
+                            let parent_name = base_map
+                                .get(base_name)
+                                .cloned()
+                                .unwrap_or_else(|| base_name.clone());
+                            if parent_name != "self"
+                                && !is_synthetic(&parent_name)
+                                && !is_parameter(&parent_name)
+                            {
+                                suggs.push((
+                                    format!("{}{}", parent_name, upper_first(&strip_quotes(lit))),
+                                    35,
+                                ));
+                            }
+                        }
+                    }
+                }
             }
             if let Some(acc) = accumulator_name(orig, list) {
                 suggs.push((acc, 20));
@@ -537,6 +611,31 @@ pub fn smart_rename(
 
         if let Some(col_list) = collector.suggestions.get(orig) {
             suggs.extend(col_list.iter().cloned());
+        }
+
+        if let Some(event) = event_name {
+            if is_parameter(orig) {
+                let p_num: u32 = orig[1..].parse().unwrap_or(0);
+                match event {
+                    "InputBegan" | "InputChanged" | "InputEnded" => {
+                        if p_num == 0 {
+                            suggs.push(("input".to_string(), 25));
+                        } else if p_num == 1 {
+                            suggs.push(("gameProcessed".to_string(), 25));
+                        }
+                    }
+                    "PlayerAdded" | "PlayerRemoving" | "OnServerEvent" if p_num == 0 => {
+                        suggs.push(("player".to_string(), 25));
+                    }
+                    "ChildAdded" | "ChildRemoved" if p_num == 0 => {
+                        suggs.push(("child".to_string(), 25));
+                    }
+                    "Touched" if p_num == 0 => {
+                        suggs.push(("hit".to_string(), 25));
+                    }
+                    _ => {}
+                }
+            }
         }
 
         if let Some(base) = select_name_base(orig, &suggs, &collector, is_method) {
@@ -1368,7 +1467,32 @@ fn collection_name(e: &Expr) -> Option<String> {
     }
 }
 
+fn loop_item_suggestion(coll_expr: &Expr) -> Option<String> {
+    if let Expr::MethodCall(recv, method, _) = coll_expr {
+        let m = method.as_str();
+        if m == "GetChildren" || m == "GetDescendants" || m == "GetPlayers" {
+            if let Some(recv_name) = name_from_value(recv) {
+                let s_name = recv_name.to_lowercase();
+                if s_name != "workspace" && s_name != "game" {
+                    return Some(singular(&recv_name));
+                }
+            }
+            if m == "GetChildren" {
+                return Some("child".to_string());
+            } else if m == "GetDescendants" {
+                return Some("descendant".to_string());
+            } else if m == "GetPlayers" {
+                return Some("player".to_string());
+            }
+        }
+    }
+    collection_name(coll_expr).map(|c| singular(&c))
+}
+
 fn singular(s: &str) -> String {
+    if s == "children" {
+        return "child".to_string();
+    }
     if let Some(stem) = s.strip_suffix("ies") {
         format!("{stem}y")
     } else if s.len() > 1 && s.ends_with('s') && !s.ends_with("ss") {
@@ -1473,7 +1597,7 @@ fn call_owner_member(callee: &Expr) -> Option<(String, String)> {
 }
 
 /// Last `.`/`:`/`/`-separated segment of a path-like string.
-fn last_segment(s: &str) -> Option<String> {
+pub(crate) fn last_segment(s: &str) -> Option<String> {
     let seg = s.rsplit(['.', ':', '/']).next().unwrap_or(s).trim();
     if seg.is_empty() {
         None
@@ -1849,5 +1973,56 @@ mod tests {
         }];
         let map = smart_rename(&stmts, &[String::from("v0")], false);
         assert_eq!(map.get("v0").map(String::as_str), Some("end_"));
+    }
+
+    #[test]
+    fn property_field_combined_naming() {
+        let stmts = vec![
+            Stmt::Local {
+                names: vec!["input".into()],
+                values: vec![Expr::Var("p0".into())],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("v0".into())],
+                values: vec![Expr::Field(
+                    Box::new(Expr::Var("input".into())),
+                    "Position".into(),
+                )],
+            },
+        ];
+        let map = smart_rename_with_event(&stmts, &[String::from("v0")], false, None);
+        assert_eq!(map.get("v0").map(String::as_str), Some("inputPosition"));
+    }
+
+    #[test]
+    fn event_callback_parameter_naming() {
+        let stmts = vec![
+            Stmt::Assign {
+                targets: vec![Expr::Var("p0".into())],
+                values: vec![Expr::Num("1".into())],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("p1".into())],
+                values: vec![Expr::Bool(true)],
+            },
+        ];
+        let map = smart_rename_with_event(&stmts, &[], false, Some("InputBegan"));
+        assert_eq!(map.get("p0").map(String::as_str), Some("input"));
+        assert_eq!(map.get("p1").map(String::as_str), Some("gameProcessed"));
+    }
+
+    #[test]
+    fn loop_collections_naming() {
+        let stmts = vec![Stmt::GenericFor {
+            vars: vec!["_".into(), "v0".into()],
+            exprs: vec![Expr::MethodCall(
+                Box::new(Expr::Var("buttons".into())),
+                "GetChildren".into(),
+                vec![],
+            )],
+            body: vec![],
+        }];
+        let map = smart_rename_with_event(&stmts, &[], false, None);
+        assert_eq!(map.get("v0").map(String::as_str), Some("button"));
     }
 }

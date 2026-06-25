@@ -125,6 +125,358 @@ pub fn dead_store_elim(root: &mut Vec<Stmt>, protected: &BTreeSet<String>) {
     }
 }
 
+/// Remove a pure assignment after the variable's final read in the current block. This catches
+/// register-reuse leftovers like `key = 60` where the name was legitimately read earlier, so a
+/// whole-function use count cannot prove the final store dead.
+pub fn remove_dead_pure_stores_after_last_read(root: &mut Vec<Stmt>, protected: &BTreeSet<String>) {
+    while dead_after_last_read_in_block(root, protected) {}
+}
+
+fn dead_after_last_read_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool {
+    for i in 0..block.len() {
+        let Some((name, val)) = sole_var_assign(&block[i]) else {
+            continue;
+        };
+        if protected.contains(&name) || !is_pure(&val) {
+            continue;
+        }
+        if block[i + 1..]
+            .iter()
+            .any(|stmt| stmt_reads_var_recursive(stmt, &name))
+        {
+            continue;
+        }
+        block.remove(i);
+        return true;
+    }
+    false
+}
+
+/// Recover loop-carried callback transforms that compile as:
+///
+/// ```lua
+/// current = callback(current)
+/// if current ~= nil then continue end
+/// return nil
+/// ```
+///
+/// after temporary inlining has reduced the condition to `if callback(current) ~= nil`.
+pub fn recover_loop_carried_call_updates(root: &mut [Stmt]) {
+    for s in root.iter_mut() {
+        for_each_block_mut(s, |b| recover_loop_carried_call_updates(b));
+    }
+
+    let mut i = 0;
+    while i + 1 < root.len() {
+        let Some((target, call)) = loop_carried_call_continue(&root[i]) else {
+            i += 1;
+            continue;
+        };
+        if !matches!(&root[i + 1], Stmt::Return(values) if values.len() == 1 && matches!(values[0], Expr::Nil))
+        {
+            i += 1;
+            continue;
+        }
+
+        root[i] = Stmt::Assign {
+            targets: vec![Expr::Var(target.clone())],
+            values: vec![call],
+        };
+        root[i + 1] = Stmt::If {
+            cond: Expr::Binary("==", Box::new(Expr::Var(target)), Box::new(Expr::Nil)),
+            then_body: vec![Stmt::Return(vec![Expr::Nil])],
+            else_body: Vec::new(),
+        };
+        i += 2;
+    }
+}
+
+fn loop_carried_call_continue(stmt: &Stmt) -> Option<(String, Expr)> {
+    let Stmt::If {
+        cond,
+        then_body,
+        else_body,
+    } = stmt
+    else {
+        return None;
+    };
+    if !else_body.is_empty() || !matches!(then_body.as_slice(), [Stmt::Continue]) {
+        return None;
+    }
+    let Expr::Binary("~=", lhs, rhs) = cond else {
+        return None;
+    };
+    if !matches!(rhs.as_ref(), Expr::Nil) {
+        return None;
+    }
+    let (Expr::Call(_, args) | Expr::MethodCall(_, _, args)) = lhs.as_ref() else {
+        return None;
+    };
+    let Some(Expr::Var(target)) = args.first() else {
+        return None;
+    };
+    Some((target.clone(), *lhs.clone()))
+}
+
+/// Collapse repeat loops that were first recovered from `if cond then return ... end`
+/// guards, so the condition moves back into `until` and temporary comparison registers can
+/// be eliminated by the normal dead-store pass.
+pub fn simplify_repeat_return_guards(root: &mut [Stmt]) {
+    for s in root.iter_mut() {
+        for_each_block_mut(s, |b| simplify_repeat_return_guards(b));
+    }
+
+    let mut i = 0;
+    while i + 1 < root.len() {
+        let return_values = match &root[i + 1] {
+            Stmt::Return(values) => values.clone(),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let Stmt::Repeat { body, cond } = &mut root[i] else {
+            i += 1;
+            continue;
+        };
+
+        let Some(cond_from_temp) = take_trailing_temp_repeat_condition(body, cond) else {
+            i += 1;
+            continue;
+        };
+        let guard_cond = take_trailing_return_guard(body, &return_values);
+        *cond = match guard_cond {
+            Some(guard) => Expr::Binary("or", Box::new(guard), Box::new(cond_from_temp)),
+            None => cond_from_temp,
+        };
+        i += 1;
+    }
+}
+
+fn take_trailing_temp_repeat_condition(body: &mut Vec<Stmt>, cond: &Expr) -> Option<Expr> {
+    let (temp, normalized) = repeat_temp_condition(cond)?;
+    let (assigned, value) = sole_var_assign(body.last()?)?;
+    if assigned != temp {
+        return None;
+    }
+    body.pop();
+    Some(substitute_repeat_temp_condition(normalized, value))
+}
+
+enum RepeatTempCondition {
+    TempLeOther(Expr),
+    OtherLeTemp(Expr),
+}
+
+fn repeat_temp_condition(cond: &Expr) -> Option<(String, RepeatTempCondition)> {
+    match cond {
+        Expr::Binary("<=", lhs, rhs) => match (lhs.as_ref(), rhs.as_ref()) {
+            (Expr::Var(temp), other) => Some((
+                temp.clone(),
+                RepeatTempCondition::TempLeOther(other.clone()),
+            )),
+            (other, Expr::Var(temp)) => Some((
+                temp.clone(),
+                RepeatTempCondition::OtherLeTemp(other.clone()),
+            )),
+            _ => None,
+        },
+        Expr::Binary(">=", lhs, rhs) => match (lhs.as_ref(), rhs.as_ref()) {
+            (Expr::Var(temp), other) => Some((
+                temp.clone(),
+                RepeatTempCondition::OtherLeTemp(other.clone()),
+            )),
+            (other, Expr::Var(temp)) => Some((
+                temp.clone(),
+                RepeatTempCondition::TempLeOther(other.clone()),
+            )),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn substitute_repeat_temp_condition(kind: RepeatTempCondition, value: Expr) -> Expr {
+    match kind {
+        RepeatTempCondition::TempLeOther(other) => {
+            Expr::Binary(">=", Box::new(other), Box::new(value))
+        }
+        RepeatTempCondition::OtherLeTemp(other) => {
+            Expr::Binary("<=", Box::new(other), Box::new(value))
+        }
+    }
+}
+
+fn take_trailing_return_guard(body: &mut Vec<Stmt>, return_values: &[Expr]) -> Option<Expr> {
+    let Stmt::If {
+        cond,
+        then_body,
+        else_body,
+    } = body.last()?
+    else {
+        return None;
+    };
+    if !else_body.is_empty() {
+        return None;
+    }
+    if !matches!(then_body.as_slice(), [Stmt::Return(values)] if values == return_values) {
+        return None;
+    }
+    let cond = cond.clone();
+    body.pop();
+    Some(cond)
+}
+
+/// Remove compiler/debug marker string assignments (`x = "BasePart"`) when the variable is
+/// definitely overwritten or control leaves the block before any read.
+pub fn remove_dead_literal_markers(root: &mut Vec<Stmt>) {
+    remove_dead_literal_markers_with_continuation(root, &[]);
+}
+
+fn remove_dead_literal_markers_with_continuation(root: &mut Vec<Stmt>, continuation: &[Stmt]) {
+    for i in 0..root.len() {
+        let mut after_stmt = root[i + 1..].to_vec();
+        after_stmt.extend_from_slice(continuation);
+        match &mut root[i] {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                remove_dead_literal_markers_with_continuation(then_body, &after_stmt);
+                remove_dead_literal_markers_with_continuation(else_body, &after_stmt);
+            }
+            Stmt::While { body, .. }
+            | Stmt::Repeat { body, .. }
+            | Stmt::NumericFor { body, .. }
+            | Stmt::GenericFor { body, .. } => {
+                remove_dead_literal_markers_with_continuation(body, &[]);
+            }
+            _ => {}
+        }
+    }
+
+    let mut i = 0;
+    while i < root.len() {
+        let Some((name, Expr::Str(_))) = sole_var_assign(&root[i]) else {
+            i += 1;
+            continue;
+        };
+        if literal_marker_dead_before_read(&root[i + 1..], continuation, &name) {
+            root.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn literal_marker_dead_before_read(stmts: &[Stmt], continuation: &[Stmt], name: &str) -> bool {
+    match marker_sequence_flow(stmts.iter().chain(continuation), name) {
+        MarkerFlow::Read | MarkerFlow::Open => false,
+        MarkerFlow::Killed => true,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerFlow {
+    Read,
+    Killed,
+    Open,
+}
+
+fn marker_sequence_flow<'a>(stmts: impl Iterator<Item = &'a Stmt>, name: &str) -> MarkerFlow {
+    for stmt in stmts {
+        match marker_stmt_flow(stmt, name) {
+            MarkerFlow::Open => {}
+            other => return other,
+        }
+    }
+    MarkerFlow::Open
+}
+
+fn marker_block_flow(stmts: &[Stmt], name: &str) -> MarkerFlow {
+    marker_sequence_flow(stmts.iter(), name)
+}
+
+fn marker_stmt_flow(stmt: &Stmt, name: &str) -> MarkerFlow {
+    if stmt_shallow_reads_var(stmt, name) {
+        return MarkerFlow::Read;
+    }
+    if directly_writes_var(stmt, name)
+        || matches!(
+            stmt,
+            Stmt::Return(_) | Stmt::Break | Stmt::Continue | Stmt::Goto(_)
+        )
+    {
+        return MarkerFlow::Killed;
+    }
+
+    match stmt {
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            let then_flow = marker_block_flow(then_body, name);
+            let else_flow = if else_body.is_empty() {
+                MarkerFlow::Open
+            } else {
+                marker_block_flow(else_body, name)
+            };
+            if then_flow == MarkerFlow::Read || else_flow == MarkerFlow::Read {
+                MarkerFlow::Read
+            } else if then_flow == MarkerFlow::Killed && else_flow == MarkerFlow::Killed {
+                MarkerFlow::Killed
+            } else {
+                MarkerFlow::Open
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::NumericFor { body, .. }
+        | Stmt::GenericFor { body, .. } => {
+            if marker_block_flow(body, name) == MarkerFlow::Read {
+                MarkerFlow::Read
+            } else {
+                MarkerFlow::Open
+            }
+        }
+        Stmt::Repeat { body, .. } => marker_block_flow(body, name),
+        _ => MarkerFlow::Open,
+    }
+}
+
+fn stmt_shallow_reads_var(stmt: &Stmt, name: &str) -> bool {
+    let mut counts = BTreeMap::new();
+    match stmt {
+        Stmt::Local { values, .. } => values.iter().for_each(|e| add_reads(e, &mut counts)),
+        Stmt::Assign { targets, values } => {
+            for target in targets {
+                if !matches!(target, Expr::Var(_)) {
+                    add_reads(target, &mut counts);
+                }
+            }
+            values.iter().for_each(|e| add_reads(e, &mut counts));
+        }
+        Stmt::Call(e) => add_reads(e, &mut counts),
+        Stmt::Return(values) => values.iter().for_each(|e| add_reads(e, &mut counts)),
+        Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::Repeat { cond, .. } => {
+            add_reads(cond, &mut counts);
+        }
+        Stmt::NumericFor {
+            start, limit, step, ..
+        } => {
+            add_reads(start, &mut counts);
+            add_reads(limit, &mut counts);
+            if let Some(step) = step {
+                add_reads(step, &mut counts);
+            }
+        }
+        Stmt::GenericFor { exprs, .. } => exprs.iter().for_each(|e| add_reads(e, &mut counts)),
+        Stmt::Break | Stmt::Continue | Stmt::Label(_) | Stmt::Goto(_) | Stmt::Comment(_) => {}
+    }
+    counts.get(name).copied().unwrap_or(0) > 0
+}
+
 /// Total statement count across the whole tree (used to detect cleanup fixpoint).
 pub fn count_stmts(root: &[Stmt]) -> usize {
     let mut n = 0;
@@ -145,8 +497,7 @@ fn write_depends_on_between(
     let mut read_vars = reads_of_expr(key);
     read_vars.extend(reads_of_expr(val));
 
-    for m in (init_idx + 1)..write_idx {
-        let stmt = &root[m];
+    for stmt in root.iter().take(write_idx).skip(init_idx + 1) {
         let written = writes_of_stmt(stmt);
         if !written.is_disjoint(&read_vars) {
             return true;
@@ -175,37 +526,42 @@ pub fn fold_table_literals(root: &mut Vec<Stmt>) {
         let mut writes = Vec::new();
         let mut stop_idx = root.len();
 
-        for k in (i + 1)..root.len() {
-            let stmt = &root[k];
+        for (k, stmt) in root.iter().enumerate().skip(i + 1) {
             let mut is_write = false;
             if let Stmt::Assign { targets, values } = stmt {
                 if targets.len() == 1 && values.len() == 1 {
                     match &targets[0] {
                         Expr::Index(base, key) => {
                             if let Expr::Var(base_name) = base.as_ref() {
-                                if base_name == &t {
-                                    if !expr_reads_var(key, &t) && !expr_reads_var(&values[0], &t) {
-                                        if write_depends_on_between(root, k, i, key, &values[0]) {
-                                            stop_idx = k;
-                                            break;
-                                        }
-                                        writes.push((k, TableField::Keyed(*key.clone(), values[0].clone())));
-                                        is_write = true;
+                                if base_name == &t
+                                    && !expr_reads_var(key, &t)
+                                    && !expr_reads_var(&values[0], &t)
+                                {
+                                    if write_depends_on_between(root, k, i, key, &values[0]) {
+                                        stop_idx = k;
+                                        break;
                                     }
+                                    writes.push((
+                                        k,
+                                        TableField::Keyed(*key.clone(), values[0].clone()),
+                                    ));
+                                    is_write = true;
                                 }
                             }
                         }
                         Expr::Field(base, field) => {
                             if let Expr::Var(base_name) = base.as_ref() {
-                                if base_name == &t {
-                                    if !expr_reads_var(&values[0], &t) {
-                                        if write_depends_on_between(root, k, i, &Expr::Nil, &values[0]) {
-                                            stop_idx = k;
-                                            break;
-                                        }
-                                        writes.push((k, TableField::Named(field.clone(), values[0].clone())));
-                                        is_write = true;
+                                if base_name == &t && !expr_reads_var(&values[0], &t) {
+                                    if write_depends_on_between(root, k, i, &Expr::Nil, &values[0])
+                                    {
+                                        stop_idx = k;
+                                        break;
                                     }
+                                    writes.push((
+                                        k,
+                                        TableField::Named(field.clone(), values[0].clone()),
+                                    ));
+                                    is_write = true;
                                 }
                             }
                         }
@@ -232,21 +588,21 @@ pub fn fold_table_literals(root: &mut Vec<Stmt>) {
         }
 
         let mut uses = BTreeMap::new();
-        for k in (i + 1)..root.len() {
-            count_uses_stmt(&root[k], &mut uses);
+        for stmt in root.iter().skip(i + 1) {
+            count_uses_stmt(stmt, &mut uses);
         }
 
         let mut inline_map = BTreeMap::new();
         let mut def_indices = BTreeSet::new();
 
-        for k in (i + 1)..stop_idx {
-            if let Some((var_name, def_val)) = sole_var_assign(&root[k]) {
+        for (k, stmt) in root.iter().enumerate().take(stop_idx).skip(i + 1) {
+            if let Some((var_name, def_val)) = sole_var_assign(stmt) {
                 if uses.get(&var_name).copied().unwrap_or(0) == 1 && is_pure(&def_val) {
-                    let read_in_writes = writes.iter().any(|(_, field)| {
-                        match field {
-                            TableField::Item(e) => expr_reads_var(e, &var_name),
-                            TableField::Named(_, e) => expr_reads_var(e, &var_name),
-                            TableField::Keyed(k, v) => expr_reads_var(k, &var_name) || expr_reads_var(v, &var_name),
+                    let read_in_writes = writes.iter().any(|(_, field)| match field {
+                        TableField::Item(e) => expr_reads_var(e, &var_name),
+                        TableField::Named(_, e) => expr_reads_var(e, &var_name),
+                        TableField::Keyed(k, v) => {
+                            expr_reads_var(k, &var_name) || expr_reads_var(v, &var_name)
                         }
                     });
                     if read_in_writes {
@@ -292,7 +648,8 @@ pub fn fold_table_literals(root: &mut Vec<Stmt>) {
         replace_table_init(&mut root[i], final_fields);
 
         let write_indices: BTreeSet<usize> = writes.iter().map(|(idx, _)| *idx).collect();
-        let indices_to_remove: BTreeSet<usize> = write_indices.union(&def_indices).cloned().collect();
+        let indices_to_remove: BTreeSet<usize> =
+            write_indices.union(&def_indices).cloned().collect();
 
         for idx in indices_to_remove.into_iter().rev() {
             root.remove(idx);
@@ -392,7 +749,6 @@ fn replace_inline_expr(e: &mut Expr, inline_map: &BTreeMap<String, Expr>) {
         _ => {}
     }
 }
-
 
 /// Inline temporary table literals that are immediately stored into another table:
 ///
@@ -496,7 +852,6 @@ fn replace_table_init(s: &mut Stmt, fields: Vec<TableField>) {
     }
 }
 
-
 /// Drop statements after a `return`/`break`/`continue`/`goto` in each block. A flush of the inline
 /// cache can append assignments after a terminator; that code is both unreachable and (for
 /// `return`) not even valid Luau, so it must go. Statements at or after a `::label::` are kept,
@@ -546,16 +901,41 @@ pub fn recover_and_or(root: &mut Vec<Stmt>) {
     for s in root.iter_mut() {
         for_each_block_mut(s, recover_and_or);
     }
-    let mut i = 0;
-    while i + 2 < root.len() {
-        if let Some(rewritten) = match_and_or(&root[i], &root[i + 1], &root[i + 2]) {
-            root[i] = rewritten;
-            root.remove(i + 2);
-            root.remove(i + 1);
-            // Re-check at i so `a and b and c or d` style chains collapse.
-            continue;
+    loop {
+        let mut changed = false;
+        let mut i = 0;
+        while i < root.len() {
+            if i + 2 < root.len() {
+                if let Some(rewritten) = match_and_or(&root[i], &root[i + 1], &root[i + 2]) {
+                    root[i] = rewritten;
+                    root.remove(i + 2);
+                    root.remove(i + 1);
+                    changed = true;
+                    continue;
+                }
+                if let Some(rewritten) =
+                    match_guard_label_and_or(&root[i], &root[i + 1], &root[i + 2])
+                {
+                    root[i] = rewritten;
+                    root.remove(i + 2);
+                    root.remove(i + 1);
+                    changed = true;
+                    continue;
+                }
+            }
+            if i + 1 < root.len() {
+                if let Some(rewritten) = match_missing_label_and_or(root, i) {
+                    root[i] = rewritten;
+                    root.remove(i + 1);
+                    changed = true;
+                    continue;
+                }
+            }
+            i += 1;
         }
-        i += 1;
+        if !changed {
+            break;
+        }
     }
 }
 
@@ -617,6 +997,176 @@ fn match_and_or(s0: &Stmt, s1: &Stmt, s2: &Stmt) -> Option<Stmt> {
     Some(Stmt::Assign {
         targets: vec![Expr::Var(z)],
         values: vec![expr],
+    })
+}
+
+fn match_missing_label_and_or(root: &[Stmt], i: usize) -> Option<Stmt> {
+    // Reduced `(a and a.x) or fallback` shape after the join label has already been
+    // removed. Keep this narrow: the inner condition must be a field matching the local
+    // being initialized.
+    let Stmt::If {
+        cond,
+        then_body,
+        else_body,
+    } = &root[i]
+    else {
+        return None;
+    };
+    if !else_body.is_empty() || then_body.len() != 1 {
+        return None;
+    }
+    let Stmt::If {
+        cond: inner_cond,
+        then_body: inner_then,
+        else_body: inner_else,
+    } = &then_body[0]
+    else {
+        return None;
+    };
+    if !inner_else.is_empty() || inner_then.len() != 1 {
+        return None;
+    }
+    let Stmt::Goto(label) = &inner_then[0] else {
+        return None;
+    };
+    if label_exists(root, label) {
+        return None;
+    }
+
+    let (target, fallback, is_local) = match &root[i + 1] {
+        Stmt::Local { names, values } if names.len() == 1 && values.len() == 1 => {
+            (names[0].clone(), values[0].clone(), true)
+        }
+        Stmt::Assign { targets, values } if targets.len() == 1 && values.len() == 1 => {
+            let Expr::Var(name) = &targets[0] else {
+                return None;
+            };
+            (name.clone(), values[0].clone(), false)
+        }
+        _ => return None,
+    };
+    if !expr_field_matches_name(inner_cond, &target) {
+        return None;
+    }
+
+    let value = Expr::Binary(
+        "or",
+        Box::new(Expr::Binary(
+            "and",
+            Box::new(cond.clone()),
+            Box::new(inner_cond.clone()),
+        )),
+        Box::new(fallback),
+    );
+    if is_local {
+        Some(Stmt::Local {
+            names: vec![target],
+            values: vec![value],
+        })
+    } else {
+        Some(Stmt::Assign {
+            targets: vec![Expr::Var(target)],
+            values: vec![value],
+        })
+    }
+}
+
+fn match_guard_label_and_or(s0: &Stmt, s1: &Stmt, s2: &Stmt) -> Option<Stmt> {
+    let (label, target, is_local, value) = guard_and_or_parts(s0, s1)?;
+    match s2 {
+        Stmt::Label(name) if *name == label => {
+            if is_local {
+                Some(Stmt::Local {
+                    names: vec![target],
+                    values: vec![value],
+                })
+            } else {
+                Some(Stmt::Assign {
+                    targets: vec![Expr::Var(target)],
+                    values: vec![value],
+                })
+            }
+        }
+        _ => None,
+    }
+}
+
+fn guard_and_or_parts(s0: &Stmt, s1: &Stmt) -> Option<(String, String, bool, Expr)> {
+    let Stmt::If {
+        cond,
+        then_body,
+        else_body,
+    } = s0
+    else {
+        return None;
+    };
+    if !else_body.is_empty() || then_body.len() != 1 {
+        return None;
+    }
+    let Stmt::If {
+        cond: inner_cond,
+        then_body: inner_then,
+        else_body: inner_else,
+    } = &then_body[0]
+    else {
+        return None;
+    };
+    if !inner_else.is_empty() || inner_then.len() != 1 {
+        return None;
+    }
+    let Stmt::Goto(label) = &inner_then[0] else {
+        return None;
+    };
+
+    let (target, fallback, is_local) = match s1 {
+        Stmt::Local { names, values } if names.len() == 1 && values.len() == 1 => {
+            (names[0].clone(), values[0].clone(), true)
+        }
+        Stmt::Assign { targets, values } if targets.len() == 1 && values.len() == 1 => {
+            let Expr::Var(name) = &targets[0] else {
+                return None;
+            };
+            (name.clone(), values[0].clone(), false)
+        }
+        _ => return None,
+    };
+    if !expr_field_matches_name(inner_cond, &target) {
+        return None;
+    }
+
+    let value = Expr::Binary(
+        "or",
+        Box::new(Expr::Binary(
+            "and",
+            Box::new(cond.clone()),
+            Box::new(inner_cond.clone()),
+        )),
+        Box::new(fallback.clone()),
+    );
+    Some((label.clone(), target, is_local, value))
+}
+
+fn expr_field_matches_name(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Field(_, field) => field == name,
+        Expr::Index(_, key) => matches!(key.as_ref(), Expr::Str(s) if s.trim_matches('"') == name),
+        _ => false,
+    }
+}
+
+fn label_exists(stmts: &[Stmt], label: &str) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Label(name) => name == label,
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => label_exists(then_body, label) || label_exists(else_body, label),
+        Stmt::While { body, .. }
+        | Stmt::Repeat { body, .. }
+        | Stmt::NumericFor { body, .. }
+        | Stmt::GenericFor { body, .. } => label_exists(body, label),
+        _ => false,
     })
 }
 
@@ -1096,13 +1646,7 @@ fn collect_goto_names(stmt: &Stmt, names: &mut BTreeSet<String>) {
 fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool {
     // Recurse into nested blocks first.
     for s in block.iter_mut() {
-        let mut changed = false;
-        for_each_block_mut(s, |b| {
-            if !changed {
-                changed = inline_in_block(b, protected);
-            }
-        });
-        if changed {
+        if inline_nested_block(s, protected) {
             return true;
         }
     }
@@ -1196,6 +1740,25 @@ fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool 
     false
 }
 
+fn inline_nested_block(s: &mut Stmt, protected: &BTreeSet<String>) -> bool {
+    match s {
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => inline_in_block(then_body, protected) || inline_in_block(else_body, protected),
+        Stmt::While { cond, body } | Stmt::Repeat { body, cond } => {
+            let mut loop_protected = protected.clone();
+            loop_protected.extend(reads_of_expr(cond));
+            inline_in_block(body, &loop_protected)
+        }
+        Stmt::NumericFor { body, .. } | Stmt::GenericFor { body, .. } => {
+            inline_in_block(body, protected)
+        }
+        _ => false,
+    }
+}
+
 /// The variable read first when evaluating an expression (its receiver/leftmost operand),
 /// if evaluation begins by reading a variable.
 fn expr_head(e: &Expr) -> Option<&str> {
@@ -1283,13 +1846,7 @@ fn dead_in_block(
 
 fn dead_overwritten_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool {
     for s in block.iter_mut() {
-        let mut changed = false;
-        for_each_block_mut(s, |b| {
-            if !changed {
-                changed = dead_overwritten_in_block(b, protected);
-            }
-        });
-        if changed {
+        if dead_overwritten_nested_block(s, protected) {
             return true;
         }
     }
@@ -1322,6 +1879,28 @@ fn dead_overwritten_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>
         return true;
     }
     false
+}
+
+fn dead_overwritten_nested_block(s: &mut Stmt, protected: &BTreeSet<String>) -> bool {
+    match s {
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            dead_overwritten_in_block(then_body, protected)
+                || dead_overwritten_in_block(else_body, protected)
+        }
+        Stmt::While { cond, body } | Stmt::Repeat { body, cond } => {
+            let mut loop_protected = protected.clone();
+            loop_protected.extend(reads_of_expr(cond));
+            dead_overwritten_in_block(body, &loop_protected)
+        }
+        Stmt::NumericFor { body, .. } | Stmt::GenericFor { body, .. } => {
+            dead_overwritten_in_block(body, protected)
+        }
+        _ => false,
+    }
 }
 
 // --- counting --------------------------------------------------------------------------
@@ -1726,7 +2305,9 @@ pub fn remove_redundant_gotos(root: &mut Vec<Stmt>) {
                     }
                 }
             }
-            if next_idx < root.len() && matches!(&root[next_idx], Stmt::Label(target) if target == &label) {
+            if next_idx < root.len()
+                && matches!(&root[next_idx], Stmt::Label(target) if target == &label)
+            {
                 continue;
             }
         }
@@ -1759,7 +2340,12 @@ pub fn remove_trailing_sibling_gotos(root: &mut Vec<Stmt>) {
         }
 
         if let Some(label_name) = next_label {
-            if let Stmt::If { cond, then_body, else_body } = &mut root[i] {
+            if let Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } = &mut root[i]
+            {
                 if let Some(Stmt::Goto(name)) = then_body.last() {
                     if name == &label_name {
                         then_body.pop();
@@ -1833,7 +2419,10 @@ fn recover_if_else_once(root: &mut Vec<Stmt>) -> bool {
         let Some((exit_cond, l_else)) = conditional_goto_expr(&root[i], None) else {
             continue;
         };
-        let Some(else_idx) = root.iter().position(|s| matches!(s, Stmt::Label(l) if l == &l_else)) else {
+        let Some(else_idx) = root
+            .iter()
+            .position(|s| matches!(s, Stmt::Label(l) if l == &l_else))
+        else {
             continue;
         };
         if else_idx <= i + 1 {
@@ -1843,7 +2432,10 @@ fn recover_if_else_once(root: &mut Vec<Stmt>) -> bool {
             Stmt::Goto(l) => l.clone(),
             _ => continue,
         };
-        let Some(end_idx) = root.iter().position(|s| matches!(s, Stmt::Label(l) if l == &l_end)) else {
+        let Some(end_idx) = root
+            .iter()
+            .position(|s| matches!(s, Stmt::Label(l) if l == &l_end))
+        else {
             continue;
         };
         if end_idx <= else_idx {
@@ -1870,7 +2462,165 @@ pub fn recover_backward_goto_while(root: &mut Vec<Stmt>) {
     for s in root.iter_mut() {
         for_each_block_mut(s, recover_backward_goto_while);
     }
-    while recover_backward_goto_while_once(root) {}
+    let mut changed = true;
+    while changed {
+        changed = recover_backward_goto_while_once(root)
+            || recover_while_with_condition_load(root)
+            || recover_repeat_return_goto_once(root);
+    }
+}
+
+fn recover_repeat_return_goto_once(root: &mut Vec<Stmt>) -> bool {
+    for i in 0..root.len() {
+        let Stmt::Label(label_name) = &root[i] else {
+            continue;
+        };
+        let label_name = label_name.clone();
+        let Some(goto_idx) = root[i + 1..]
+            .iter()
+            .position(|s| matches!(s, Stmt::Goto(name) if name == &label_name))
+            .map(|offset| i + 1 + offset)
+        else {
+            continue;
+        };
+        if count_gotos_named(root, &label_name) != 1 || goto_idx <= i + 1 {
+            continue;
+        }
+
+        let mut conds = Vec::new();
+        let mut return_values: Option<Vec<Expr>> = None;
+        let mut first_cond_idx = goto_idx;
+
+        while first_cond_idx > i + 1 {
+            let idx = first_cond_idx - 1;
+            let Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } = &root[idx]
+            else {
+                break;
+            };
+            if !else_body.is_empty() || then_body.len() != 1 {
+                break;
+            }
+            let Stmt::Return(values) = &then_body[0] else {
+                break;
+            };
+            if let Some(existing) = &return_values {
+                if existing != values {
+                    break;
+                }
+            } else {
+                return_values = Some(values.clone());
+            }
+            conds.push(cond.clone());
+            first_cond_idx = idx;
+        }
+
+        if conds.is_empty()
+            || first_cond_idx <= i + 1
+            || contains_label_or_goto(&root[i + 1..first_cond_idx])
+        {
+            continue;
+        }
+
+        conds.reverse();
+        let Some(cond) = or_all(conds) else {
+            continue;
+        };
+        let values = return_values.unwrap_or_default();
+        let body = root[i + 1..first_cond_idx].to_vec();
+        root[i] = Stmt::Repeat { body, cond };
+        root.drain(i + 1..=goto_idx);
+        root.insert(i + 1, Stmt::Return(values));
+        return true;
+    }
+    false
+}
+
+fn recover_while_with_condition_load(root: &mut Vec<Stmt>) -> bool {
+    for i in 0..root.len() {
+        let Stmt::Label(label_name) = &root[i] else {
+            continue;
+        };
+        let label_name = label_name.clone();
+
+        if i + 2 >= root.len() {
+            continue;
+        }
+
+        let (cond_var, cond_expr) = match &root[i + 1] {
+            Stmt::Local { names, values } if names.len() == 1 && values.len() == 1 => {
+                (names[0].clone(), values[0].clone())
+            }
+            Stmt::Assign { targets, values } if targets.len() == 1 && values.len() == 1 => {
+                if let Expr::Var(name) = &targets[0] {
+                    (name.clone(), values[0].clone())
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+
+        let Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } = &root[i + 2]
+        else {
+            continue;
+        };
+
+        let matches_cond = match cond {
+            Expr::Unary("not ", expr) => {
+                if let Expr::Var(name) = &**expr {
+                    name == &cond_var
+                } else {
+                    false
+                }
+            }
+            Expr::Var(name) => name == &cond_var,
+            _ => false,
+        };
+        if !matches_cond {
+            continue;
+        }
+
+        if then_body.is_empty() {
+            continue;
+        }
+        let last_idx = then_body.len() - 1;
+        let Stmt::Goto(goto_target) = &then_body[last_idx] else {
+            continue;
+        };
+        if goto_target != &label_name {
+            continue;
+        }
+
+        if !else_body.is_empty() {
+            continue;
+        }
+
+        let loop_body = then_body[..last_idx].to_vec();
+
+        let loop_cond = if let Expr::Unary("not ", _) = cond {
+            negate_condition(cond_expr)
+        } else {
+            cond_expr
+        };
+
+        let while_stmt = Stmt::While {
+            cond: loop_cond,
+            body: loop_body,
+        };
+
+        root[i] = while_stmt;
+        root.drain(i + 1..=i + 2);
+        return true;
+    }
+    false
 }
 
 fn recover_backward_goto_while_once(root: &mut Vec<Stmt>) -> bool {
@@ -1880,8 +2630,8 @@ fn recover_backward_goto_while_once(root: &mut Vec<Stmt>) -> bool {
         };
         let label_name = label_name.clone();
         let mut goto_idx = None;
-        for k in (i + 1)..root.len() {
-            if let Stmt::Goto(name) = &root[k] {
+        for (k, stmt) in root.iter().enumerate().skip(i + 1) {
+            if let Stmt::Goto(name) = stmt {
                 if name == &label_name {
                     goto_idx = Some(k);
                     break;
@@ -1900,7 +2650,10 @@ fn recover_backward_goto_while_once(root: &mut Vec<Stmt>) -> bool {
         let Some((exit_cond, exit_label)) = conditional_goto_expr(&root[i + 1], None) else {
             continue;
         };
-        let Some(exit_idx) = root.iter().position(|s| matches!(s, Stmt::Label(l) if l == &exit_label)) else {
+        let Some(exit_idx) = root
+            .iter()
+            .position(|s| matches!(s, Stmt::Label(l) if l == &exit_label))
+        else {
             continue;
         };
         if exit_idx < j {
@@ -1924,7 +2677,10 @@ fn recover_backward_goto_while_once(root: &mut Vec<Stmt>) -> bool {
         root.drain(i + 1..=j);
 
         if count_gotos_named(root, &exit_label) == 0 {
-            if let Some(pos) = root.iter().position(|s| matches!(s, Stmt::Label(l) if l == &exit_label)) {
+            if let Some(pos) = root
+                .iter()
+                .position(|s| matches!(s, Stmt::Label(l) if l == &exit_label))
+            {
                 root.remove(pos);
             }
         }
@@ -1976,6 +2732,412 @@ fn has_goto_in_nested_loop(stmts: &[Stmt], target_label: &str, in_loop: bool) ->
         }
     }
     false
+}
+
+// --- Register/Value Splitting (Slice 5) --------------------------------------------------
+
+fn is_synthetic(name: &str) -> bool {
+    if !name.starts_with('v') || name.len() < 2 {
+        return false;
+    }
+    let rest = &name[1..];
+    if let Some(pos) = rest.find('_') {
+        let before = &rest[..pos];
+        let after = &rest[pos + 1..];
+        !before.is_empty()
+            && before.chars().all(|c| c.is_ascii_digit())
+            && !after.is_empty()
+            && after.chars().all(|c| c.is_ascii_digit())
+    } else {
+        rest.chars().all(|c| c.is_ascii_digit())
+    }
+}
+
+fn is_parameter(name: &str) -> bool {
+    name.len() >= 2 && name.starts_with('p') && name[1..].chars().all(|c| c.is_ascii_digit())
+}
+
+fn collect_unsplittable(stmts: &[Stmt], in_nested: bool, unsplittable: &mut BTreeSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                collect_expr_vars(cond, in_nested, unsplittable);
+                collect_unsplittable(then_body, true, unsplittable);
+                collect_unsplittable(else_body, true, unsplittable);
+            }
+            Stmt::While { cond, body } => {
+                collect_expr_vars(cond, true, unsplittable);
+                collect_unsplittable(body, true, unsplittable);
+            }
+            Stmt::Repeat { body, cond } => {
+                collect_unsplittable(body, true, unsplittable);
+                collect_expr_vars(cond, true, unsplittable);
+            }
+            Stmt::NumericFor {
+                var,
+                start,
+                limit,
+                step,
+                body,
+            } => {
+                unsplittable.insert(var.clone());
+                collect_expr_vars(start, true, unsplittable);
+                collect_expr_vars(limit, true, unsplittable);
+                if let Some(step_expr) = step {
+                    collect_expr_vars(step_expr, true, unsplittable);
+                }
+                collect_unsplittable(body, true, unsplittable);
+            }
+            Stmt::GenericFor { vars, exprs, body } => {
+                for v in vars {
+                    unsplittable.insert(v.clone());
+                }
+                for e in exprs {
+                    collect_expr_vars(e, true, unsplittable);
+                }
+                collect_unsplittable(body, true, unsplittable);
+            }
+            Stmt::Local { names, values } => {
+                for name in names {
+                    if in_nested {
+                        unsplittable.insert(name.clone());
+                    }
+                }
+                for val in values {
+                    collect_expr_vars(val, in_nested, unsplittable);
+                }
+            }
+            Stmt::Assign { targets, values } => {
+                for t in targets {
+                    collect_expr_vars(t, in_nested, unsplittable);
+                }
+                for val in values {
+                    collect_expr_vars(val, in_nested, unsplittable);
+                }
+            }
+            Stmt::Call(expr) => {
+                collect_expr_vars(expr, in_nested, unsplittable);
+            }
+            Stmt::Return(exprs) => {
+                for e in exprs {
+                    collect_expr_vars(e, in_nested, unsplittable);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_expr_vars(e: &Expr, in_nested: bool, unsplittable: &mut BTreeSet<String>) {
+    match e {
+        Expr::Var(name) if in_nested => {
+            unsplittable.insert(name.clone());
+        }
+        Expr::Raw(text) => {
+            for word in text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+                if is_synthetic(word) || is_parameter(word) {
+                    unsplittable.insert(word.to_string());
+                }
+            }
+        }
+        Expr::Index(t, k) => {
+            collect_expr_vars(t, in_nested, unsplittable);
+            collect_expr_vars(k, in_nested, unsplittable);
+        }
+        Expr::Field(t, _) => {
+            collect_expr_vars(t, in_nested, unsplittable);
+        }
+        Expr::Call(f, args) => {
+            collect_expr_vars(f, in_nested, unsplittable);
+            for arg in args {
+                collect_expr_vars(arg, in_nested, unsplittable);
+            }
+        }
+        Expr::MethodCall(o, _, args) => {
+            collect_expr_vars(o, in_nested, unsplittable);
+            for arg in args {
+                collect_expr_vars(arg, in_nested, unsplittable);
+            }
+        }
+        Expr::Unary(_, a) => {
+            collect_expr_vars(a, in_nested, unsplittable);
+        }
+        Expr::Binary(_, a, b) => {
+            collect_expr_vars(a, in_nested, unsplittable);
+            collect_expr_vars(b, in_nested, unsplittable);
+        }
+        Expr::Table(fields) => {
+            for f in fields {
+                match f {
+                    TableField::Item(e) | TableField::Named(_, e) => {
+                        collect_expr_vars(e, in_nested, unsplittable);
+                    }
+                    TableField::Keyed(k, v) => {
+                        collect_expr_vars(k, in_nested, unsplittable);
+                        collect_expr_vars(v, in_nested, unsplittable);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_block_vars(stmts: &[Stmt], vars: &mut BTreeSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Local { names, values } => {
+                for name in names {
+                    vars.insert(name.clone());
+                }
+                for val in values {
+                    collect_expr_vars_simple(val, vars);
+                }
+            }
+            Stmt::Assign { targets, values } => {
+                for t in targets {
+                    collect_expr_vars_simple(t, vars);
+                }
+                for val in values {
+                    collect_expr_vars_simple(val, vars);
+                }
+            }
+            Stmt::Call(e) => collect_expr_vars_simple(e, vars),
+            Stmt::Return(es) => es.iter().for_each(|e| collect_expr_vars_simple(e, vars)),
+            Stmt::If { cond, .. } => collect_expr_vars_simple(cond, vars),
+            Stmt::While { cond, .. } => collect_expr_vars_simple(cond, vars),
+            Stmt::Repeat { cond, .. } => collect_expr_vars_simple(cond, vars),
+            _ => {}
+        }
+    }
+}
+
+fn collect_expr_vars_simple(e: &Expr, vars: &mut BTreeSet<String>) {
+    match e {
+        Expr::Var(name) => {
+            vars.insert(name.clone());
+        }
+        Expr::Index(t, k) => {
+            collect_expr_vars_simple(t, vars);
+            collect_expr_vars_simple(k, vars);
+        }
+        Expr::Field(t, _) => {
+            collect_expr_vars_simple(t, vars);
+        }
+        Expr::Call(f, args) => {
+            collect_expr_vars_simple(f, vars);
+            for arg in args {
+                collect_expr_vars_simple(arg, vars);
+            }
+        }
+        Expr::MethodCall(o, _, args) => {
+            collect_expr_vars_simple(o, vars);
+            for arg in args {
+                collect_expr_vars_simple(arg, vars);
+            }
+        }
+        Expr::Unary(_, a) => {
+            collect_expr_vars_simple(a, vars);
+        }
+        Expr::Binary(_, a, b) => {
+            collect_expr_vars_simple(a, vars);
+            collect_expr_vars_simple(b, vars);
+        }
+        Expr::Table(fields) => {
+            for f in fields {
+                match f {
+                    TableField::Item(e) | TableField::Named(_, e) => {
+                        collect_expr_vars_simple(e, vars);
+                    }
+                    TableField::Keyed(k, v) => {
+                        collect_expr_vars_simple(k, vars);
+                        collect_expr_vars_simple(v, vars);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rename_var_in_expr(e: &mut Expr, var: &str, new_name: &str) {
+    match e {
+        Expr::Var(name) if name == var => {
+            *name = new_name.to_string();
+        }
+        Expr::Index(t, k) => {
+            rename_var_in_expr(t, var, new_name);
+            rename_var_in_expr(k, var, new_name);
+        }
+        Expr::Field(t, _) => {
+            rename_var_in_expr(t, var, new_name);
+        }
+        Expr::Call(f, args) => {
+            rename_var_in_expr(f, var, new_name);
+            for arg in args {
+                rename_var_in_expr(arg, var, new_name);
+            }
+        }
+        Expr::MethodCall(o, _, args) => {
+            rename_var_in_expr(o, var, new_name);
+            for arg in args {
+                rename_var_in_expr(arg, var, new_name);
+            }
+        }
+        Expr::Unary(_, a) => {
+            rename_var_in_expr(a, var, new_name);
+        }
+        Expr::Binary(_, a, b) => {
+            rename_var_in_expr(a, var, new_name);
+            rename_var_in_expr(b, var, new_name);
+        }
+        Expr::Table(fields) => {
+            for f in fields {
+                match f {
+                    TableField::Item(e) | TableField::Named(_, e) => {
+                        rename_var_in_expr(e, var, new_name);
+                    }
+                    TableField::Keyed(k, v) => {
+                        rename_var_in_expr(k, var, new_name);
+                        rename_var_in_expr(v, var, new_name);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rename_var_in_stmt(s: &mut Stmt, var: &str, read_ver: usize, write_ver: usize) {
+    let read_name = format!("{var}_{read_ver}");
+    let write_name = format!("{var}_{write_ver}");
+    match s {
+        Stmt::Local { names, values } => {
+            for val in values {
+                rename_var_in_expr(val, var, &read_name);
+            }
+            for name in names {
+                if name == var {
+                    *name = write_name.clone();
+                }
+            }
+        }
+        Stmt::Assign { targets, values } => {
+            for val in values {
+                rename_var_in_expr(val, var, &read_name);
+            }
+            for target in targets {
+                match target {
+                    Expr::Var(name) if name == var => {
+                        *name = write_name.clone();
+                    }
+                    _ => {
+                        rename_var_in_expr(target, var, &read_name);
+                    }
+                }
+            }
+        }
+        Stmt::Call(e) => {
+            rename_var_in_expr(e, var, &read_name);
+        }
+        Stmt::Return(es) => {
+            for e in es {
+                rename_var_in_expr(e, var, &read_name);
+            }
+        }
+        Stmt::If { cond, .. } => {
+            rename_var_in_expr(cond, var, &read_name);
+        }
+        Stmt::While { cond, .. } => {
+            rename_var_in_expr(cond, var, &read_name);
+        }
+        Stmt::Repeat { cond, .. } => {
+            rename_var_in_expr(cond, var, &read_name);
+        }
+        _ => {}
+    }
+}
+
+fn split_reused_registers_in_block(stmts: &mut [Stmt], unsplittable: &BTreeSet<String>) {
+    // 1. Recurse into subblocks
+    for s in stmts.iter_mut() {
+        match s {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                split_reused_registers_in_block(then_body, unsplittable);
+                split_reused_registers_in_block(else_body, unsplittable);
+            }
+            Stmt::While { body, .. } => {
+                split_reused_registers_in_block(body, unsplittable);
+            }
+            Stmt::Repeat { body, .. } => {
+                split_reused_registers_in_block(body, unsplittable);
+            }
+            Stmt::NumericFor { body, .. } => {
+                split_reused_registers_in_block(body, unsplittable);
+            }
+            Stmt::GenericFor { body, .. } => {
+                split_reused_registers_in_block(body, unsplittable);
+            }
+            _ => {}
+        }
+    }
+
+    // 2. Process current block candidates
+    let mut candidates = BTreeSet::new();
+    collect_block_vars(stmts, &mut candidates);
+    let candidates: Vec<String> = candidates
+        .into_iter()
+        .filter(|name| is_synthetic(name) && !unsplittable.contains(name))
+        .collect();
+
+    for var in candidates {
+        let mut current_version = 1;
+        let mut stmt_versions = Vec::new();
+        let mut ever_written = false;
+        let mut referenced = false;
+
+        for s in stmts.iter() {
+            let reads = stmt_reads_var(s, &var);
+            let writes = directly_writes_var(s, &var);
+
+            let read_ver = current_version;
+            let mut write_ver = current_version;
+
+            if writes {
+                if ever_written || reads {
+                    current_version += 1;
+                    write_ver = current_version;
+                }
+                ever_written = true;
+            }
+            if reads || writes {
+                referenced = true;
+            }
+
+            stmt_versions.push((read_ver, write_ver));
+        }
+
+        if referenced && current_version > 1 {
+            for (i, s) in stmts.iter_mut().enumerate() {
+                let (read_ver, write_ver) = stmt_versions[i];
+                rename_var_in_stmt(s, &var, read_ver, write_ver);
+            }
+        }
+    }
+}
+
+pub fn split_reused_registers(stmts: &mut [Stmt], protected: &BTreeSet<String>) {
+    let mut unsplittable = protected.clone();
+    collect_unsplittable(stmts, false, &mut unsplittable);
+    split_reused_registers_in_block(stmts, &unsplittable);
 }
 
 #[cfg(test)]
@@ -2067,6 +3229,262 @@ mod tests {
             !rendered.contains("local tmp = {ConstraintType"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn recovers_loop_carried_callback_update_before_nil_guard() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Binary(
+                    "~=",
+                    Box::new(Expr::Call(
+                        Box::new(Expr::Var("callback".into())),
+                        vec![Expr::Var("current".into())],
+                    )),
+                    Box::new(Expr::Nil),
+                ),
+                then_body: vec![Stmt::Continue],
+                else_body: Vec::new(),
+            },
+            Stmt::Return(vec![Expr::Nil]),
+        ];
+
+        recover_loop_carried_call_updates(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(
+            rendered.contains("current = callback(current)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("if current == nil then"), "{rendered}");
+        assert!(rendered.contains("return nil"), "{rendered}");
+        assert!(!rendered.contains("if callback(current)"), "{rendered}");
+    }
+
+    #[test]
+    fn simplifies_repeat_return_guard_and_temp_limit() {
+        let mut stmts = vec![
+            Stmt::Repeat {
+                body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("tries".into())],
+                        values: vec![Expr::Binary(
+                            "+",
+                            Box::new(Expr::Var("tries".into())),
+                            Box::new(Expr::Num("1".into())),
+                        )],
+                    },
+                    Stmt::If {
+                        cond: Expr::Var("saved".into()),
+                        then_body: vec![Stmt::Return(vec![
+                            Expr::Var("saved".into()),
+                            Expr::Var("lastError".into()),
+                        ])],
+                        else_body: Vec::new(),
+                    },
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("v8".into())],
+                        values: vec![Expr::Num("3".into())],
+                    },
+                ],
+                cond: Expr::Binary(
+                    "<=",
+                    Box::new(Expr::Var("v8".into())),
+                    Box::new(Expr::Var("tries".into())),
+                ),
+            },
+            Stmt::Return(vec![
+                Expr::Var("saved".into()),
+                Expr::Var("lastError".into()),
+            ]),
+        ];
+
+        simplify_repeat_return_guards(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("until saved or tries >= 3"), "{rendered}");
+        assert!(!rendered.contains("v8 = 3"), "{rendered}");
+        assert!(!rendered.contains("if saved then"), "{rendered}");
+    }
+
+    #[test]
+    fn keeps_loop_body_assignment_read_by_repeat_condition() {
+        let mut stmts = vec![Stmt::Repeat {
+            body: vec![
+                Stmt::Assign {
+                    targets: vec![Expr::Var("saved".into())],
+                    values: vec![Expr::Var("ok".into())],
+                },
+                Stmt::If {
+                    cond: Expr::Unary("not ", Box::new(Expr::Var("saved".into()))),
+                    then_body: vec![Stmt::Call(Expr::Call(
+                        Box::new(Expr::Field(
+                            Box::new(Expr::Var("task".into())),
+                            "wait".into(),
+                        )),
+                        Vec::new(),
+                    ))],
+                    else_body: Vec::new(),
+                },
+            ],
+            cond: Expr::Binary(
+                "or",
+                Box::new(Expr::Var("saved".into())),
+                Box::new(Expr::Binary(
+                    ">=",
+                    Box::new(Expr::Var("tries".into())),
+                    Box::new(Expr::Num("3".into())),
+                )),
+            ),
+        }];
+
+        single_use_inline(&mut stmts, &BTreeSet::new());
+        dead_store_elim(&mut stmts, &BTreeSet::new());
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("saved = ok"), "{rendered}");
+        assert!(rendered.contains("if not saved then"), "{rendered}");
+        assert!(rendered.contains("until saved or tries >= 3"), "{rendered}");
+    }
+
+    #[test]
+    fn removes_pure_store_after_final_read_in_block() {
+        let mut stmts = vec![
+            Stmt::GenericFor {
+                vars: vec!["key".into(), "value".into()],
+                exprs: vec![Expr::Call(
+                    Box::new(Expr::Var("pairs".into())),
+                    vec![Expr::Var("defaults".into())],
+                )],
+                body: vec![Stmt::Assign {
+                    targets: vec![Expr::Index(
+                        Box::new(Expr::Var("config".into())),
+                        Box::new(Expr::Var("key".into())),
+                    )],
+                    values: vec![Expr::Var("value".into())],
+                }],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("timeout".into())],
+                values: vec![Expr::Call(
+                    Box::new(Expr::Field(
+                        Box::new(Expr::Var("math".into())),
+                        "clamp".into(),
+                    )),
+                    vec![
+                        Expr::Var("timeout".into()),
+                        Expr::Num("1".into()),
+                        Expr::Num("60".into()),
+                    ],
+                )],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("key".into())],
+                values: vec![Expr::Num("60".into())],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Field(
+                    Box::new(Expr::Var("config".into())),
+                    "Timeout".into(),
+                )],
+                values: vec![Expr::Var("timeout".into())],
+            },
+        ];
+
+        remove_dead_pure_stores_after_last_read(&mut stmts, &BTreeSet::new());
+
+        let rendered = render_block(&stmts, 0);
+        assert!(!rendered.contains("key = 60"), "{rendered}");
+        assert!(rendered.contains("config.Timeout = timeout"), "{rendered}");
+    }
+
+    #[test]
+    fn removes_dead_literal_markers_but_keeps_read_strings() {
+        let mut stmts = vec![
+            Stmt::Assign {
+                targets: vec![Expr::Var("marker".into())],
+                values: vec![Expr::Str("\"Model\"".into())],
+            },
+            Stmt::If {
+                cond: Expr::Var("ok".into()),
+                then_body: vec![Stmt::Call(Expr::Call(
+                    Box::new(Expr::Var("touch".into())),
+                    Vec::new(),
+                ))],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("marker".into())],
+                values: vec![Expr::Call(
+                    Box::new(Expr::Field(
+                        Box::new(Expr::Var("Instance".into())),
+                        "new".into(),
+                    )),
+                    vec![Expr::Str("\"Weld\"".into())],
+                )],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("kind".into())],
+                values: vec![Expr::Str("\"BasePart\"".into())],
+            },
+            Stmt::If {
+                cond: Expr::Binary(
+                    "==",
+                    Box::new(Expr::Var("kind".into())),
+                    Box::new(Expr::Str("\"BasePart\"".into())),
+                ),
+                then_body: Vec::new(),
+                else_body: Vec::new(),
+            },
+        ];
+
+        remove_dead_literal_markers(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(!rendered.contains("marker = \"Model\""), "{rendered}");
+        assert!(rendered.contains("kind = \"BasePart\""), "{rendered}");
+    }
+
+    #[test]
+    fn removes_dead_literal_marker_before_nested_overwrite() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("primaryPart".into()))),
+                then_body: vec![Stmt::Assign {
+                    targets: vec![Expr::Var("cframe".into())],
+                    values: vec![Expr::Str("\"Middle\"".into())],
+                }],
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("useMotor".into()))),
+                then_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("cframe".into())],
+                        values: vec![Expr::Call(
+                            Box::new(Expr::Field(
+                                Box::new(Expr::Var("CFrame".into())),
+                                "new".into(),
+                            )),
+                            Vec::new(),
+                        )],
+                    },
+                    Stmt::Assign {
+                        targets: vec![Expr::Field(Box::new(Expr::Var("weld".into())), "C0".into())],
+                        values: vec![Expr::Var("cframe".into())],
+                    },
+                    Stmt::Return(vec![Expr::Var("weld".into())]),
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::Return(vec![Expr::Var("motor".into())]),
+        ];
+
+        remove_dead_literal_markers(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(!rendered.contains("cframe = \"Middle\""), "{rendered}");
+        assert!(rendered.contains("cframe = CFrame.new()"), "{rendered}");
     }
 
     #[test]
@@ -2465,11 +3883,17 @@ mod tests {
     #[test]
     fn removes_redundant_goto_adjacent_to_label() {
         let mut stmts = vec![
-            Stmt::Call(Expr::Call(Box::new(Expr::Var("print".into())), vec![Expr::Str("\"hello\"".into())])),
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Var("print".into())),
+                vec![Expr::Str("\"hello\"".into())],
+            )),
             Stmt::Goto("L0".into()),
             Stmt::Comment("some comment".into()),
             Stmt::Label("L0".into()),
-            Stmt::Call(Expr::Call(Box::new(Expr::Var("print".into())), vec![Expr::Str("\"world\"".into())])),
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Var("print".into())),
+                vec![Expr::Str("\"world\"".into())],
+            )),
         ];
         remove_redundant_gotos(&mut stmts);
         let rendered = render_block(&stmts, 0);
@@ -2525,10 +3949,16 @@ mod tests {
                 then_body: vec![Stmt::Goto("L_else".into())],
                 else_body: Vec::new(),
             },
-            Stmt::Call(Expr::Call(Box::new(Expr::Var("print".into())), vec![Expr::Str("\"then\"".into())])),
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Var("print".into())),
+                vec![Expr::Str("\"then\"".into())],
+            )),
             Stmt::Goto("L_end".into()),
             Stmt::Label("L_else".into()),
-            Stmt::Call(Expr::Call(Box::new(Expr::Var("print".into())), vec![Expr::Str("\"else\"".into())])),
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Var("print".into())),
+                vec![Expr::Str("\"else\"".into())],
+            )),
             Stmt::Label("L_end".into()),
         ];
         recover_if_else_gotos(&mut stmts);
@@ -2552,7 +3982,10 @@ mod tests {
                 then_body: vec![Stmt::Goto("L1".into())],
                 else_body: Vec::new(),
             },
-            Stmt::Call(Expr::Call(Box::new(Expr::Var("print".into())), vec![Expr::Str("\"body\"".into())])),
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Var("print".into())),
+                vec![Expr::Str("\"body\"".into())],
+            )),
             Stmt::Goto("L0".into()),
             Stmt::Label("L1".into()),
         ];
@@ -2563,6 +3996,52 @@ mod tests {
         assert!(!rendered.contains("goto"), "{rendered}");
         assert!(!rendered.contains("::L0::"), "{rendered}");
         assert!(!rendered.contains("::L1::"), "{rendered}");
+    }
+
+    #[test]
+    fn recovers_repeat_until_return_goto_loop() {
+        let mut stmts = vec![
+            Stmt::Label("L0".into()),
+            Stmt::Assign {
+                targets: vec![Expr::Var("tries".into())],
+                values: vec![Expr::Binary(
+                    "+",
+                    Box::new(Expr::Var("tries".into())),
+                    Box::new(Expr::Num("1".into())),
+                )],
+            },
+            Stmt::Call(Expr::Call(Box::new(Expr::Var("save".into())), Vec::new())),
+            Stmt::If {
+                cond: Expr::Var("saved".into()),
+                then_body: vec![Stmt::Return(vec![
+                    Expr::Var("saved".into()),
+                    Expr::Var("lastError".into()),
+                ])],
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Binary(
+                    ">=",
+                    Box::new(Expr::Var("tries".into())),
+                    Box::new(Expr::Num("3".into())),
+                ),
+                then_body: vec![Stmt::Return(vec![
+                    Expr::Var("saved".into()),
+                    Expr::Var("lastError".into()),
+                ])],
+                else_body: Vec::new(),
+            },
+            Stmt::Goto("L0".into()),
+        ];
+
+        recover_backward_goto_while(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("repeat"), "{rendered}");
+        assert!(rendered.contains("until saved or tries >= 3"), "{rendered}");
+        assert!(rendered.contains("return saved, lastError"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+        assert!(!rendered.contains("::L0::"), "{rendered}");
     }
 
     #[test]
@@ -2591,5 +4070,67 @@ mod tests {
         let rendered = render_block(&stmts, 0);
         assert!(rendered.contains("t[1] = temp"), "{rendered}");
         assert!(!rendered.contains("t = {temp}"), "{rendered}");
+    }
+
+    #[test]
+    fn split_reused_registers_disjoint() {
+        let mut stmts = vec![
+            Stmt::Local {
+                names: vec!["v1".into()],
+                values: vec![Expr::Num("5".into())],
+            },
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Var("print".into())),
+                vec![Expr::Var("v1".into())],
+            )),
+            Stmt::Assign {
+                targets: vec![Expr::Var("v1".into())],
+                values: vec![Expr::Num("10".into())],
+            },
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Var("print".into())),
+                vec![Expr::Var("v1".into())],
+            )),
+        ];
+
+        split_reused_registers(&mut stmts, &BTreeSet::new());
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("local v1_1 = 5"), "{rendered}");
+        assert!(rendered.contains("print(v1_1)"), "{rendered}");
+        assert!(rendered.contains("v1_2 = 10"), "{rendered}");
+        assert!(rendered.contains("print(v1_2)"), "{rendered}");
+    }
+
+    #[test]
+    fn split_reused_registers_skip_unsplittable() {
+        let mut stmts = vec![
+            Stmt::Local {
+                names: vec!["v1".into()],
+                values: vec![Expr::Num("5".into())],
+            },
+            Stmt::If {
+                cond: Expr::Bool(true),
+                then_body: vec![Stmt::Call(Expr::Call(
+                    Box::new(Expr::Var("print".into())),
+                    vec![Expr::Var("v1".into())],
+                ))],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("v1".into())],
+                values: vec![Expr::Num("10".into())],
+            },
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Var("print".into())),
+                vec![Expr::Var("v1".into())],
+            )),
+        ];
+
+        split_reused_registers(&mut stmts, &BTreeSet::new());
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("local v1 = 5"), "{rendered}");
+        assert!(rendered.contains("v1 = 10"), "{rendered}");
     }
 }

@@ -57,7 +57,7 @@ pub struct ProtoDecompileResult {
 pub fn decompile(module: &Module) -> Decompiled {
     let mut reports = Vec::new();
     let main = module.main_proto as usize;
-    let res = decompile_proto(module, main, false, &mut reports);
+    let res = decompile_proto(module, main, false, None, &mut reports);
     let body = res.body;
 
     let partial = reports.iter().any(|r| r.partial);
@@ -65,13 +65,15 @@ pub fn decompile(module: &Module) -> Decompiled {
     let mut source = String::new();
     if partial {
         source.push_str("-- Decompiled by luau-decompile (best-effort reconstruction).\n");
+        source.push_str("-- Github repository https://github.com/PolarisHub/luau-disassembler-decompiler.\n\n");
         if has_gotos_or_labels {
             source.push_str("-- Some regions use goto/labels where structuring is incomplete.\n\n");
         } else {
-            source.push_str("\n");
+            source.push('\n');
         }
     } else {
-        source.push_str("-- Decompiled by luau-decompile.\n\n");
+        source.push_str("-- Decompiled by luau-decompile.\n");
+        source.push_str("-- Github repository https://github.com/PolarisHub/luau-disassembler-decompiler.\n\n");
     }
     source.push_str(&body);
 
@@ -88,6 +90,7 @@ fn decompile_proto(
     module: &Module,
     proto_idx: usize,
     is_method: bool,
+    event_name: Option<String>,
     reports: &mut Vec<ProtoReport>,
 ) -> ProtoDecompileResult {
     let proto = &module.protos[proto_idx];
@@ -120,6 +123,8 @@ fn decompile_proto(
         protected.insert(d.upval_name(i));
     }
 
+    cleanup::split_reused_registers(&mut stmts, &protected);
+
     // Run the reducing passes to a fixpoint: chain-folding, table-literal rebuilding,
     // per-definition copy propagation, and dead-store elimination all enable each other
     // (e.g. inlining temps makes a chain consecutive, which folds, which frees more temps).
@@ -128,8 +133,12 @@ fn decompile_proto(
         naming::fold_refinements(&mut stmts);
         cleanup::fold_table_literals(&mut stmts);
         cleanup::inline_table_literal_fill_temps(&mut stmts);
+        cleanup::recover_loop_carried_call_updates(&mut stmts);
+        cleanup::simplify_repeat_return_guards(&mut stmts);
+        cleanup::remove_dead_literal_markers(&mut stmts);
         cleanup::single_use_inline(&mut stmts, &protected);
         cleanup::dead_store_elim(&mut stmts, &protected);
+        cleanup::remove_dead_pure_stores_after_last_read(&mut stmts, &protected);
         let n = cleanup::count_stmts(&stmts);
         if n == prev {
             break;
@@ -152,7 +161,8 @@ fn decompile_proto(
     // Smart-rename synthesized locals from the expressions they hold (require -> module,
     // GetService -> service, etc.). Renaming a local is always semantics-preserving, so this
     // runs after reconstruction and rewrites the AST consistently.
-    let rename = naming::smart_rename(&stmts, &hoist_names, is_method);
+    let rename =
+        naming::smart_rename_with_event(&stmts, &hoist_names, is_method, event_name.as_deref());
     naming::apply_rename(&mut stmts, &rename);
     for n in hoist_names.iter_mut() {
         if let Some(new) = rename.get(n) {
@@ -178,8 +188,12 @@ fn decompile_proto(
     for _ in 0..16 {
         cleanup::fold_table_literals(&mut stmts);
         cleanup::inline_table_literal_fill_temps(&mut stmts);
+        cleanup::recover_loop_carried_call_updates(&mut stmts);
+        cleanup::simplify_repeat_return_guards(&mut stmts);
+        cleanup::remove_dead_literal_markers(&mut stmts);
         cleanup::single_use_inline(&mut stmts, &protected);
         cleanup::dead_store_elim(&mut stmts, &protected);
+        cleanup::remove_dead_pure_stores_after_last_read(&mut stmts, &protected);
         let n = cleanup::count_stmts(&stmts);
         if n == prev {
             break;
@@ -189,6 +203,7 @@ fn decompile_proto(
     cleanup::remove_redundant_gotos(&mut stmts);
     cleanup::remove_trailing_sibling_gotos(&mut stmts);
     cleanup::remove_unused_labels(&mut stmts);
+    cleanup::recover_and_or(&mut stmts);
     cleanup::recover_goto_into_if_gates(&mut stmts);
     cleanup::recover_guard_else_gotos(&mut stmts);
     cleanup::recover_if_skip_gotos(&mut stmts);
@@ -196,6 +211,11 @@ fn decompile_proto(
     cleanup::recover_top_test_while_gotos(&mut stmts);
     cleanup::recover_backward_goto_while(&mut stmts);
     cleanup::merge_leading_while_break_guards(&mut stmts);
+    cleanup::recover_loop_carried_call_updates(&mut stmts);
+    cleanup::simplify_repeat_return_guards(&mut stmts);
+    cleanup::remove_dead_literal_markers(&mut stmts);
+    cleanup::dead_store_elim(&mut stmts, &protected);
+    cleanup::remove_dead_pure_stores_after_last_read(&mut stmts, &protected);
     cleanup::drop_trailing_empty_return(&mut stmts);
     let hoist_names = cleanup::assigned_locals(&stmts, &non_local);
 
@@ -881,6 +901,58 @@ impl<'a> Decompiler<'a> {
             return Some(body);
         }
 
+        if last_taken == guard {
+            // All jumps target the fallback block G, which sits after the accepted body:
+            //
+            //   if not a then goto G end
+            //   if not b then goto G end
+            //   <accepted body>
+            //   G: <terminator fallback>
+            //
+            // Emit sequential guards that clone G, then emit the accepted body and skip the
+            // original fallback block.
+            for &j in &jumps {
+                if jump_target(self.proto.code[j], j) != Some(guard) {
+                    return None;
+                }
+            }
+            let last_len = Opcode::from_u8(insn_op(self.proto.code[last]))?
+                .length()
+                .max(1);
+            let accepted_start = last + last_len;
+            if accepted_start >= guard || guard > hi {
+                return None;
+            }
+            if !self.block_is_terminated(guard, hi, loop_ctx) {
+                return None;
+            }
+
+            self.flush_inline(stmts);
+            let guard_stmts = self.collect_guard_body(guard, hi, loop_ctx)?;
+            for (i, &j) in jumps.iter().enumerate() {
+                let op = Opcode::from_u8(insn_op(self.proto.code[j]))?;
+                stmts.push(Stmt::If {
+                    cond: self.taken_condition(op, j),
+                    then_body: guard_stmts.clone(),
+                    else_body: Vec::new(),
+                });
+                if i + 1 < jumps.len() {
+                    let next_j = jumps[i + 1];
+                    let j_len = Opcode::from_u8(insn_op(self.proto.code[j]))?
+                        .length()
+                        .max(1);
+                    let after_j = j + j_len;
+                    if after_j != next_j {
+                        let inner = self.emit_body(after_j, next_j, loop_ctx);
+                        stmts.extend(inner);
+                    }
+                }
+            }
+            let accepted = self.emit_body(accepted_start, guard, loop_ctx);
+            stmts.extend(accepted);
+            return Some(hi);
+        }
+
         // Intervening-code pattern (effects between guard jumps): scan bytes between
         // consecutive jumps to confirm the straight-line code is just evaluation.
         for window in jumps.windows(2) {
@@ -899,21 +971,7 @@ impl<'a> Decompiler<'a> {
             }
         }
         // Determine guard block G and body based on jump target pattern.
-        let (guard, body) = if last_taken == guard {
-            // All jumps target G. Body starts after the guard block terminator.
-            for &j in &jumps {
-                if jump_target(self.proto.code[j], j) != Some(guard) {
-                    return None;
-                }
-            }
-            let gt = self.last_instr_before(guard, hi)?;
-            let gt_op = Opcode::from_u8(insn_op(self.proto.code[gt]))?;
-            let body_pc = gt + gt_op.length().max(1);
-            if body_pc > hi {
-                return None;
-            }
-            (guard, body_pc)
-        } else {
+        let (guard, body) = {
             // Last jump targets BODY. Earlier jumps target G.
             let body_pc = last_taken;
             if body_pc <= guard || body_pc > hi {
@@ -1553,7 +1611,14 @@ impl<'a> Decompiler<'a> {
         let insn = self.proto.code[pc];
         let reg_a = insn_a(insn);
         let is_method = self.is_closure_method_like(pc, reg_a);
-        let res = decompile_proto(self.module, child_idx, is_method, &mut sub_reports);
+        let event_name = self.find_closure_event_name(pc, reg_a);
+        let res = decompile_proto(
+            self.module,
+            child_idx,
+            is_method,
+            event_name,
+            &mut sub_reports,
+        );
         let body = res.body;
         let params = res.params;
         if sub_reports.iter().any(|r| r.partial) {
@@ -1994,6 +2059,56 @@ impl<'a> Decompiler<'a> {
             q += op.length().max(1);
         }
         false
+    }
+
+    fn find_closure_event_name(&self, pc: usize, reg: u8) -> Option<String> {
+        let code = &self.proto.code;
+        let mut q = pc;
+        if let Some(op) = Opcode::from_u8(insn_op(code[pc])) {
+            q += op.length().max(1);
+        } else {
+            q += 1;
+        }
+
+        let mut pending_namecall = None;
+
+        while q < code.len() && q < pc + 30 {
+            let insn = code[q];
+            let op = match Opcode::from_u8(insn_op(insn)) {
+                Some(o) => o,
+                None => {
+                    q += 1;
+                    continue;
+                }
+            };
+
+            if op == Opcode::NAMECALL {
+                let method = self.string_const(insn_c(insn) as u32);
+                pending_namecall = Some((insn_a(insn), method));
+            } else if op == Opcode::CALL {
+                let call_a = insn_a(insn);
+                let call_b = insn_b(insn);
+                if let Some((namecall_a, method)) = &pending_namecall {
+                    if *namecall_a == call_a
+                        && (call_b == 0 || (call_b >= 3 && reg == call_a + 2))
+                        && (method == "Connect" || method == "ConnectParallel" || method == "Once")
+                    {
+                        let event_expr_str = render_expr(&self.reg(call_a + 1));
+                        if let Some(last_seg) = naming::last_segment(&event_expr_str) {
+                            return Some(last_seg);
+                        }
+                    }
+                }
+                pending_namecall = None;
+            } else {
+                if writes_register(op, insn, reg) {
+                    break;
+                }
+            }
+
+            q += op.length().max(1);
+        }
+        None
     }
 
     /// A loop variable's name: its debug name if available, else a synthesized one that does
