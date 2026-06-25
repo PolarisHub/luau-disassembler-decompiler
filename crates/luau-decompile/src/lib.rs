@@ -129,6 +129,18 @@ fn decompile_proto(module: &Module, proto_idx: usize, reports: &mut Vec<ProtoRep
     // Now that this function's locals have their final names, rewrite the `u0`/`u1`/… upvalue
     // placeholders inside each nested closure to the captured local's name.
     d.resolve_closures(&mut stmts, &rename);
+    cleanup::promote_top_level_initializers(&mut stmts, &non_local);
+    let mut prev = usize::MAX;
+    for _ in 0..16 {
+        cleanup::single_use_inline(&mut stmts, &protected);
+        cleanup::dead_store_elim(&mut stmts, &protected);
+        let n = cleanup::count_stmts(&stmts);
+        if n == prev {
+            break;
+        }
+        prev = n;
+    }
+    let hoist_names = cleanup::assigned_locals(&stmts, &non_local);
 
     // Determine `partial` from the FINAL tree: a proto is partial only if some unstructured
     // control flow (a goto/label) survived all recovery passes, or a nested closure was partial.

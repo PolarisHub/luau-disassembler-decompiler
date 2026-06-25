@@ -22,9 +22,16 @@ use crate::naming::is_pure;
 pub fn assigned_locals(root: &[Stmt], exclude: &BTreeSet<String>) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut order = Vec::new();
+    let mut declared = exclude.clone();
+    for stmt in root {
+        if let Stmt::Local { names, .. } = stmt {
+            declared.extend(names.iter().cloned());
+        }
+    }
+
     fn walk(
         stmts: &[Stmt],
-        exclude: &BTreeSet<String>,
+        declared: &BTreeSet<String>,
         seen: &mut BTreeSet<String>,
         order: &mut Vec<String>,
     ) {
@@ -35,17 +42,70 @@ pub fn assigned_locals(root: &[Stmt], exclude: &BTreeSet<String>) -> Vec<String>
             if let Stmt::Assign { targets, .. } = s {
                 for t in targets {
                     if let Expr::Var(name) = t {
-                        if !exclude.contains(name) && seen.insert(name.clone()) {
+                        if !declared.contains(name) && seen.insert(name.clone()) {
                             order.push(name.clone());
                         }
                     }
                 }
             }
-            for_each_block(s, |b| walk(b, exclude, seen, order));
+            for_each_block(s, |b| walk(b, declared, seen, order));
         }
     }
-    walk(root, exclude, &mut seen, &mut order);
+    walk(root, &declared, &mut seen, &mut order);
     order
+}
+
+/// Promote first top-level assignments into local initializers when the variable is assigned
+/// exactly once in the function. This removes synthetic "local x; x = ..." boilerplate
+/// without changing scope across branches/loops.
+pub fn promote_top_level_initializers(root: &mut [Stmt], exclude: &BTreeSet<String>) {
+    let mut prior_reads = BTreeSet::new();
+    let mut prior_writes = BTreeSet::new();
+
+    for stmt in root.iter_mut() {
+        let replacement = match stmt {
+            Stmt::Assign { targets, values } if !targets.is_empty() => {
+                let mut names = Vec::new();
+                for target in targets.iter() {
+                    let Expr::Var(name) = target else {
+                        names.clear();
+                        break;
+                    };
+                    if exclude.contains(name)
+                        || prior_reads.contains(name)
+                        || prior_writes.contains(name)
+                    {
+                        names.clear();
+                        break;
+                    }
+                    names.push(name.clone());
+                }
+
+                let value_reads = values.iter().fold(BTreeSet::new(), |mut acc, value| {
+                    acc.extend(reads_of_expr(value));
+                    acc
+                });
+                if names.is_empty() || names.iter().any(|name| value_reads.contains(name)) {
+                    None
+                } else {
+                    Some(Stmt::Local {
+                        names,
+                        values: values.clone(),
+                    })
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(local) = replacement {
+            *stmt = local;
+        }
+
+        let mut reads = BTreeMap::new();
+        count_uses_stmt(stmt, &mut reads);
+        prior_reads.extend(reads.into_keys());
+        prior_writes.extend(writes_of_stmt(stmt));
+    }
 }
 
 /// Inline single-use pure temporaries to fixpoint. `protected` names are never inlined
@@ -307,9 +367,6 @@ fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool 
         let next_def = ((i + 1)..block.len())
             .find(|&k| writes_of_stmt(&block[k]).contains(&name))
             .unwrap_or(block.len());
-        if block[i + 1..next_def].iter().any(is_control_flow) {
-            continue; // a branch/loop may use the value on a path we can't see; be safe
-        }
         let reads: Vec<(usize, usize)> = ((i + 1)..next_def)
             .filter_map(|k| {
                 let count = stmt_read_count(&block[k], &name);
@@ -321,6 +378,13 @@ fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool 
         }
         let total_reads: usize = reads.iter().map(|(_, count)| *count).sum();
         let (j, reads_in_stmt) = reads[0];
+        let replaceable_reads = stmt_replaceable_read_count(&block[j], &name);
+        if replaceable_reads == 0 {
+            continue;
+        }
+        if block[i + 1..j].iter().any(is_control_flow) {
+            continue; // a branch/loop before the use may hide path-specific behavior
+        }
 
         // Interference check on the statements strictly between def and use.
         let inputs = reads_of_expr(&val);
@@ -358,7 +422,7 @@ fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool 
         if !can_remove_def && !is_duplicable_leaf(&val) {
             continue;
         }
-        if !can_remove_def && reads_in_stmt != 1 {
+        if !can_remove_def && (reads_in_stmt != 1 || replaceable_reads != 1) {
             continue; // don't partially inline `x` inside `x and x.y`
         }
 
@@ -392,9 +456,11 @@ fn stmt_head(s: &Stmt) -> Option<&str> {
     match s {
         Stmt::Call(e) => expr_head(e),
         Stmt::Return(vals) => vals.first().and_then(expr_head),
+        Stmt::Local { values, .. } => values.first().and_then(expr_head),
         Stmt::Assign { targets, values } if matches!(targets.as_slice(), [Expr::Var(_)]) => {
             values.first().and_then(expr_head)
         }
+        Stmt::If { cond, .. } => expr_head(cond),
         _ => None,
     }
 }
@@ -555,16 +621,22 @@ fn reads_of_expr(e: &Expr) -> BTreeSet<String> {
 
 // --- predicates & helpers --------------------------------------------------------------
 
-/// If `s` is `name = value` with a single bare-Var target, return `(name, value)`.
+/// If `s` is `name = value` or `local name = value` with a single bare name, return
+/// `(name, value)`.
 fn sole_var_assign(s: &Stmt) -> Option<(String, Expr)> {
-    if let Stmt::Assign { targets, values } = s {
-        if targets.len() == 1 && values.len() == 1 {
+    match s {
+        Stmt::Assign { targets, values } if targets.len() == 1 && values.len() == 1 => {
             if let Expr::Var(name) = &targets[0] {
-                return Some((name.clone(), values[0].clone()));
+                Some((name.clone(), values[0].clone()))
+            } else {
+                None
             }
         }
+        Stmt::Local { names, values } if names.len() == 1 && values.len() == 1 => {
+            Some((names[0].clone(), values[0].clone()))
+        }
+        _ => None,
     }
-    None
 }
 
 fn stmt_reads_var(s: &Stmt, name: &str) -> bool {
@@ -584,6 +656,42 @@ fn stmt_reads_var_in_assignment_target(s: &Stmt, name: &str) -> bool {
 fn stmt_read_count(s: &Stmt, name: &str) -> usize {
     let mut counts = BTreeMap::new();
     count_uses_stmt(s, &mut counts);
+    counts.get(name).copied().unwrap_or(0)
+}
+
+fn stmt_replaceable_read_count(s: &Stmt, name: &str) -> usize {
+    let mut counts = BTreeMap::new();
+    match s {
+        Stmt::Local { values, .. } => values.iter().for_each(|e| add_reads(e, &mut counts)),
+        Stmt::Assign { targets, values } => {
+            for t in targets {
+                if !matches!(t, Expr::Var(_)) {
+                    add_reads(t, &mut counts);
+                }
+            }
+            values.iter().for_each(|e| add_reads(e, &mut counts));
+        }
+        Stmt::Call(e) => add_reads(e, &mut counts),
+        Stmt::Return(es) => es.iter().for_each(|e| add_reads(e, &mut counts)),
+        Stmt::If { cond, .. } => add_reads(cond, &mut counts),
+        Stmt::NumericFor {
+            start, limit, step, ..
+        } => {
+            add_reads(start, &mut counts);
+            add_reads(limit, &mut counts);
+            if let Some(step) = step {
+                add_reads(step, &mut counts);
+            }
+        }
+        Stmt::GenericFor { exprs, .. } => exprs.iter().for_each(|e| add_reads(e, &mut counts)),
+        Stmt::While { .. }
+        | Stmt::Repeat { .. }
+        | Stmt::Break
+        | Stmt::Continue
+        | Stmt::Label(_)
+        | Stmt::Goto(_)
+        | Stmt::Comment(_) => {}
+    }
     counts.get(name).copied().unwrap_or(0)
 }
 

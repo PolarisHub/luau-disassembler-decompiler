@@ -61,7 +61,7 @@ pub fn smart_rename(stmts: &[Stmt], hoist_names: &[String]) -> BTreeMap<String, 
         } else {
             continue;
         };
-        let Some(base) = derive_name(chosen) else {
+        let Some(base) = accumulator_name(orig, list).or_else(|| derive_name(chosen)) else {
             continue;
         };
         // Avoid colliding with reserved names and other still-unmapped synthesized names.
@@ -76,6 +76,7 @@ pub fn smart_rename(stmts: &[Stmt], hoist_names: &[String]) -> BTreeMap<String, 
     // Context-based naming for things the defining expression alone can't name.
     apply_tuple_names(stmts, &candidates, &mut reserved, &mut map);
     apply_field_sink_names(stmts, &candidates, &mut reserved, &mut map);
+    apply_returned_table_names(stmts, &defs, &candidates, &mut reserved, &mut map);
     map
 }
 
@@ -168,6 +169,127 @@ fn apply_field_sink_names(
         }
         for_each_child_block(s, |b| apply_field_sink_names(b, candidates, reserved, map));
     }
+}
+
+/// `local v0 = { ... }; return v0` is usually a module/export/result table. Give that
+/// synthetic local a readable name when no definition-based heuristic found one.
+fn apply_returned_table_names(
+    stmts: &[Stmt],
+    defs: &BTreeMap<String, Vec<Expr>>,
+    candidates: &BTreeSet<String>,
+    reserved: &mut BTreeSet<String>,
+    map: &mut BTreeMap<String, String>,
+) {
+    for s in stmts {
+        if let Stmt::Return(values) = s {
+            if let [Expr::Var(name)] = values.as_slice() {
+                if candidates.contains(name) && !map.contains_key(name) {
+                    if let Some([Expr::Table(fields)]) = defs.get(name).map(Vec::as_slice) {
+                        let base = returned_table_name(fields);
+                        let u = unique_name(base, reserved);
+                        reserved.insert(u.clone());
+                        map.insert(name.clone(), u);
+                    }
+                }
+            }
+        }
+        for_each_child_block(s, |b| {
+            apply_returned_table_names(b, defs, candidates, reserved, map)
+        });
+    }
+}
+
+fn returned_table_name(fields: &[TableField]) -> &'static str {
+    if fields.iter().any(|field| match field {
+        TableField::Named(name, value) => {
+            matches!(value, Expr::Closure { .. }) || name.chars().any(|c| c.is_ascii_uppercase())
+        }
+        _ => false,
+    }) {
+        "module"
+    } else {
+        "result"
+    }
+}
+
+fn accumulator_name(name: &str, defs: &[Expr]) -> Option<String> {
+    if defs.len() < 2 {
+        return None;
+    }
+    let Expr::Num(init) = &defs[0] else {
+        return None;
+    };
+
+    let mut saw_add_sub = false;
+    let mut saw_mul = false;
+    for expr in &defs[1..] {
+        match accumulator_step(name, expr)? {
+            AccumulatorStep::AddSub => saw_add_sub = true,
+            AccumulatorStep::Mul => saw_mul = true,
+        }
+    }
+
+    if saw_add_sub && !saw_mul && num_literal_is(init, 0.0) {
+        return Some("total".to_string());
+    }
+    if saw_mul && !saw_add_sub && num_literal_is(init, 1.0) {
+        return Some("product".to_string());
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccumulatorStep {
+    AddSub,
+    Mul,
+}
+
+fn accumulator_step(name: &str, expr: &Expr) -> Option<AccumulatorStep> {
+    let Expr::Binary(op, a, b) = expr else {
+        return None;
+    };
+    let other = match *op {
+        "+" => {
+            if is_var(a, name) {
+                b.as_ref()
+            } else if is_var(b, name) {
+                a.as_ref()
+            } else {
+                return None;
+            }
+        }
+        "-" => {
+            if !is_var(a, name) {
+                return None;
+            }
+            b.as_ref()
+        }
+        "*" => {
+            if is_var(a, name) {
+                b.as_ref()
+            } else if is_var(b, name) {
+                a.as_ref()
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    if expr_references(other, name) {
+        return None;
+    }
+    Some(match *op {
+        "+" | "-" => AccumulatorStep::AddSub,
+        "*" => AccumulatorStep::Mul,
+        _ => return None,
+    })
+}
+
+fn num_literal_is(value: &str, expected: f64) -> bool {
+    value
+        .parse::<f64>()
+        .map(|parsed| parsed == expected)
+        .unwrap_or(false)
 }
 
 /// Fold chained refinements: `x = a.b; x = x.c` -> `x = a.b.c`, the compiler's reuse of one
@@ -531,11 +653,11 @@ pub fn derive_name(e: &Expr) -> Option<String> {
             // Otherwise the trailing field, read as an instance: player.Character -> character.
             sanitize(&field_to_local_name(field))
         }
-        Expr::Index(_, key) => {
+        Expr::Index(base, key) => {
             if let Expr::Str(lit) = key.as_ref() {
                 return sanitize(&strip_quotes(lit));
             }
-            None
+            Some(index_value_name(base))
         }
         // #players -> playerCount ; #t -> count
         Expr::Unary(op, inner) if *op == "#" => Some(length_name(inner)),
@@ -737,14 +859,40 @@ fn trailing_noun(e: &Expr) -> Option<String> {
     }
 }
 
-/// #players -> playerCount, #t -> count.
+/// #players -> playerCount, #workspace:GetChildren() -> childCount, #t -> count.
 fn length_name(inner: &Expr) -> String {
-    if let Some(base) = name_from_value(inner) {
+    if let Some(base) = collection_name(inner) {
+        if base == "children" {
+            return "childCount".to_string();
+        }
         if base.len() > 1 && base.ends_with('s') && !base.ends_with("ss") {
             return format!("{}Count", singular(&base));
         }
     }
     "count".to_string()
+}
+
+fn index_value_name(base: &Expr) -> String {
+    if let Some(base) = collection_name(base) {
+        if base == "children" {
+            return "child".to_string();
+        }
+        if base.len() > 1 && base.ends_with('s') && !base.ends_with("ss") {
+            return singular(&base);
+        }
+    }
+    "value".to_string()
+}
+
+fn collection_name(e: &Expr) -> Option<String> {
+    if let Some(name) = name_from_value(e) {
+        return Some(name);
+    }
+    match e {
+        Expr::Call(callee, args) => derive_from_call(callee, args),
+        Expr::MethodCall(recv, method, args) => derive_from_method(recv, method, args),
+        _ => None,
+    }
 }
 
 fn singular(s: &str) -> String {
@@ -1017,6 +1165,21 @@ mod tests {
 
         let len = Expr::Unary("#", Box::new(Expr::Var("t".into())));
         assert_eq!(derive_name(&len).as_deref(), Some("count"));
+
+        let child_count = Expr::Unary("#", Box::new(get_children));
+        assert_eq!(derive_name(&child_count).as_deref(), Some("childCount"));
+
+        let item = Expr::Index(
+            Box::new(Expr::Var("items".into())),
+            Box::new(Expr::Var("i".into())),
+        );
+        assert_eq!(derive_name(&item).as_deref(), Some("item"));
+
+        let value = Expr::Index(
+            Box::new(Expr::Var("p0".into())),
+            Box::new(Expr::Var("i".into())),
+        );
+        assert_eq!(derive_name(&value).as_deref(), Some("value"));
     }
 
     #[test]
@@ -1080,5 +1243,58 @@ mod tests {
         assert_eq!(derive_name(&Expr::Var("x".into())), None);
         assert_eq!(derive_name(&Expr::Num("3".into())), None);
         assert_eq!(derive_name(&Expr::Nil), None);
+    }
+
+    #[test]
+    fn names_returned_module_tables() {
+        let stmts = vec![
+            Stmt::Assign {
+                targets: vec![Expr::Var("v0".into())],
+                values: vec![Expr::Table(vec![TableField::Named(
+                    "MAX_REWARD".into(),
+                    Expr::Num("250".into()),
+                )])],
+            },
+            Stmt::Return(vec![Expr::Var("v0".into())]),
+        ];
+        let map = smart_rename(&stmts, &[String::from("v0")]);
+        assert_eq!(map.get("v0").map(String::as_str), Some("module"));
+    }
+
+    #[test]
+    fn names_numeric_accumulators() {
+        let stmts = vec![
+            Stmt::Assign {
+                targets: vec![Expr::Var("v1".into())],
+                values: vec![Expr::Num("0".into())],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("v1".into())],
+                values: vec![Expr::Binary(
+                    "+",
+                    Box::new(Expr::Var("v1".into())),
+                    Box::new(Expr::Var("p0".into())),
+                )],
+            },
+        ];
+        let map = smart_rename(&stmts, &[String::from("v1")]);
+        assert_eq!(map.get("v1").map(String::as_str), Some("total"));
+
+        let stmts = vec![
+            Stmt::Assign {
+                targets: vec![Expr::Var("v2".into())],
+                values: vec![Expr::Num("1".into())],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("v2".into())],
+                values: vec![Expr::Binary(
+                    "*",
+                    Box::new(Expr::Var("v2".into())),
+                    Box::new(Expr::Var("p0".into())),
+                )],
+            },
+        ];
+        let map = smart_rename(&stmts, &[String::from("v2")]);
+        assert_eq!(map.get("v2").map(String::as_str), Some("product"));
     }
 }

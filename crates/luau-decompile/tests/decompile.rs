@@ -164,6 +164,23 @@ fn loop_break_and_continue_recovered() {
 }
 
 #[test]
+fn literal_left_comparisons_render_naturally() {
+    let out = decompile(&parse_and_validate(&read("03_if_else.luauc")).unwrap()).source;
+    assert!(
+        out.contains("if n > 0 then"),
+        "constant-left comparison should be flipped for readability:\n{out}"
+    );
+    assert!(
+        !out.contains("if 0 < n then"),
+        "backwards comparison survived:\n{out}"
+    );
+    assert!(
+        recompiles(&out, "if_else_cmp"),
+        "comparison-normalized output must recompile:\n{out}"
+    );
+}
+
+#[test]
 fn guard_chains_recovered() {
     // `if not (a and b ...) then return/break end` compiles to a run of conditional jumps
     // converging on a terminator block; the structurer must rebuild the combined condition
@@ -177,6 +194,26 @@ fn guard_chains_recovered() {
     assert!(
         out.contains("if not (a and b and c) then"),
         "three-condition guard not flattened:\n{out}"
+    );
+    assert!(
+        out.contains("local total = 0"),
+        "first assignment should be promoted into a local initializer:\n{out}"
+    );
+    assert!(
+        !out.contains("local amount, total"),
+        "promoted locals must not also appear in the hoist declaration:\n{out}"
+    );
+    assert!(
+        out.contains("for _, it in ipairs(items) do"),
+        "single-use loop aliases should be inlined:\n{out}"
+    );
+    assert!(
+        out.contains("panel:FindFirstChild(name)"),
+        "single-use call argument aliases should be inlined:\n{out}"
+    );
+    assert!(
+        !out.contains("local v3 = items") && !out.contains("local v4 = name"),
+        "trivial parameter aliases should not survive cleanup:\n{out}"
     );
     assert!(
         recompiles(&out, "guards"),
@@ -203,7 +240,7 @@ fn short_circuit_return_recovered_without_goto() {
         out.source
     );
     assert!(
-        out.source.contains("return (v1 and v1.icon) or"),
+        out.source.contains("return (value and value.icon) or"),
         "and/or return not rebuilt cleanly:\n{}",
         out.source
     );
@@ -298,6 +335,7 @@ fn roblox_idioms_get_smart_names() {
         "MyModule_doThing = require(game.ReplicatedStorage.MyModule).doThing",
         "part = Instance.new(\"Part\")",
         "Players.LocalPlayer.Character",
+        "childCount = #workspace:GetChildren()",
         "#workspace:GetChildren()",
     ] {
         assert!(
@@ -310,6 +348,56 @@ fn roblox_idioms_get_smart_names() {
         recompiles(&out.source, "roblox"),
         "smart-named output must recompile:\n{}",
         out.source
+    );
+}
+
+#[test]
+fn stripped_accumulators_get_readable_names() {
+    let out =
+        decompile(&parse_and_validate(&read_stripped("06_numeric_for.luauc")).unwrap()).source;
+    assert!(
+        out.contains("local total = 0"),
+        "numeric sum accumulator should be named total:\n{out}"
+    );
+    assert!(
+        !out.contains("local v1 = 0"),
+        "synthetic accumulator name survived:\n{out}"
+    );
+    assert!(
+        recompiles(&out, "stripped_accumulator_total"),
+        "renamed accumulator output must recompile:\n{out}"
+    );
+
+    let out = decompile(&parse_and_validate(&read_stripped("05_repeat.luauc")).unwrap()).source;
+    assert!(
+        out.contains("local product = 1"),
+        "multiplicative accumulator should be named product:\n{out}"
+    );
+    assert!(
+        recompiles(&out, "stripped_accumulator_product"),
+        "renamed product output must recompile:\n{out}"
+    );
+}
+
+#[test]
+fn stripped_index_reads_get_readable_names() {
+    let out =
+        decompile(&parse_and_validate(&read_stripped("20_loop_control.luauc")).unwrap()).source;
+    assert!(
+        out.contains("local value"),
+        "dynamic index result should get a readable fallback name:\n{out}"
+    );
+    assert!(
+        out.contains("value = p0[i]"),
+        "indexed loop value should be renamed consistently:\n{out}"
+    );
+    assert!(
+        !out.contains("v6 = p0[i]"),
+        "synthetic index-read name survived:\n{out}"
+    );
+    assert!(
+        recompiles(&out, "stripped_index_value"),
+        "renamed index-read output must recompile:\n{out}"
     );
 }
 

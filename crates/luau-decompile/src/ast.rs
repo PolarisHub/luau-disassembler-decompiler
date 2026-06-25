@@ -131,6 +131,12 @@ fn pad(out: &mut String, indent: usize) {
 fn render_stmt(out: &mut String, s: &Stmt, indent: usize) {
     match s {
         Stmt::Local { names, values } => {
+            if let Some(text) = local_function_text(names, values, indent) {
+                pad(out, indent);
+                out.push_str(&text);
+                out.push('\n');
+                return;
+            }
             pad(out, indent);
             let _ = write!(out, "local {}", names.join(", "));
             if !values.is_empty() {
@@ -139,6 +145,12 @@ fn render_stmt(out: &mut String, s: &Stmt, indent: usize) {
             out.push('\n');
         }
         Stmt::Assign { targets, values } => {
+            if let Some(text) = assignment_function_text(targets, values, indent) {
+                pad(out, indent);
+                out.push_str(&text);
+                out.push('\n');
+                return;
+            }
             pad(out, indent);
             let _ = writeln!(
                 out,
@@ -266,6 +278,42 @@ fn render_stmt(out: &mut String, s: &Stmt, indent: usize) {
     }
 }
 
+fn local_function_text(names: &[String], values: &[Expr], indent: usize) -> Option<String> {
+    let [name] = names else {
+        return None;
+    };
+    let [Expr::Closure { text, .. }] = values else {
+        return None;
+    };
+    let tail = text.strip_prefix("function")?;
+    Some(format!(
+        "local function {name}{}",
+        indent_multiline(tail, indent)
+    ))
+}
+
+fn assignment_function_text(targets: &[Expr], values: &[Expr], indent: usize) -> Option<String> {
+    let [target] = targets else {
+        return None;
+    };
+    let [Expr::Closure { text, .. }] = values else {
+        return None;
+    };
+    let name = function_assignment_target(target)?;
+    let tail = text.strip_prefix("function")?;
+    Some(format!("function {name}{}", indent_multiline(tail, indent)))
+}
+
+fn function_assignment_target(target: &Expr) -> Option<String> {
+    match target {
+        Expr::Var(name) => Some(name.clone()),
+        Expr::Field(base, field) => {
+            function_assignment_target(base).map(|base| format!("{base}.{field}"))
+        }
+        _ => None,
+    }
+}
+
 fn join_exprs(exprs: &[Expr]) -> String {
     exprs.iter().map(render_expr).collect::<Vec<_>>().join(", ")
 }
@@ -309,6 +357,11 @@ fn render_expr_at(e: &Expr, indent: usize) -> String {
             }
         }
         Expr::Binary(op, a, b) => {
+            if let Some(flipped) = flipped_comparison(op) {
+                if is_literal_expr(a) && !is_literal_expr(b) {
+                    return format!("{} {flipped} {}", paren_at(b, indent), paren_at(a, indent));
+                }
+            }
             // `and`/`or` are associative and left-grouped by the compiler; a same-operator
             // left operand doesn't need parens (`a and b and c`, not `(a and b) and c`).
             let lhs = match (a.as_ref(), *op) {
@@ -320,6 +373,25 @@ fn render_expr_at(e: &Expr, indent: usize) -> String {
         }
         Expr::Table(fields) => render_table(fields, indent),
     }
+}
+
+fn flipped_comparison(op: &str) -> Option<&'static str> {
+    Some(match op {
+        "<" => ">",
+        "<=" => ">=",
+        ">" => "<",
+        ">=" => "<=",
+        "==" => "==",
+        "~=" => "~=",
+        _ => return None,
+    })
+}
+
+fn is_literal_expr(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Nil | Expr::Bool(_) | Expr::Num(_) | Expr::Str(_) | Expr::Vector(_)
+    )
 }
 
 fn render_table(fields: &[TableField], indent: usize) -> String {
@@ -484,5 +556,48 @@ mod tests {
             TableField::Keyed(Expr::Num("2".into()), Expr::Bool(true)),
         ]);
         assert_eq!(render_expr(&t), "{1, k = \"v\", [2] = true}");
+    }
+
+    #[test]
+    fn prints_literal_left_comparisons_naturally() {
+        let e = Expr::Binary(
+            "<",
+            Box::new(Expr::Num("0".into())),
+            Box::new(Expr::Var("n".into())),
+        );
+        assert_eq!(render_expr(&e), "n > 0");
+
+        let e = Expr::Binary(
+            "<",
+            Box::new(Expr::Var("n".into())),
+            Box::new(Expr::Num("0".into())),
+        );
+        assert_eq!(render_expr(&e), "n < 0");
+    }
+
+    #[test]
+    fn prints_function_sugar() {
+        let closure = Expr::Closure {
+            text: "function(x)\n\treturn x\nend".into(),
+            captures: Vec::new(),
+        };
+        let rendered = render_block(
+            &[
+                Stmt::Local {
+                    names: vec!["id".into()],
+                    values: vec![closure.clone()],
+                },
+                Stmt::Assign {
+                    targets: vec![Expr::Field(
+                        Box::new(Expr::Var("module".into())),
+                        "id".into(),
+                    )],
+                    values: vec![closure],
+                },
+            ],
+            0,
+        );
+        assert!(rendered.contains("local function id(x)"));
+        assert!(rendered.contains("function module.id(x)"));
     }
 }
