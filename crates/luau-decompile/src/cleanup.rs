@@ -146,10 +146,1826 @@ fn dead_after_last_read_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<Str
         {
             continue;
         }
+        if block[i + 1..].iter().any(stmt_contains_nonlocal_flow) {
+            continue;
+        }
         block.remove(i);
         return true;
     }
     false
+}
+
+/// A label as the final statement of a proto is just the function's natural return point.
+/// Gotos to it from nested branches are early exits from the function, so rewrite them to
+/// `return` and remove the label.
+pub fn replace_terminal_label_gotos_with_return(root: &mut Vec<Stmt>) {
+    let Some((label_idx, label)) = terminal_label(root) else {
+        return;
+    };
+    if count_gotos_named(root, &label) == 0 {
+        return;
+    }
+    replace_gotos_with_return(root, &label);
+    root.remove(label_idx);
+}
+
+/// Recover a terminal shared tail:
+///
+/// ```lua
+/// if a then
+///     setup()
+///     goto done
+/// end
+/// fallback()
+/// ::done::
+/// finish()
+/// ```
+///
+/// When the label is at function end and the tail is tiny, jumps to it can be represented as
+/// `finish(); return` inside the jumping branch while the natural fallthrough keeps the single
+/// terminal tail. This avoids keeping a label solely for a small common epilogue.
+pub fn replace_terminal_label_tail_gotos(root: &mut Vec<Stmt>) {
+    let Some((mut label_idx, label, _tail)) = terminal_label_tail(root) else {
+        return;
+    };
+    if label_idx > 0 && matches!(&root[label_idx - 1], Stmt::Goto(target) if target == &label) {
+        root.remove(label_idx - 1);
+        label_idx -= 1;
+    }
+    let tail = root[label_idx + 1..].to_vec();
+    if count_gotos_named(&root[..label_idx], &label) == 0 {
+        root.remove(label_idx);
+        return;
+    }
+    if has_goto_in_nested_loop(&root[..label_idx], &label, false) {
+        return;
+    }
+    let Some(first_goto_idx) = root[..label_idx]
+        .iter()
+        .position(|stmt| count_gotos_named_stmt(stmt, &label) > 0)
+    else {
+        return;
+    };
+    if tail_reads_late_local(root, first_goto_idx, label_idx, &tail) {
+        return;
+    }
+    if replace_gotos_with_tail_return_before(root, &mut label_idx, &label, &tail)
+        && count_gotos_named(&root[..label_idx], &label) == 0
+    {
+        root.remove(label_idx);
+    }
+}
+
+/// Like `replace_terminal_label_tail_gotos`, but also handles gotos nested inside loops when
+/// the shared tail itself terminates the function. A `goto done` from inside a loop to:
+///
+/// ```lua
+/// ::done::
+/// cleanup()
+/// return value
+/// ```
+///
+/// is equivalent to `cleanup(); return value` at the jump site. This is intentionally narrower
+/// than the normal terminal-tail pass: non-terminating tails still need structured loop exits.
+pub fn replace_loop_gotos_to_terminal_label_tail(root: &mut Vec<Stmt>) {
+    let Some((mut label_idx, label, tail)) = terminal_label_tail(root) else {
+        return;
+    };
+    if !block_ends_terminated(&tail) || count_gotos_named(&root[..label_idx], &label) == 0 {
+        return;
+    }
+    let Some(first_goto_idx) = root[..label_idx]
+        .iter()
+        .position(|stmt| count_gotos_named_stmt(stmt, &label) > 0)
+    else {
+        return;
+    };
+    if tail_reads_late_local(root, first_goto_idx, label_idx, &tail) {
+        return;
+    }
+    if replace_gotos_with_terminal_tail_before(root, &mut label_idx, &label, &tail)
+        && count_gotos_named(&root[..label_idx], &label) == 0
+    {
+        root.remove(label_idx);
+    }
+}
+
+/// If previous structuring removed a terminal label but left a final jump to it, the jump is
+/// just the function's natural exit.
+pub fn replace_orphan_terminal_goto_with_return(root: &mut [Stmt]) {
+    let labels = label_names(root);
+    let Some(idx) = orphan_terminal_goto_idx(root) else {
+        return;
+    };
+    let Stmt::Goto(label) = &root[idx] else {
+        return;
+    };
+    if !labels.contains(label) {
+        root[idx] = Stmt::Return(Vec::new());
+    }
+}
+
+/// Labels that immediately return are just shared early-return targets. Replacing gotos to
+/// them with the same return removes noisy labels without moving any non-returning work.
+pub fn replace_return_label_gotos(root: &mut Vec<Stmt>) {
+    let return_labels = return_only_labels(root);
+    if return_labels.is_empty() {
+        return;
+    }
+    replace_gotos_to_return_labels(root, &return_labels);
+    remove_return_only_labels(root, &return_labels);
+}
+
+/// Recover missing-label joins whose continuation is terminal and can be safely duplicated at
+/// each jump. This handles value-selection code like:
+///
+/// ```lua
+/// if candidate:IsA("Sound") then
+///     sound = candidate
+///     goto done
+/// end
+/// sound = candidate:FindFirstChildWhichIsA("Sound")
+/// if not sound then return nil end
+/// return use(sound)
+/// ```
+///
+/// after earlier passes removed `::done::`. The rewrite copies the terminal suffix beginning at
+/// `if not sound ...` into each jump site, preserving the natural fallback path and avoiding a
+/// raw orphan goto. It is intentionally limited to one join variable and terminal suffixes.
+pub fn replace_orphan_gotos_with_terminal_continuation(root: &mut Vec<Stmt>) {
+    for stmt in root.iter_mut() {
+        for_each_block_mut(stmt, replace_orphan_gotos_with_terminal_continuation);
+    }
+    while replace_orphan_gotos_with_terminal_continuation_once(root) {}
+}
+
+/// Recover missing-label joins whose purpose was to skip a bounded fallback block before the
+/// next read of the selected value:
+///
+/// ```lua
+/// if fast then
+///     value = cached
+///     goto done
+/// end
+/// value = compute()
+/// if value then
+///     use(value)
+/// end
+/// ```
+///
+/// becomes:
+///
+/// ```lua
+/// if fast then
+///     value = cached
+/// else
+///     value = compute()
+/// end
+/// if value then
+///     use(value)
+/// end
+/// ```
+///
+/// The pass is deliberately conservative: it only handles one synthesized join variable, only
+/// moves a small label-free/goto-free fallback region, and widens locals that are still needed
+/// after the join.
+pub fn recover_orphan_if_fallback_gotos(root: &mut Vec<Stmt>) {
+    for stmt in root.iter_mut() {
+        for_each_block_mut(stmt, recover_orphan_if_fallback_gotos);
+    }
+    while recover_orphan_if_fallback_once(root) {}
+}
+
+/// Recover missing-label skips where the target was a short fallthrough point after a bounded
+/// calculation block:
+///
+/// ```lua
+/// if skip_a then goto done end
+/// if skip_b then goto done end
+/// update()
+/// local next = ...
+/// ```
+///
+/// becomes:
+///
+/// ```lua
+/// if not (skip_a or skip_b) then
+///     update()
+/// end
+/// local next = ...
+/// ```
+///
+/// This only runs when every jump to the missing label is in one consecutive guard run, so it
+/// never guesses across unrelated branches.
+pub fn recover_orphan_skip_blocks(root: &mut Vec<Stmt>) {
+    for stmt in root.iter_mut() {
+        for_each_block_mut(stmt, recover_orphan_skip_blocks);
+    }
+    while recover_orphan_skip_block_once(root) {}
+}
+
+pub fn recover_nested_orphan_skip_gotos(root: &mut Vec<Stmt>) {
+    for stmt in root.iter_mut() {
+        for_each_block_mut(stmt, recover_nested_orphan_skip_gotos);
+    }
+    while recover_nested_orphan_skip_once(root) || recover_orphan_multistmt_skip_once(root) {}
+}
+
+pub fn retarget_missing_gotos_to_next_label(root: &mut [Stmt]) {
+    for stmt in root.iter_mut() {
+        for_each_block_mut(stmt, |block| retarget_missing_gotos_to_next_label(block));
+    }
+    while retarget_missing_goto_to_next_label_once(root) {}
+}
+
+pub fn recover_loop_bool_selector_gotos(root: &mut Vec<Stmt>) {
+    for stmt in root.iter_mut() {
+        for_each_block_mut(stmt, recover_loop_bool_selector_gotos);
+    }
+    while recover_loop_bool_selector_once(root)
+        || recover_loop_bool_assignment_break_once(root)
+        || recover_loop_bool_guard_break_once(root)
+        || remove_trailing_missing_loop_goto_once(root)
+    {}
+}
+
+pub fn recover_loop_find_breaks(root: &mut Vec<Stmt>) {
+    for stmt in root.iter_mut() {
+        for_each_block_mut(stmt, recover_loop_find_breaks);
+    }
+    while recover_loop_find_break_once(root) || recover_loop_find_fallback_block_once(root) {}
+}
+
+pub fn recover_forward_label_skip_gotos(root: &mut Vec<Stmt>) {
+    for stmt in root.iter_mut() {
+        for_each_block_mut(stmt, recover_forward_label_skip_gotos);
+    }
+    while recover_forward_label_skip_once(root) {}
+}
+
+pub fn recover_missing_label_skip_to_block_end_gotos(root: &mut Vec<Stmt>) {
+    for stmt in root.iter_mut() {
+        for_each_block_mut(stmt, recover_missing_label_skip_to_block_end_gotos);
+    }
+    while recover_missing_label_skip_to_block_end_once(root) {}
+}
+
+pub fn recover_missing_guard_skip_to_block_end_gotos(root: &mut Vec<Stmt>) {
+    for stmt in root.iter_mut() {
+        for_each_block_mut(stmt, recover_missing_guard_skip_to_block_end_gotos);
+    }
+    while recover_missing_guard_skip_to_block_end_once(root) {}
+}
+
+pub fn recover_duplicate_labeled_terminal_bodies(root: &mut Vec<Stmt>) {
+    for stmt in root.iter_mut() {
+        for_each_block_mut(stmt, recover_duplicate_labeled_terminal_bodies);
+    }
+    while recover_duplicate_labeled_terminal_body_once(root) {}
+}
+
+pub fn recover_duplicate_labeled_bodies(root: &mut Vec<Stmt>) {
+    for stmt in root.iter_mut() {
+        for_each_block_mut(stmt, recover_duplicate_labeled_bodies);
+    }
+    while recover_duplicate_labeled_body_once(root) {}
+}
+
+fn recover_loop_find_break_once(root: &mut Vec<Stmt>) -> bool {
+    let mut i = 0;
+    while i + 1 < root.len() {
+        if !is_loop_stmt(&root[i]) {
+            i += 1;
+            continue;
+        }
+        let Some((result_var, default_value)) = sole_var_assign(&root[i + 1]) else {
+            i += 1;
+            continue;
+        };
+        let default_is_nil = matches!(default_value, Expr::Nil);
+        let labels = label_names(root);
+        let goto_labels = goto_names_in_stmt(&root[i]);
+        for label in goto_labels {
+            let label_after_default =
+                matches!(root.get(i + 2), Some(Stmt::Label(name)) if name == &label);
+            if !default_is_nil && !label_after_default {
+                continue;
+            }
+            let loop_gotos = count_gotos_named_stmt(&root[i], &label);
+            if labels.contains(&label)
+                && (!label_after_default || count_gotos_named(root, &label) != loop_gotos)
+            {
+                continue;
+            }
+            let Some(body) = loop_body_mut(&mut root[i]) else {
+                continue;
+            };
+            if has_goto_in_nested_loop(body, &label, false)
+                || !all_gotos_preceded_by_assign_to(body, &label, &result_var)
+            {
+                continue;
+            }
+            replace_gotos_with_break(body, &label);
+            let default = root.remove(i + 1);
+            root.insert(i, default);
+            if label_after_default
+                && matches!(root.get(i + 2), Some(Stmt::Label(name)) if name == &label)
+            {
+                root.remove(i + 2);
+            }
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn recover_loop_find_fallback_block_once(root: &mut Vec<Stmt>) -> bool {
+    let mut i = 0;
+    while i + 2 < root.len() {
+        if !is_loop_stmt(&root[i]) {
+            i += 1;
+            continue;
+        }
+        let labels = goto_names_in_stmt(&root[i]);
+        for label in labels {
+            let Some(label_idx) = root[i + 2..]
+                .iter()
+                .position(|stmt| matches!(stmt, Stmt::Label(name) if name == &label))
+                .map(|offset| i + 2 + offset)
+            else {
+                continue;
+            };
+            let fallback = &root[i + 1..label_idx];
+            let Some((result_var, _)) = fallback.last().and_then(sole_var_assign) else {
+                continue;
+            };
+            let loop_gotos = count_gotos_named_stmt(&root[i], &label);
+            if fallback.len() > 6
+                || loop_gotos == 0
+                || count_gotos_named(root, &label) != loop_gotos
+                || contains_label_or_goto(fallback)
+                || !fallback.iter().all(is_pure_assignment_stmt)
+            {
+                continue;
+            }
+
+            let Some(body) = loop_body_mut(&mut root[i]) else {
+                continue;
+            };
+            if has_goto_in_nested_loop(body, &label, false)
+                || !all_gotos_preceded_by_assign_to(body, &label, &result_var)
+            {
+                continue;
+            }
+
+            replace_gotos_with_break(body, &label);
+            let fallback = root[i + 1..label_idx].to_vec();
+            root.drain(i + 1..=label_idx);
+            for (offset, stmt) in fallback.into_iter().enumerate() {
+                root.insert(i + offset, stmt);
+            }
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn is_pure_assignment_stmt(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Assign { targets, values } => {
+            targets.iter().all(|target| matches!(target, Expr::Var(_)))
+                && values.iter().all(is_pure)
+        }
+        Stmt::Local { values, .. } => values.iter().all(is_pure),
+        _ => false,
+    }
+}
+
+fn recover_forward_label_skip_once(root: &mut Vec<Stmt>) -> bool {
+    for label_idx in 2..root.len() {
+        let Stmt::Label(label) = &root[label_idx] else {
+            continue;
+        };
+        let label = label.clone();
+        let Some(first_goto_idx) = root[..label_idx]
+            .iter()
+            .position(|stmt| count_gotos_named_stmt(stmt, &label) > 0)
+        else {
+            continue;
+        };
+        let region_gotos = count_gotos_named(&root[first_goto_idx..label_idx], &label);
+        if region_gotos == 0
+            || count_gotos_named(root, &label) != region_gotos
+            || label_idx - first_goto_idx > 32
+            || contains_label_or_goto_except_gotos(&root[first_goto_idx..label_idx], &label)
+            || contains_break_continue(&root[first_goto_idx..label_idx])
+            || has_goto_in_nested_loop(&root[first_goto_idx..label_idx], &label, false)
+        {
+            continue;
+        }
+
+        let mut wrapped = root[first_goto_idx..label_idx].to_vec();
+        replace_gotos_with_break(&mut wrapped, &label);
+        root.splice(
+            first_goto_idx..=label_idx,
+            [Stmt::Repeat {
+                body: wrapped,
+                cond: Expr::Bool(true),
+            }],
+        );
+        return true;
+    }
+    false
+}
+
+fn recover_missing_label_skip_to_block_end_once(root: &mut Vec<Stmt>) -> bool {
+    let labels = label_names(root);
+    let missing = missing_goto_labels(root, &labels);
+    for label in missing {
+        let Some(first_goto_idx) = root
+            .iter()
+            .position(|stmt| count_gotos_named_stmt(stmt, &label) > 0)
+        else {
+            continue;
+        };
+        let region = &root[first_goto_idx..];
+        let region_gotos = count_gotos_named(region, &label);
+        if region_gotos == 0
+            || count_gotos_named(root, &label) != region_gotos
+            || region.len() > 32
+            || contains_label_or_goto_except_gotos(region, &label)
+            || contains_direct_break_continue(region)
+            || has_goto_in_nested_loop(region, &label, false)
+        {
+            continue;
+        }
+
+        let mut wrapped = root.split_off(first_goto_idx);
+        replace_gotos_with_break(&mut wrapped, &label);
+        root.push(Stmt::Repeat {
+            body: wrapped,
+            cond: Expr::Bool(true),
+        });
+        return true;
+    }
+    false
+}
+
+fn recover_missing_guard_skip_to_block_end_once(root: &mut Vec<Stmt>) -> bool {
+    let labels = label_names(root);
+    let mut i = 0;
+    while i + 1 < root.len() {
+        let Some((cond, label)) = conditional_goto_expr(&root[i], None) else {
+            i += 1;
+            continue;
+        };
+        let goto_count = count_gotos_named_stmt(&root[i], &label);
+        let tail = &root[i + 1..];
+        if labels.contains(&label)
+            || goto_count == 0
+            || count_gotos_named(root, &label) != goto_count
+            || tail.is_empty()
+            || tail.len() > 32
+            || contains_label_or_goto(tail)
+        {
+            i += 1;
+            continue;
+        }
+
+        let then_body = tail.to_vec();
+        root.truncate(i);
+        root.push(Stmt::If {
+            cond: negate_condition(cond),
+            then_body,
+            else_body: Vec::new(),
+        });
+        return true;
+    }
+    false
+}
+
+fn recover_duplicate_labeled_terminal_body_once(root: &mut Vec<Stmt>) -> bool {
+    let mut candidates: BTreeMap<String, Vec<Vec<Stmt>>> = BTreeMap::new();
+    for stmt in root.iter() {
+        collect_immediate_labeled_terminal_bodies(stmt, &mut candidates);
+    }
+
+    for (label, bodies) in candidates {
+        let Some(first) = bodies.first() else {
+            continue;
+        };
+        if first.is_empty()
+            || contains_label_or_goto(first)
+            || !block_ends_terminated(first)
+            || !bodies.iter().all(|body| body == first)
+            || count_gotos_named(root, &label) == 0
+            || has_goto_in_nested_loop(root, &label, false)
+        {
+            continue;
+        }
+
+        replace_gotos_with_body(root, &label, first);
+        strip_leading_labels_named(root, &label);
+        return true;
+    }
+    false
+}
+
+fn recover_duplicate_labeled_body_once(root: &mut Vec<Stmt>) -> bool {
+    let mut candidates: BTreeMap<String, Vec<Vec<Stmt>>> = BTreeMap::new();
+    for stmt in root.iter() {
+        collect_immediate_labeled_bodies(stmt, &mut candidates);
+    }
+
+    for (label, bodies) in candidates {
+        let Some(first) = bodies.first() else {
+            continue;
+        };
+        if first.is_empty()
+            || contains_label_or_goto(first)
+            || contains_direct_break_continue(first)
+            || !bodies.iter().all(|body| body == first)
+            || count_labels_named(root, &label) != bodies.len()
+            || count_gotos_named(root, &label) == 0
+            || has_goto_in_nested_loop(root, &label, false)
+        {
+            continue;
+        }
+
+        replace_gotos_with_body(root, &label, first);
+        strip_leading_labels_named(root, &label);
+        return true;
+    }
+    false
+}
+
+fn collect_immediate_labeled_terminal_bodies(
+    stmt: &Stmt,
+    candidates: &mut BTreeMap<String, Vec<Vec<Stmt>>>,
+) {
+    let Stmt::If {
+        then_body,
+        else_body,
+        ..
+    } = stmt
+    else {
+        return;
+    };
+
+    for body in [then_body, else_body] {
+        let Some(Stmt::Label(label)) = body.first() else {
+            continue;
+        };
+        let tail = body[1..].to_vec();
+        if block_ends_terminated(&tail) {
+            candidates.entry(label.clone()).or_default().push(tail);
+        }
+    }
+}
+
+fn collect_immediate_labeled_bodies(
+    stmt: &Stmt,
+    candidates: &mut BTreeMap<String, Vec<Vec<Stmt>>>,
+) {
+    let Stmt::If {
+        then_body,
+        else_body,
+        ..
+    } = stmt
+    else {
+        return;
+    };
+
+    for body in [then_body, else_body] {
+        let Some(Stmt::Label(label)) = body.first() else {
+            continue;
+        };
+        candidates
+            .entry(label.clone())
+            .or_default()
+            .push(body[1..].to_vec());
+    }
+}
+
+fn replace_gotos_with_body(stmts: &mut Vec<Stmt>, label: &str, body: &[Stmt]) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i < stmts.len() {
+        match &mut stmts[i] {
+            Stmt::Goto(target) if target == label => {
+                stmts.splice(i..=i, body.to_vec());
+                i += body.len();
+                changed = true;
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                changed |= replace_gotos_with_body(then_body, label, body);
+                changed |= replace_gotos_with_body(else_body, label, body);
+                i += 1;
+            }
+            Stmt::While {
+                body: loop_body, ..
+            }
+            | Stmt::Repeat {
+                body: loop_body, ..
+            }
+            | Stmt::NumericFor {
+                body: loop_body, ..
+            }
+            | Stmt::GenericFor {
+                body: loop_body, ..
+            } => {
+                changed |= replace_gotos_with_body(loop_body, label, body);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    changed
+}
+
+fn strip_leading_labels_named(stmts: &mut Vec<Stmt>, label: &str) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if matches!(then_body.first(), Some(Stmt::Label(name)) if name == label) {
+                    then_body.remove(0);
+                }
+                if matches!(else_body.first(), Some(Stmt::Label(name)) if name == label) {
+                    else_body.remove(0);
+                }
+                strip_leading_labels_named(then_body, label);
+                strip_leading_labels_named(else_body, label);
+            }
+            Stmt::While { body, .. }
+            | Stmt::Repeat { body, .. }
+            | Stmt::NumericFor { body, .. }
+            | Stmt::GenericFor { body, .. } => strip_leading_labels_named(body, label),
+            _ => {}
+        }
+    }
+}
+
+fn all_gotos_preceded_by_assign_to(stmts: &[Stmt], label: &str, var: &str) -> bool {
+    let mut found = false;
+    all_gotos_preceded_by_assign_to_inner(stmts, label, var, &mut found) && found
+}
+
+fn all_gotos_preceded_by_assign_to_inner(
+    stmts: &[Stmt],
+    label: &str,
+    var: &str,
+    found: &mut bool,
+) -> bool {
+    for (idx, stmt) in stmts.iter().enumerate() {
+        match stmt {
+            Stmt::Goto(target) if target == label => {
+                *found = true;
+                let Some(prev) = idx.checked_sub(1).and_then(|prev| stmts.get(prev)) else {
+                    return false;
+                };
+                if !matches!(sole_var_assign(prev), Some((name, _)) if name == var) {
+                    return false;
+                }
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } if !all_gotos_preceded_by_assign_to_inner(then_body, label, var, found)
+                || !all_gotos_preceded_by_assign_to_inner(else_body, label, var, found) =>
+            {
+                return false;
+            }
+            Stmt::While { body, .. }
+            | Stmt::Repeat { body, .. }
+            | Stmt::NumericFor { body, .. }
+            | Stmt::GenericFor { body, .. }
+                if !all_gotos_preceded_by_assign_to_inner(body, label, var, found) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+fn retarget_missing_goto_to_next_label_once(root: &mut [Stmt]) -> bool {
+    let labels = label_names(root);
+    for i in 0..root.len() {
+        let missing: Vec<String> = goto_names_in_stmt(&root[i])
+            .into_iter()
+            .filter(|label| !labels.contains(label))
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let Some(next_label) = root[i + 1..].iter().find_map(|stmt| match stmt {
+            Stmt::Label(label) => Some(label.clone()),
+            _ => None,
+        }) else {
+            continue;
+        };
+
+        for label in missing {
+            if has_goto_in_nested_loop(std::slice::from_ref(&root[i]), &label, false) {
+                continue;
+            }
+            if retarget_gotos_in_stmt(&mut root[i], &label, &next_label) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn retarget_gotos_in_stmt(stmt: &mut Stmt, from: &str, to: &str) -> bool {
+    match stmt {
+        Stmt::Goto(label) if label == from => {
+            *label = to.to_string();
+            true
+        }
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            retarget_gotos_in_block(then_body, from, to)
+                | retarget_gotos_in_block(else_body, from, to)
+        }
+        Stmt::While { body, .. }
+        | Stmt::Repeat { body, .. }
+        | Stmt::NumericFor { body, .. }
+        | Stmt::GenericFor { body, .. } => retarget_gotos_in_block(body, from, to),
+        _ => false,
+    }
+}
+
+fn retarget_gotos_in_block(stmts: &mut [Stmt], from: &str, to: &str) -> bool {
+    let mut changed = false;
+    for stmt in stmts {
+        changed |= retarget_gotos_in_stmt(stmt, from, to);
+    }
+    changed
+}
+
+fn recover_loop_bool_selector_once(root: &mut Vec<Stmt>) -> bool {
+    let mut i = 0;
+    while i + 2 < root.len() {
+        if !is_loop_stmt(&root[i]) {
+            i += 1;
+            continue;
+        }
+        let Some((selector, Expr::Bool(true))) = sole_var_assign(&root[i + 1]) else {
+            i += 1;
+            continue;
+        };
+        if !if_is_negated_selector(&root[i + 2], &selector) {
+            i += 1;
+            continue;
+        }
+
+        let labels = goto_names_in_stmt(&root[i]);
+        for label in labels {
+            let Some(body) = loop_body_mut(&mut root[i]) else {
+                continue;
+            };
+            if !all_gotos_preceded_by_bool_assign(body, &label, &selector, false) {
+                continue;
+            }
+            replace_gotos_with_break(body, &label);
+            if let Stmt::If { cond, .. } = &mut root[i + 2] {
+                *cond = Expr::Unary("not ", Box::new(Expr::Var(selector.clone())));
+            }
+            let init = root.remove(i + 1);
+            root.insert(i, init);
+            return true;
+        }
+
+        i += 1;
+    }
+    false
+}
+
+fn recover_loop_bool_assignment_break_once(root: &mut Vec<Stmt>) -> bool {
+    let mut i = 0;
+    while i + 1 < root.len() {
+        if !is_loop_stmt(&root[i]) {
+            i += 1;
+            continue;
+        }
+        let Some((selector, Expr::Bool(default_value))) = sole_var_assign(&root[i + 1]) else {
+            i += 1;
+            continue;
+        };
+
+        let labels = label_names(root);
+        let goto_labels = goto_names_in_stmt(&root[i]);
+        for label in goto_labels {
+            if labels.contains(&label) {
+                continue;
+            }
+            let Some(body) = loop_body_mut(&mut root[i]) else {
+                continue;
+            };
+            if has_goto_in_nested_loop(body, &label, false)
+                || !all_gotos_preceded_by_bool_assign(body, &label, &selector, !default_value)
+            {
+                continue;
+            }
+
+            replace_gotos_with_break(body, &label);
+            if let Some(next) = root.get_mut(i + 2) {
+                rewrite_const_bool_if_guard(next, &selector, default_value);
+            }
+            let init = root.remove(i + 1);
+            root.insert(i, init);
+            return true;
+        }
+
+        i += 1;
+    }
+    false
+}
+
+fn recover_loop_bool_guard_break_once(root: &mut [Stmt]) -> bool {
+    let mut i = 0;
+    while i + 1 < root.len() {
+        if !is_loop_stmt(&root[i]) {
+            i += 1;
+            continue;
+        }
+        let Some(selector) = if_negated_var(&root[i + 1]) else {
+            i += 1;
+            continue;
+        };
+
+        let labels = label_names(root);
+        let goto_labels = goto_names_in_stmt(&root[i]);
+        for label in goto_labels {
+            if labels.contains(&label) {
+                continue;
+            }
+            let Some(body) = loop_body_mut(&mut root[i]) else {
+                continue;
+            };
+            if has_goto_in_nested_loop(body, &label, false)
+                || !all_gotos_preceded_by_bool_assign(body, &label, &selector, true)
+            {
+                continue;
+            }
+
+            replace_gotos_with_break(body, &label);
+            return true;
+        }
+
+        i += 1;
+    }
+    false
+}
+
+fn remove_trailing_missing_loop_goto_once(root: &mut [Stmt]) -> bool {
+    let labels = label_names(root);
+    for stmt in root {
+        let Some(body) = loop_body_mut(stmt) else {
+            continue;
+        };
+        if remove_tail_missing_goto(body, &labels) {
+            return true;
+        }
+    }
+    false
+}
+
+fn remove_tail_missing_goto(stmts: &mut Vec<Stmt>, labels: &BTreeSet<String>) -> bool {
+    let Some(last) = stmts.last_mut() else {
+        return false;
+    };
+    match last {
+        Stmt::Goto(label) if !labels.contains(label) => {
+            stmts.pop();
+            true
+        }
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            remove_tail_missing_goto(then_body, labels)
+                | remove_tail_missing_goto(else_body, labels)
+        }
+        _ => false,
+    }
+}
+
+fn is_loop_stmt(stmt: &Stmt) -> bool {
+    matches!(
+        stmt,
+        Stmt::While { .. }
+            | Stmt::Repeat { .. }
+            | Stmt::NumericFor { .. }
+            | Stmt::GenericFor { .. }
+    )
+}
+
+fn loop_body_mut(stmt: &mut Stmt) -> Option<&mut Vec<Stmt>> {
+    match stmt {
+        Stmt::While { body, .. }
+        | Stmt::Repeat { body, .. }
+        | Stmt::NumericFor { body, .. }
+        | Stmt::GenericFor { body, .. } => Some(body),
+        _ => None,
+    }
+}
+
+fn if_is_negated_selector(stmt: &Stmt, selector: &str) -> bool {
+    let Stmt::If { cond, .. } = stmt else {
+        return false;
+    };
+    matches!(cond, Expr::Unary("not ", inner) if matches!(inner.as_ref(), Expr::Var(name) if name == selector) || matches!(inner.as_ref(), Expr::Bool(true)))
+}
+
+fn if_negated_var(stmt: &Stmt) -> Option<String> {
+    let Stmt::If { cond, .. } = stmt else {
+        return None;
+    };
+    match cond {
+        Expr::Unary("not ", inner) => match inner.as_ref() {
+            Expr::Var(name) => Some(name.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn rewrite_const_bool_if_guard(stmt: &mut Stmt, selector: &str, value: bool) {
+    let Stmt::If { cond, .. } = stmt else {
+        return;
+    };
+    match cond {
+        Expr::Bool(current) if *current == value => {
+            *cond = Expr::Var(selector.to_string());
+        }
+        Expr::Unary("not ", inner) if matches!(inner.as_ref(), Expr::Bool(current) if *current == value) =>
+        {
+            *cond = Expr::Unary("not ", Box::new(Expr::Var(selector.to_string())));
+        }
+        _ => {}
+    }
+}
+
+fn all_gotos_preceded_by_bool_assign(
+    stmts: &[Stmt],
+    label: &str,
+    selector: &str,
+    value: bool,
+) -> bool {
+    let mut found = false;
+    all_gotos_preceded_by_bool_assign_inner(stmts, label, selector, value, &mut found) && found
+}
+
+fn all_gotos_preceded_by_bool_assign_inner(
+    stmts: &[Stmt],
+    label: &str,
+    selector: &str,
+    value: bool,
+    found: &mut bool,
+) -> bool {
+    for (idx, stmt) in stmts.iter().enumerate() {
+        match stmt {
+            Stmt::Goto(target) if target == label => {
+                *found = true;
+                let Some(prev) = idx.checked_sub(1).and_then(|prev| stmts.get(prev)) else {
+                    return false;
+                };
+                if !matches!(
+                    sole_var_assign(prev),
+                    Some((name, Expr::Bool(v))) if name == selector && v == value
+                ) {
+                    return false;
+                }
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } if !all_gotos_preceded_by_bool_assign_inner(
+                then_body, label, selector, value, found,
+            ) || !all_gotos_preceded_by_bool_assign_inner(
+                else_body, label, selector, value, found,
+            ) =>
+            {
+                return false;
+            }
+            Stmt::While { body, .. }
+            | Stmt::Repeat { body, .. }
+            | Stmt::NumericFor { body, .. }
+            | Stmt::GenericFor { body, .. }
+                if !all_gotos_preceded_by_bool_assign_inner(
+                    body, label, selector, value, found,
+                ) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+fn return_only_labels(root: &[Stmt]) -> BTreeMap<String, Vec<Expr>> {
+    let mut candidates = BTreeMap::new();
+    let mut rejected = BTreeSet::new();
+    collect_return_only_labels(root, &mut candidates, &mut rejected);
+    for label in rejected {
+        candidates.remove(&label);
+    }
+    candidates
+}
+
+fn collect_return_only_labels(
+    stmts: &[Stmt],
+    candidates: &mut BTreeMap<String, Vec<Expr>>,
+    rejected: &mut BTreeSet<String>,
+) {
+    for (idx, stmt) in stmts.iter().enumerate() {
+        match stmt {
+            Stmt::Label(label) => {
+                let Some(Stmt::Return(values)) = stmts.get(idx + 1) else {
+                    rejected.insert(label.clone());
+                    continue;
+                };
+                match candidates.get(label) {
+                    Some(existing) if existing != values => {
+                        rejected.insert(label.clone());
+                    }
+                    Some(_) => {}
+                    None => {
+                        candidates.insert(label.clone(), values.clone());
+                    }
+                }
+            }
+            _ => for_each_block(stmt, |body| {
+                collect_return_only_labels(body, candidates, rejected)
+            }),
+        }
+    }
+}
+
+fn replace_gotos_to_return_labels(stmts: &mut [Stmt], labels: &BTreeMap<String, Vec<Expr>>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Goto(label) => {
+                if let Some(values) = labels.get(label) {
+                    *stmt = Stmt::Return(values.clone());
+                }
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                replace_gotos_to_return_labels(then_body, labels);
+                replace_gotos_to_return_labels(else_body, labels);
+            }
+            Stmt::While { body, .. }
+            | Stmt::Repeat { body, .. }
+            | Stmt::NumericFor { body, .. }
+            | Stmt::GenericFor { body, .. } => replace_gotos_to_return_labels(body, labels),
+            _ => {}
+        }
+    }
+}
+
+fn remove_return_only_labels(stmts: &mut Vec<Stmt>, labels: &BTreeMap<String, Vec<Expr>>) {
+    let mut idx = 0;
+    while idx < stmts.len() {
+        match &mut stmts[idx] {
+            Stmt::Label(label) if labels.contains_key(label) => {
+                stmts.remove(idx);
+            }
+            stmt => {
+                for_each_block_mut(stmt, |body| remove_return_only_labels(body, labels));
+                idx += 1;
+            }
+        }
+    }
+}
+
+fn orphan_terminal_goto_idx(root: &[Stmt]) -> Option<usize> {
+    match root {
+        [.., Stmt::Goto(_)] => Some(root.len() - 1),
+        [.., Stmt::Goto(_), Stmt::Return(values)] if values.is_empty() => Some(root.len() - 2),
+        _ => None,
+    }
+}
+
+fn replace_orphan_gotos_with_terminal_continuation_once(root: &mut Vec<Stmt>) -> bool {
+    let labels = label_names(root);
+    let missing_labels = missing_goto_labels(root, &labels);
+    for label in missing_labels {
+        if has_goto_in_nested_loop(root, &label, false) {
+            continue;
+        }
+        let Some(join_var) = orphan_join_assignment_var(root, &label) else {
+            continue;
+        };
+        let Some(first_goto_idx) = root
+            .iter()
+            .position(|stmt| count_gotos_named_stmt(stmt, &label) > 0)
+        else {
+            continue;
+        };
+
+        for tail_start in first_goto_idx + 1..root.len() {
+            let tail = root[tail_start..].to_vec();
+            if tail.len() > 48
+                || contains_label_or_goto(&tail)
+                || !block_ends_terminated(&tail)
+                || tail_reads_late_local(root, first_goto_idx, tail_start, &tail)
+                || !stmt_reads_var_before_write(&root[tail_start], &join_var)
+            {
+                continue;
+            }
+
+            let mut boundary = tail_start;
+            if replace_gotos_with_tail_return_before(root, &mut boundary, &label, &tail)
+                && count_gotos_named(&root[..boundary], &label) == 0
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn recover_orphan_if_fallback_once(root: &mut Vec<Stmt>) -> bool {
+    let labels = label_names(root);
+    for i in (0..root.len()).rev() {
+        let goto_labels = goto_names_in_stmt(&root[i]);
+        if goto_labels.len() != 1 {
+            continue;
+        }
+        let label = goto_labels.into_iter().next().unwrap();
+        if labels.contains(&label)
+            || has_goto_in_nested_loop(std::slice::from_ref(&root[i]), &label, false)
+        {
+            continue;
+        }
+
+        let mut vars = BTreeSet::new();
+        if !collect_pre_goto_assignment_vars(std::slice::from_ref(&root[i]), &label, &mut vars)
+            || vars.len() != 1
+        {
+            continue;
+        }
+        let join_var = vars.into_iter().next().unwrap();
+
+        let Some(tail_start) =
+            (i + 1..root.len()).find(|&idx| stmt_reads_var_before_write(&root[idx], &join_var))
+        else {
+            continue;
+        };
+        let mut fallback = root[i + 1..tail_start].to_vec();
+        if fallback.is_empty()
+            || fallback.len() > 64
+            || contains_label_or_goto(&fallback)
+            || block_ends_terminated(&fallback)
+        {
+            continue;
+        }
+        widen_locals_read_after_join(&mut fallback, &root[tail_start..]);
+        if !direct_local_scope_safe(&fallback, &root[tail_start..]) {
+            continue;
+        }
+
+        let Some(transformed) = absorb_join_in_stmt(root[i].clone(), &label, fallback) else {
+            continue;
+        };
+        if contains_label_or_goto(std::slice::from_ref(&transformed)) {
+            continue;
+        }
+        root[i] = transformed;
+        root.drain(i + 1..tail_start);
+        return true;
+    }
+    false
+}
+
+fn recover_orphan_skip_block_once(root: &mut Vec<Stmt>) -> bool {
+    let labels = label_names(root);
+    for i in 0..root.len() {
+        let Some((first_cond, label)) = conditional_goto_expr(&root[i], None) else {
+            continue;
+        };
+        if labels.contains(&label)
+            || has_goto_in_nested_loop(std::slice::from_ref(&root[i]), &label, false)
+        {
+            continue;
+        }
+
+        let mut conds = vec![first_cond];
+        let mut guard_end = i + 1;
+        while guard_end < root.len() {
+            let Some((cond, _)) = conditional_goto_expr(&root[guard_end], Some(&label)) else {
+                break;
+            };
+            if has_goto_in_nested_loop(std::slice::from_ref(&root[guard_end]), &label, false) {
+                break;
+            }
+            conds.push(cond);
+            guard_end += 1;
+        }
+
+        let guard_gotos: usize = root[i..guard_end]
+            .iter()
+            .map(|stmt| count_gotos_named_stmt(stmt, &label))
+            .sum();
+        if guard_gotos == 0 || count_gotos_named(root, &label) != guard_gotos {
+            continue;
+        }
+
+        let Some(boundary) = orphan_skip_boundary(root, guard_end) else {
+            continue;
+        };
+        let mut skipped = root[guard_end..boundary].to_vec();
+        widen_locals_read_after_join(&mut skipped, &root[boundary..]);
+        if !direct_local_scope_safe(&skipped, &root[boundary..]) {
+            continue;
+        }
+
+        let Some(skip_cond) = or_all(conds) else {
+            continue;
+        };
+        root.splice(
+            i..boundary,
+            [Stmt::If {
+                cond: negate_condition(skip_cond),
+                then_body: skipped,
+                else_body: Vec::new(),
+            }],
+        );
+        return true;
+    }
+    false
+}
+
+fn recover_nested_orphan_skip_once(root: &mut Vec<Stmt>) -> bool {
+    let labels = label_names(root);
+    for i in 0..root.len() {
+        let goto_labels = goto_names_in_stmt(&root[i]);
+        for label in goto_labels {
+            let goto_count = count_gotos_named_stmt(&root[i], &label);
+            if goto_count == 0
+                || labels.contains(&label)
+                || count_gotos_named(root, &label) != goto_count
+                || has_goto_in_nested_loop(std::slice::from_ref(&root[i]), &label, false)
+            {
+                continue;
+            }
+
+            let Some(boundary) = orphan_skip_boundary(root, i + 1) else {
+                continue;
+            };
+            let mut normal_continuation = root[i + 1..boundary].to_vec();
+            widen_locals_read_after_join(&mut normal_continuation, &root[boundary..]);
+            if !direct_local_scope_safe(&normal_continuation, &root[boundary..]) {
+                continue;
+            }
+
+            let Some(transformed) = route_gotos_to_target_body(
+                vec![root[i].clone()],
+                &label,
+                Vec::new(),
+                normal_continuation,
+            ) else {
+                continue;
+            };
+            if contains_label_or_goto(&transformed) {
+                continue;
+            }
+
+            root.splice(i..boundary, transformed);
+            return true;
+        }
+    }
+    false
+}
+
+fn recover_orphan_multistmt_skip_once(root: &mut Vec<Stmt>) -> bool {
+    let labels = label_names(root);
+    let missing_labels = missing_goto_labels(root, &labels);
+    for label in missing_labels {
+        if has_goto_in_nested_loop(root, &label, false) {
+            continue;
+        }
+        let indices: Vec<usize> = root
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, stmt)| (count_gotos_named_stmt(stmt, &label) > 0).then_some(idx))
+            .collect();
+        let (Some(first), Some(last)) = (indices.first().copied(), indices.last().copied()) else {
+            continue;
+        };
+        if first == last
+            || count_gotos_named(&root[first..=last], &label) != count_gotos_named(root, &label)
+        {
+            continue;
+        }
+        if contains_label_or_goto_except_gotos(&root[first..=last], &label) {
+            continue;
+        }
+
+        let mut end = last + 1;
+        if end < root.len() {
+            let region_writes = direct_writes_in_block(&root[first..=last]);
+            if is_pure_assignment_to_any(&root[end], &region_writes) {
+                end += 1;
+            }
+        }
+
+        let region = root[first..end].to_vec();
+        let Some(transformed) =
+            route_gotos_to_target_body_deep(region, &label, Vec::new(), Vec::new())
+        else {
+            continue;
+        };
+        if transformed.is_empty() || contains_label_or_goto(&transformed) {
+            continue;
+        }
+
+        root.splice(first..end, transformed);
+        return true;
+    }
+    false
+}
+
+fn is_pure_assignment_to_any(stmt: &Stmt, names: &BTreeSet<String>) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    match stmt {
+        Stmt::Assign { targets, values } => {
+            !values.is_empty()
+                && values.iter().all(is_pure)
+                && targets.iter().any(|target| match target {
+                    Expr::Var(name) => names.contains(name),
+                    _ => false,
+                })
+        }
+        Stmt::Local {
+            names: local_names,
+            values,
+        } => {
+            !values.is_empty()
+                && values.iter().all(is_pure)
+                && local_names.iter().any(|name| names.contains(name))
+        }
+        _ => false,
+    }
+}
+
+fn orphan_skip_boundary(root: &[Stmt], start: usize) -> Option<usize> {
+    let max_end = root.len().min(start + 64);
+    for boundary in start + 1..=max_end {
+        let skipped = &root[start..boundary];
+        if contains_label_or_goto(skipped) || block_ends_terminated(skipped) {
+            return None;
+        }
+        if boundary == root.len() {
+            return Some(boundary);
+        }
+
+        let writes = direct_writes_in_block(skipped);
+        if !writes.is_empty()
+            && stmt_reads_any_var_before_write(&root[boundary], &writes)
+            && !stmt_definitely_writes_any_var(&root[boundary], &writes)
+        {
+            return Some(boundary);
+        }
+
+        if matches!(root[boundary], Stmt::Local { .. })
+            && (skipped.len() >= 4 || skipped.last().is_some_and(is_nonlocal_effect_stmt))
+        {
+            return Some(boundary);
+        }
+    }
+    None
+}
+
+fn direct_writes_in_block(stmts: &[Stmt]) -> BTreeSet<String> {
+    let mut writes = BTreeSet::new();
+    for stmt in stmts {
+        writes.extend(writes_of_stmt(stmt));
+    }
+    writes
+}
+
+fn stmt_reads_any_var_before_write(stmt: &Stmt, names: &BTreeSet<String>) -> bool {
+    names
+        .iter()
+        .any(|name| stmt_reads_var_before_write(stmt, name))
+}
+
+fn stmt_definitely_writes_any_var(stmt: &Stmt, names: &BTreeSet<String>) -> bool {
+    names
+        .iter()
+        .any(|name| stmt_definitely_writes_var(stmt, name))
+}
+
+fn is_nonlocal_effect_stmt(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Call(_) => true,
+        Stmt::Assign { targets, .. } => {
+            targets.iter().any(|target| !matches!(target, Expr::Var(_)))
+        }
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => then_body
+            .iter()
+            .chain(else_body)
+            .any(is_nonlocal_effect_stmt),
+        _ => false,
+    }
+}
+
+fn missing_goto_labels(root: &[Stmt], labels: &BTreeSet<String>) -> Vec<String> {
+    let mut gotos = BTreeSet::new();
+    for stmt in root {
+        collect_goto_names(stmt, &mut gotos);
+    }
+    gotos
+        .into_iter()
+        .filter(|label| !labels.contains(label))
+        .collect()
+}
+
+fn orphan_join_assignment_var(root: &[Stmt], label: &str) -> Option<String> {
+    let mut vars = BTreeSet::new();
+    if !collect_pre_goto_assignment_vars(root, label, &mut vars) || vars.len() != 1 {
+        return None;
+    }
+    vars.into_iter().next()
+}
+
+fn collect_pre_goto_assignment_vars(
+    stmts: &[Stmt],
+    label: &str,
+    vars: &mut BTreeSet<String>,
+) -> bool {
+    for (idx, stmt) in stmts.iter().enumerate() {
+        match stmt {
+            Stmt::Goto(target) if target == label => {
+                let Some(prev) = idx.checked_sub(1).and_then(|prev| stmts.get(prev)) else {
+                    return false;
+                };
+                let Some(name) = single_var_assignment_target(prev) else {
+                    return false;
+                };
+                vars.insert(name);
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } if !collect_pre_goto_assignment_vars(then_body, label, vars)
+                || !collect_pre_goto_assignment_vars(else_body, label, vars) =>
+            {
+                return false;
+            }
+            Stmt::While { body, .. }
+            | Stmt::Repeat { body, .. }
+            | Stmt::NumericFor { body, .. }
+            | Stmt::GenericFor { body, .. }
+                if count_gotos_named(body, label) > 0 =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+fn single_var_assignment_target(stmt: &Stmt) -> Option<String> {
+    let Stmt::Assign { targets, values } = stmt else {
+        return None;
+    };
+    if values.len() != 1 {
+        return None;
+    }
+    match targets.as_slice() {
+        [Expr::Var(name)] => Some(name.clone()),
+        _ => None,
+    }
+}
+
+fn stmt_reads_var_before_write(stmt: &Stmt, name: &str) -> bool {
+    match stmt {
+        Stmt::Local { names, values } => {
+            values.iter().any(|value| expr_reads_var(value, name))
+                || (!names.iter().any(|local| local == name)
+                    && stmt_reads_var_recursive(stmt, name))
+        }
+        Stmt::Assign { targets, values } => {
+            values.iter().any(|value| expr_reads_var(value, name))
+                || (!targets.iter().any(|target| expr_writes_var(target, name))
+                    && targets.iter().any(|target| expr_reads_var(target, name)))
+        }
+        Stmt::Call(expr) => expr_reads_var(expr, name),
+        Stmt::Return(values) => values.iter().any(|value| expr_reads_var(value, name)),
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            expr_reads_var(cond, name)
+                || block_reads_var_before_write(then_body, name)
+                || block_reads_var_before_write(else_body, name)
+        }
+        Stmt::While { cond, body } => {
+            expr_reads_var(cond, name) || block_reads_var_before_write(body, name)
+        }
+        Stmt::Repeat { cond, body } => {
+            body.iter()
+                .any(|stmt| stmt_reads_var_before_write(stmt, name))
+                || expr_reads_var(cond, name)
+        }
+        Stmt::NumericFor {
+            start, limit, step, ..
+        } => {
+            expr_reads_var(start, name)
+                || expr_reads_var(limit, name)
+                || step.as_ref().is_some_and(|step| expr_reads_var(step, name))
+        }
+        Stmt::GenericFor { vars, exprs, .. } => {
+            !vars.iter().any(|var| var == name)
+                && exprs.iter().any(|expr| expr_reads_var(expr, name))
+        }
+        Stmt::Break | Stmt::Continue | Stmt::Label(_) | Stmt::Goto(_) | Stmt::Comment(_) => false,
+    }
+}
+
+fn block_reads_var_before_write(stmts: &[Stmt], name: &str) -> bool {
+    for stmt in stmts {
+        if stmt_reads_var_before_write(stmt, name) {
+            return true;
+        }
+        if stmt_definitely_writes_var(stmt, name) {
+            return false;
+        }
+    }
+    false
+}
+
+fn stmt_definitely_writes_var(stmt: &Stmt, name: &str) -> bool {
+    match stmt {
+        Stmt::Local { names, .. } => names.iter().any(|local| local == name),
+        Stmt::Assign { targets, .. } => targets.iter().any(|target| expr_writes_var(target, name)),
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } if !else_body.is_empty() => {
+            block_definitely_writes_var(then_body, name)
+                && block_definitely_writes_var(else_body, name)
+        }
+        _ => false,
+    }
+}
+
+fn block_definitely_writes_var(stmts: &[Stmt], name: &str) -> bool {
+    stmts
+        .iter()
+        .any(|stmt| stmt_definitely_writes_var(stmt, name))
+}
+
+fn expr_writes_var(expr: &Expr, name: &str) -> bool {
+    matches!(expr, Expr::Var(var) if var == name)
+}
+
+fn terminal_label_tail(root: &[Stmt]) -> Option<(usize, String, Vec<Stmt>)> {
+    for (idx, stmt) in root.iter().enumerate() {
+        let Stmt::Label(label) = stmt else {
+            continue;
+        };
+        let tail = &root[idx + 1..];
+        if tail.is_empty()
+            || tail.len() > 8
+            || contains_label_or_goto(tail)
+            || !tail.iter().all(is_simple_terminal_tail_stmt)
+            || count_gotos_named(&root[..idx], label) == 0
+        {
+            continue;
+        }
+        return Some((idx, label.clone(), tail.to_vec()));
+    }
+    None
+}
+
+fn is_simple_terminal_tail_stmt(stmt: &Stmt) -> bool {
+    matches!(stmt, Stmt::Assign { .. } | Stmt::Call(_) | Stmt::Return(_))
+}
+
+fn tail_reads_late_local(
+    root: &[Stmt],
+    first_goto_idx: usize,
+    label_idx: usize,
+    tail: &[Stmt],
+) -> bool {
+    let mut late_locals = BTreeSet::new();
+    for stmt in &root[first_goto_idx + 1..label_idx] {
+        if let Stmt::Local { names, .. } = stmt {
+            late_locals.extend(names.iter().cloned());
+        }
+    }
+    !late_locals.is_empty()
+        && tail.iter().any(|stmt| {
+            late_locals
+                .iter()
+                .any(|name| stmt_reads_var_recursive(stmt, name))
+        })
+}
+
+fn replace_gotos_with_tail_return_before(
+    root: &mut Vec<Stmt>,
+    label_idx: &mut usize,
+    label: &str,
+    tail: &[Stmt],
+) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i < *label_idx {
+        match &mut root[i] {
+            Stmt::Goto(target) if target == label => {
+                let mut replacement = tail.to_vec();
+                if !block_ends_terminated(&replacement) {
+                    replacement.push(Stmt::Return(Vec::new()));
+                }
+                let replacement_len = replacement.len();
+                root.splice(i..=i, replacement);
+                *label_idx += replacement_len - 1;
+                i += replacement_len;
+                changed = true;
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                changed |= replace_gotos_with_tail_return_in_block(then_body, label, tail);
+                changed |= replace_gotos_with_tail_return_in_block(else_body, label, tail);
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    changed
+}
+
+fn replace_gotos_with_tail_return_in_block(
+    stmts: &mut Vec<Stmt>,
+    label: &str,
+    tail: &[Stmt],
+) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i < stmts.len() {
+        match &mut stmts[i] {
+            Stmt::Goto(target) if target == label => {
+                let mut replacement = tail.to_vec();
+                if !block_ends_terminated(&replacement) {
+                    replacement.push(Stmt::Return(Vec::new()));
+                }
+                let replacement_len = replacement.len();
+                stmts.splice(i..=i, replacement);
+                i += replacement_len;
+                changed = true;
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                changed |= replace_gotos_with_tail_return_in_block(then_body, label, tail);
+                changed |= replace_gotos_with_tail_return_in_block(else_body, label, tail);
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    changed
+}
+
+fn replace_gotos_with_terminal_tail_before(
+    root: &mut Vec<Stmt>,
+    label_idx: &mut usize,
+    label: &str,
+    tail: &[Stmt],
+) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i < *label_idx {
+        match &mut root[i] {
+            Stmt::Goto(target) if target == label => {
+                let replacement = tail.to_vec();
+                let replacement_len = replacement.len();
+                root.splice(i..=i, replacement);
+                *label_idx += replacement_len - 1;
+                i += replacement_len;
+                changed = true;
+            }
+            stmt => {
+                changed |= replace_gotos_with_terminal_tail_in_stmt(stmt, label, tail);
+                i += 1;
+            }
+        }
+    }
+    changed
+}
+
+fn replace_gotos_with_terminal_tail_in_stmt(stmt: &mut Stmt, label: &str, tail: &[Stmt]) -> bool {
+    let mut changed = false;
+    for_each_block_mut(stmt, |body| {
+        changed |= replace_gotos_with_terminal_tail_in_block(body, label, tail);
+    });
+    changed
+}
+
+fn replace_gotos_with_terminal_tail_in_block(
+    stmts: &mut Vec<Stmt>,
+    label: &str,
+    tail: &[Stmt],
+) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i < stmts.len() {
+        match &mut stmts[i] {
+            Stmt::Goto(target) if target == label => {
+                let replacement = tail.to_vec();
+                let replacement_len = replacement.len();
+                stmts.splice(i..=i, replacement);
+                i += replacement_len;
+                changed = true;
+            }
+            stmt => {
+                changed |= replace_gotos_with_terminal_tail_in_stmt(stmt, label, tail);
+                i += 1;
+            }
+        }
+    }
+    changed
+}
+
+fn terminal_label(root: &[Stmt]) -> Option<(usize, String)> {
+    match root {
+        [.., Stmt::Label(label)] => Some((root.len() - 1, label.clone())),
+        [.., Stmt::Label(label), Stmt::Return(values)] if values.is_empty() => {
+            Some((root.len() - 2, label.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn replace_gotos_with_return(stmts: &mut [Stmt], target_label: &str) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Goto(label) if label == target_label => {
+                *stmt = Stmt::Return(Vec::new());
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                replace_gotos_with_return(then_body, target_label);
+                replace_gotos_with_return(else_body, target_label);
+            }
+            Stmt::While { body, .. }
+            | Stmt::Repeat { body, .. }
+            | Stmt::NumericFor { body, .. }
+            | Stmt::GenericFor { body, .. } => {
+                replace_gotos_with_return(body, target_label);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Recover loop-carried callback transforms that compile as:
@@ -1170,6 +2986,24 @@ fn label_exists(stmts: &[Stmt], label: &str) -> bool {
     })
 }
 
+fn label_names(stmts: &[Stmt]) -> BTreeSet<String> {
+    let mut labels = BTreeSet::new();
+    fn collect(stmts: &[Stmt], labels: &mut BTreeSet<String>) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Label(name) => {
+                    labels.insert(name.clone());
+                }
+                _ => {
+                    for_each_block(stmt, |body| collect(body, labels));
+                }
+            }
+        }
+    }
+    collect(stmts, &mut labels);
+    labels
+}
+
 /// Recover simple forward gotos used only to skip a block:
 ///
 /// ```text
@@ -1304,7 +3138,12 @@ pub fn recover_goto_into_if_gates(root: &mut Vec<Stmt>) {
     for s in root.iter_mut() {
         for_each_block_mut(s, recover_goto_into_if_gates);
     }
-    while recover_goto_into_if_gate_once(root) {}
+    while recover_goto_into_if_gate_once(root)
+        || recover_goto_into_later_if_chain_once(root)
+        || recover_goto_into_later_if_gate_once(root)
+        || recover_goto_into_if_chain_once(root)
+        || recover_nested_goto_to_later_label_once(root)
+    {}
 }
 
 /// Recover top-tested loops that survived the bytecode structurer as a label plus a nested
@@ -1617,7 +3456,7 @@ fn recover_goto_into_if_gate_once(root: &mut Vec<Stmt>) -> bool {
             continue;
         };
         let guard_gotos = count_gotos_named_stmt(&root[i], &label);
-        if guard_gotos == 0 || count_gotos_named(root, &label) != guard_gotos {
+        if guard_gotos == 0 {
             i += 1;
             continue;
         }
@@ -1633,7 +3472,7 @@ fn recover_goto_into_if_gate_once(root: &mut Vec<Stmt>) -> bool {
         };
         if !else_body.is_empty()
             || !matches!(then_body.first(), Some(Stmt::Label(name)) if name == &label)
-            || contains_label_or_goto(&then_body[1..])
+            || !label_names(&then_body[1..]).is_empty()
         {
             i += 1;
             continue;
@@ -1649,6 +3488,502 @@ fn recover_goto_into_if_gate_once(root: &mut Vec<Stmt>) -> bool {
         return true;
     }
     false
+}
+
+fn recover_goto_into_if_chain_once(root: &mut Vec<Stmt>) -> bool {
+    let mut i = 0;
+    while i + 1 < root.len() {
+        let Some((entry_cond, label)) = conditional_goto_expr(&root[i], None) else {
+            i += 1;
+            continue;
+        };
+        let guard_gotos = count_gotos_named_stmt(&root[i], &label);
+        if guard_gotos == 0 {
+            i += 1;
+            continue;
+        }
+        if has_goto_in_nested_loop(std::slice::from_ref(&root[i]), &label, false) {
+            i += 1;
+            continue;
+        }
+
+        let Some(transformed) =
+            force_entry_into_labeled_if(root[i + 1].clone(), &label, &entry_cond)
+        else {
+            i += 1;
+            continue;
+        };
+        if contains_label_or_goto(std::slice::from_ref(&transformed)) {
+            i += 1;
+            continue;
+        }
+
+        root[i + 1] = transformed;
+        root.remove(i);
+        return true;
+    }
+    false
+}
+
+fn recover_goto_into_later_if_chain_once(root: &mut Vec<Stmt>) -> bool {
+    let mut i = 0;
+    while i + 2 < root.len() {
+        let Some((entry_cond, label)) = conditional_goto_expr(&root[i], None) else {
+            i += 1;
+            continue;
+        };
+        let guard_gotos = count_gotos_named_stmt(&root[i], &label);
+        if guard_gotos == 0 {
+            i += 1;
+            continue;
+        }
+        if has_goto_in_nested_loop(std::slice::from_ref(&root[i]), &label, false) {
+            i += 1;
+            continue;
+        }
+        if count_gotos_named(root, &label) != guard_gotos {
+            i += 1;
+            continue;
+        }
+
+        let search_end = root.len().min(i + 48);
+        for target_idx in i + 2..search_end {
+            if !block_contains_label(std::slice::from_ref(&root[target_idx]), &label) {
+                continue;
+            }
+            let prefix = root[i + 1..target_idx].to_vec();
+            if prefix.is_empty()
+                || prefix.len() > 32
+                || contains_label_or_goto(&prefix)
+                || block_ends_terminated(&prefix)
+            {
+                continue;
+            }
+            if !direct_local_scope_safe(&prefix, &root[target_idx + 1..]) {
+                continue;
+            }
+
+            let Some((target_body, target_without_labels)) =
+                duplicate_labeled_if_chain_body_and_strip(root[target_idx].clone(), &label)
+            else {
+                continue;
+            };
+            if target_body.is_empty()
+                || contains_label_or_goto(&target_body)
+                || contains_label_or_goto(std::slice::from_ref(&target_without_labels))
+            {
+                continue;
+            }
+
+            let mut else_body = prefix;
+            else_body.push(target_without_labels);
+            root[target_idx] = Stmt::If {
+                cond: entry_cond,
+                then_body: target_body,
+                else_body,
+            };
+            root.drain(i..target_idx);
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn recover_goto_into_later_if_gate_once(root: &mut Vec<Stmt>) -> bool {
+    let mut i = 0;
+    while i + 2 < root.len() {
+        let Some((entry_cond, label)) = conditional_goto_expr(&root[i], None) else {
+            i += 1;
+            continue;
+        };
+        let guard_gotos = count_gotos_named_stmt(&root[i], &label);
+        if guard_gotos == 0 {
+            i += 1;
+            continue;
+        }
+        if has_goto_in_nested_loop(std::slice::from_ref(&root[i]), &label, false) {
+            i += 1;
+            continue;
+        }
+
+        let search_end = root.len().min(i + 48);
+        for target_idx in i + 2..search_end {
+            if !block_contains_label(std::slice::from_ref(&root[target_idx]), &label) {
+                continue;
+            }
+            let prefix = root[i + 1..target_idx].to_vec();
+            if prefix.is_empty()
+                || prefix.len() > 32
+                || contains_label_or_goto(&prefix)
+                || block_ends_terminated(&prefix)
+            {
+                continue;
+            }
+            let region_gotos = count_gotos_named(&root[i..=target_idx], &label);
+            if region_gotos != guard_gotos
+                || (count_gotos_named(root, &label) != region_gotos
+                    && count_labels_named_outside(root, &label, i, target_idx) == 0)
+            {
+                continue;
+            }
+
+            let Some((target_body, target_without_label)) =
+                split_tail_label_continuation(root[target_idx].clone(), &label)
+            else {
+                continue;
+            };
+            if target_body.is_empty()
+                || contains_label_or_goto(&target_body)
+                || contains_label_or_goto(std::slice::from_ref(&target_without_label))
+            {
+                continue;
+            }
+
+            let mut else_body = prefix;
+            else_body.push(target_without_label);
+            root.splice(
+                i..=target_idx,
+                [Stmt::If {
+                    cond: entry_cond,
+                    then_body: target_body,
+                    else_body,
+                }],
+            );
+            return true;
+        }
+
+        i += 1;
+    }
+    false
+}
+
+fn recover_nested_goto_to_later_label_once(root: &mut Vec<Stmt>) -> bool {
+    for i in 0..root.len() {
+        let labels = goto_names_in_stmt(&root[i]);
+        for label in labels {
+            let goto_count = count_gotos_named_stmt(&root[i], &label);
+            if goto_count == 0
+                || has_goto_in_nested_loop(std::slice::from_ref(&root[i]), &label, false)
+            {
+                continue;
+            }
+
+            let search_end = root.len().min(i + 48);
+            for target_idx in i + 1..search_end {
+                if !block_contains_label(std::slice::from_ref(&root[target_idx]), &label) {
+                    continue;
+                }
+                let mut normal_continuation = root[i + 1..target_idx].to_vec();
+                let region_gotos = count_gotos_named(&root[i..=target_idx], &label);
+                if normal_continuation.len() > 32
+                    || count_gotos_named(&normal_continuation, &label) != 0
+                    || block_contains_label(&normal_continuation, &label)
+                    || block_ends_terminated(&normal_continuation)
+                    || region_gotos != goto_count
+                    || (count_gotos_named(root, &label) != region_gotos
+                        && count_labels_named_outside(root, &label, i, target_idx) == 0)
+                {
+                    continue;
+                }
+
+                let Some((target_body, target_without_label)) =
+                    split_later_label_target(root[target_idx].clone(), &label)
+                else {
+                    continue;
+                };
+                if count_gotos_named(&target_body, &label) != 0
+                    || block_contains_label(&target_body, &label)
+                    || target_without_label.as_ref().is_some_and(|stmt| {
+                        count_gotos_named_stmt(stmt, &label) != 0
+                            || block_contains_label(std::slice::from_ref(stmt), &label)
+                    })
+                {
+                    continue;
+                }
+                if let Some(target_without_label) = target_without_label {
+                    normal_continuation.push(target_without_label);
+                }
+                widen_locals_read_after_join(&mut normal_continuation, &root[target_idx + 1..]);
+                if !direct_local_scope_safe(&normal_continuation, &root[target_idx + 1..]) {
+                    continue;
+                }
+
+                let Some(transformed) = route_gotos_to_target_body(
+                    vec![root[i].clone()],
+                    &label,
+                    target_body,
+                    normal_continuation,
+                ) else {
+                    continue;
+                };
+                if count_gotos_named(&transformed, &label) != 0
+                    || block_contains_label(&transformed, &label)
+                {
+                    continue;
+                }
+
+                root.splice(i..=target_idx, transformed);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn split_later_label_target(stmt: Stmt, label: &str) -> Option<(Vec<Stmt>, Option<Stmt>)> {
+    match stmt {
+        Stmt::Label(name) if name == label => Some((Vec::new(), None)),
+        other => {
+            let (target, without_label) = split_tail_label_continuation(other, label)?;
+            Some((target, Some(without_label)))
+        }
+    }
+}
+
+fn split_tail_label_continuation(stmt: Stmt, label: &str) -> Option<(Vec<Stmt>, Stmt)> {
+    match stmt {
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            if block_contains_label(&then_body, label) {
+                if block_contains_label(&else_body, label) {
+                    return None;
+                }
+                let (target, then_body) = split_tail_label_continuation_block(then_body, label)?;
+                return Some((
+                    target,
+                    Stmt::If {
+                        cond,
+                        then_body,
+                        else_body,
+                    },
+                ));
+            }
+            if block_contains_label(&else_body, label) {
+                let (target, else_body) = split_tail_label_continuation_block(else_body, label)?;
+                return Some((
+                    target,
+                    Stmt::If {
+                        cond,
+                        then_body,
+                        else_body,
+                    },
+                ));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn split_tail_label_continuation_block(
+    mut stmts: Vec<Stmt>,
+    label: &str,
+) -> Option<(Vec<Stmt>, Vec<Stmt>)> {
+    for idx in 0..stmts.len() {
+        match &stmts[idx] {
+            Stmt::Label(name) if name == label => {
+                let target = stmts[idx + 1..].to_vec();
+                stmts.remove(idx);
+                return Some((target, stmts));
+            }
+            stmt if block_contains_label(std::slice::from_ref(stmt), label) => {
+                if idx + 1 != stmts.len() {
+                    return None;
+                }
+                let (target, replacement) =
+                    split_tail_label_continuation(stmts.remove(idx), label)?;
+                stmts.push(replacement);
+                return Some((target, stmts));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn force_entry_into_labeled_if(stmt: Stmt, label: &str, entry_cond: &Expr) -> Option<Stmt> {
+    let Stmt::If {
+        cond,
+        then_body,
+        else_body,
+    } = stmt
+    else {
+        return None;
+    };
+    if !block_contains_label(&then_body, label) {
+        return None;
+    }
+
+    Some(Stmt::If {
+        cond: Expr::Binary("or", Box::new(entry_cond.clone()), Box::new(cond)),
+        then_body: force_entry_into_labeled_block(then_body, label, entry_cond, true)?,
+        else_body: force_entry_into_labeled_block(else_body, label, entry_cond, false)?,
+    })
+}
+
+fn force_entry_into_labeled_block(
+    stmts: Vec<Stmt>,
+    label: &str,
+    entry_cond: &Expr,
+    route_entry: bool,
+) -> Option<Vec<Stmt>> {
+    let mut out = Vec::new();
+    for stmt in stmts {
+        match stmt {
+            Stmt::Label(name) if name == label => {}
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                let then_has = block_contains_label(&then_body, label);
+                let else_has = block_contains_label(&else_body, label);
+                let cond = if route_entry && then_has {
+                    Expr::Binary("or", Box::new(entry_cond.clone()), Box::new(cond))
+                } else {
+                    cond
+                };
+                if route_entry && else_has && !then_has {
+                    return None;
+                }
+                out.push(Stmt::If {
+                    cond,
+                    then_body: force_entry_into_labeled_block(
+                        then_body,
+                        label,
+                        entry_cond,
+                        route_entry && then_has,
+                    )?,
+                    else_body: force_entry_into_labeled_block(else_body, label, entry_cond, false)?,
+                });
+            }
+            Stmt::While { body, .. }
+            | Stmt::Repeat { body, .. }
+            | Stmt::NumericFor { body, .. }
+            | Stmt::GenericFor { body, .. }
+                if block_contains_label(&body, label) =>
+            {
+                return None;
+            }
+            other => out.push(other),
+        }
+    }
+    Some(out)
+}
+
+fn duplicate_labeled_if_chain_body_and_strip(stmt: Stmt, label: &str) -> Option<(Vec<Stmt>, Stmt)> {
+    let mut bodies = Vec::new();
+    collect_duplicate_labeled_if_chain_bodies(&stmt, label, &mut bodies)?;
+    if bodies.len() < 2 {
+        return None;
+    }
+
+    let first = bodies.first()?.clone();
+    if first.is_empty()
+        || contains_label_or_goto(&first)
+        || !bodies.iter().all(|body| body == &first)
+    {
+        return None;
+    }
+
+    let stripped = strip_duplicate_labeled_if_chain_labels(stmt, label)?;
+    Some((first, stripped))
+}
+
+fn collect_duplicate_labeled_if_chain_bodies(
+    stmt: &Stmt,
+    label: &str,
+    bodies: &mut Vec<Vec<Stmt>>,
+) -> Option<()> {
+    let Stmt::If {
+        then_body,
+        else_body,
+        ..
+    } = stmt
+    else {
+        return None;
+    };
+
+    if let Some(body) = leading_label_body(then_body, label) {
+        bodies.push(body);
+    } else if block_contains_label(then_body, label) {
+        return None;
+    }
+
+    match else_body.as_slice() {
+        [next @ Stmt::If { .. }] => {
+            collect_duplicate_labeled_if_chain_bodies(next, label, bodies)?;
+        }
+        _ if block_contains_label(else_body, label) => return None,
+        _ => {}
+    }
+
+    Some(())
+}
+
+fn strip_duplicate_labeled_if_chain_labels(stmt: Stmt, label: &str) -> Option<Stmt> {
+    let Stmt::If {
+        cond,
+        then_body,
+        else_body,
+    } = stmt
+    else {
+        return None;
+    };
+
+    let then_body = strip_leading_label_from_chain_body(then_body, label)?;
+    let else_body = match else_body.as_slice() {
+        [Stmt::If { .. }] => vec![strip_duplicate_labeled_if_chain_labels(
+            else_body.into_iter().next()?,
+            label,
+        )?],
+        _ if block_contains_label(&else_body, label) => return None,
+        _ => else_body,
+    };
+
+    Some(Stmt::If {
+        cond,
+        then_body,
+        else_body,
+    })
+}
+
+fn strip_leading_label_from_chain_body(mut body: Vec<Stmt>, label: &str) -> Option<Vec<Stmt>> {
+    match body.first() {
+        Some(Stmt::Label(name)) if name == label => {
+            body.remove(0);
+            Some(body)
+        }
+        _ if block_contains_label(&body, label) => None,
+        _ => Some(body),
+    }
+}
+
+fn leading_label_body(stmts: &[Stmt], label: &str) -> Option<Vec<Stmt>> {
+    match stmts.first() {
+        Some(Stmt::Label(name)) if name == label => Some(stmts[1..].to_vec()),
+        _ => None,
+    }
+}
+
+fn block_contains_label(stmts: &[Stmt], label: &str) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        Stmt::Label(name) => name == label,
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => block_contains_label(then_body, label) || block_contains_label(else_body, label),
+        Stmt::While { body, .. }
+        | Stmt::Repeat { body, .. }
+        | Stmt::NumericFor { body, .. }
+        | Stmt::GenericFor { body, .. } => block_contains_label(body, label),
+        _ => false,
+    })
 }
 
 fn conditional_goto_expr(stmt: &Stmt, required_label: Option<&str>) -> Option<(Expr, String)> {
@@ -1742,6 +4077,26 @@ fn contains_label_or_goto(stmts: &[Stmt]) -> bool {
     })
 }
 
+fn contains_label_or_goto_except_gotos(stmts: &[Stmt], allowed_goto: &str) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        Stmt::Label(_) => true,
+        Stmt::Goto(label) => label != allowed_goto,
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            contains_label_or_goto_except_gotos(then_body, allowed_goto)
+                || contains_label_or_goto_except_gotos(else_body, allowed_goto)
+        }
+        Stmt::While { body, .. }
+        | Stmt::Repeat { body, .. }
+        | Stmt::NumericFor { body, .. }
+        | Stmt::GenericFor { body, .. } => contains_label_or_goto_except_gotos(body, allowed_goto),
+        _ => false,
+    })
+}
+
 fn direct_local_scope_safe(moved: &[Stmt], following: &[Stmt]) -> bool {
     let locals: BTreeSet<String> = moved
         .iter()
@@ -1761,6 +4116,38 @@ fn count_gotos_named(stmts: &[Stmt], label: &str) -> usize {
     stmts
         .iter()
         .map(|stmt| count_gotos_named_stmt(stmt, label))
+        .sum()
+}
+
+fn count_labels_named_outside(stmts: &[Stmt], label: &str, start: usize, end: usize) -> usize {
+    stmts
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| *idx < start || *idx > end)
+        .map(|(_, stmt)| count_labels_named_stmt(stmt, label))
+        .sum()
+}
+
+fn count_labels_named_stmt(stmt: &Stmt, label: &str) -> usize {
+    match stmt {
+        Stmt::Label(name) if name == label => 1,
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => count_labels_named(then_body, label) + count_labels_named(else_body, label),
+        Stmt::While { body, .. }
+        | Stmt::Repeat { body, .. }
+        | Stmt::NumericFor { body, .. }
+        | Stmt::GenericFor { body, .. } => count_labels_named(body, label),
+        _ => 0,
+    }
+}
+
+fn count_labels_named(stmts: &[Stmt], label: &str) -> usize {
+    stmts
+        .iter()
+        .map(|stmt| count_labels_named_stmt(stmt, label))
         .sum()
 }
 
@@ -1856,6 +4243,9 @@ fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool 
         let replaceable_reads = stmt_replaceable_read_count(&block[j], &name);
         if replaceable_reads == 0 {
             continue;
+        }
+        if block[..i].iter().any(stmt_contains_nonlocal_flow) {
+            continue; // an earlier goto/break/continue may jump to this value's use
         }
         if block[i + 1..j].iter().any(is_control_flow) {
             continue; // a branch/loop before the use may hide path-specific behavior
@@ -1972,6 +4362,57 @@ fn is_control_flow(s: &Stmt) -> bool {
             | Stmt::Break
             | Stmt::Continue
     )
+}
+
+fn stmt_contains_nonlocal_flow(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Goto(_) | Stmt::Break | Stmt::Continue => true,
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => then_body
+            .iter()
+            .chain(else_body)
+            .any(stmt_contains_nonlocal_flow),
+        Stmt::While { body, .. }
+        | Stmt::Repeat { body, .. }
+        | Stmt::NumericFor { body, .. }
+        | Stmt::GenericFor { body, .. } => body.iter().any(stmt_contains_nonlocal_flow),
+        _ => false,
+    }
+}
+
+fn contains_break_continue(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        Stmt::Break | Stmt::Continue => true,
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => contains_break_continue(then_body) || contains_break_continue(else_body),
+        Stmt::While { body, .. }
+        | Stmt::Repeat { body, .. }
+        | Stmt::NumericFor { body, .. }
+        | Stmt::GenericFor { body, .. } => contains_break_continue(body),
+        _ => false,
+    })
+}
+
+fn contains_direct_break_continue(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        Stmt::Break | Stmt::Continue => true,
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => contains_direct_break_continue(then_body) || contains_direct_break_continue(else_body),
+        Stmt::While { .. }
+        | Stmt::Repeat { .. }
+        | Stmt::NumericFor { .. }
+        | Stmt::GenericFor { .. } => false,
+        _ => false,
+    })
 }
 
 // --- dead store elimination ------------------------------------------------------------
@@ -2583,6 +5024,663 @@ pub fn recover_if_else_gotos(root: &mut Vec<Stmt>) {
         for_each_block_mut(s, recover_if_else_gotos);
     }
     while recover_if_else_once(root) {}
+}
+
+/// Recover a common forward join shape:
+///
+/// ```lua
+/// if cond then
+///     accepted()
+///     goto join
+/// end
+/// fallback()
+/// ::join::
+/// common()
+/// ```
+///
+/// into:
+///
+/// ```lua
+/// if cond then
+///     accepted()
+/// else
+///     fallback()
+/// end
+/// common()
+/// ```
+///
+/// The rewrite is limited to one incoming goto and fallback blocks with no nested
+/// goto/label, so it does not move arbitrary control flow across branch boundaries.
+pub fn recover_if_join_gotos(root: &mut Vec<Stmt>) {
+    for s in root.iter_mut() {
+        for_each_block_mut(s, recover_if_join_gotos);
+    }
+    while recover_if_join_once(root) {}
+}
+
+/// Recover short fallback tails left behind when earlier passes already removed the matching
+/// join label:
+///
+/// ```lua
+/// if accepted then
+///     goto missing_join
+/// end
+/// fallback()
+/// ```
+///
+/// becomes `if not accepted then fallback() end`. This intentionally only handles short,
+/// straight-line tails; a long tail could include real common continuation code and is left as
+/// explicit fallback control flow.
+pub fn recover_orphan_if_join_gotos(root: &mut Vec<Stmt>) {
+    let labels = label_names(root);
+    recover_orphan_if_join_gotos_with_labels(root, &labels);
+}
+
+fn recover_orphan_if_join_gotos_with_labels(root: &mut Vec<Stmt>, labels: &BTreeSet<String>) {
+    for s in root.iter_mut() {
+        for_each_block_mut(s, |body| {
+            recover_orphan_if_join_gotos_with_labels(body, labels)
+        });
+    }
+    while recover_orphan_if_skip_to_end_once(root, labels)
+        || recover_orphan_if_join_once(root, labels)
+    {}
+}
+
+pub fn recover_else_label_gotos(root: &mut [Stmt]) {
+    for s in root.iter_mut() {
+        for_each_block_mut(s, |body| recover_else_label_gotos(body));
+    }
+    while recover_else_label_once(root) {}
+}
+
+pub fn recover_gotos_to_later_else_label(root: &mut Vec<Stmt>) {
+    for s in root.iter_mut() {
+        for_each_block_mut(s, recover_gotos_to_later_else_label);
+    }
+    while recover_gotos_to_later_else_label_once(root) {}
+}
+
+pub fn recover_branch_gotos_to_following_label(root: &mut Vec<Stmt>) {
+    for stmt in root.iter_mut() {
+        for_each_block_mut(stmt, recover_branch_gotos_to_following_label);
+    }
+    while recover_branch_gotos_to_following_label_once(root) {}
+}
+
+fn recover_branch_gotos_to_following_label_once(root: &mut Vec<Stmt>) -> bool {
+    let mut i = 0;
+    while i + 1 < root.len() {
+        let Stmt::Label(label) = &root[i + 1] else {
+            i += 1;
+            continue;
+        };
+        let label = label.clone();
+        if count_gotos_named(&root[..i], &label) != 0 {
+            i += 1;
+            continue;
+        }
+
+        let Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } = &mut root[i]
+        else {
+            i += 1;
+            continue;
+        };
+
+        let changed_then = wrap_gotos_to_label_in_repeat_break(then_body, &label);
+        let changed_else = wrap_gotos_to_label_in_repeat_break(else_body, &label);
+        if !changed_then && !changed_else {
+            i += 1;
+            continue;
+        }
+
+        root.remove(i + 1);
+        return true;
+    }
+    false
+}
+
+fn wrap_gotos_to_label_in_repeat_break(body: &mut Vec<Stmt>, label: &str) -> bool {
+    if count_gotos_named(body, label) == 0
+        || block_contains_label(body, label)
+        || has_goto_in_nested_loop(body, label, false)
+    {
+        return false;
+    }
+
+    let mut wrapped = std::mem::take(body);
+    replace_gotos_with_break(&mut wrapped, label);
+    *body = vec![Stmt::Repeat {
+        body: wrapped,
+        cond: Expr::Bool(true),
+    }];
+    true
+}
+
+fn recover_else_label_once(root: &mut [Stmt]) -> bool {
+    for stmt in root {
+        let Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } = stmt
+        else {
+            continue;
+        };
+        let Some(Stmt::Label(label)) = else_body.first() else {
+            continue;
+        };
+        let label = label.clone();
+        if count_gotos_named(then_body, &label) == 0
+            || count_gotos_named(else_body, &label) != 0
+            || has_goto_in_nested_loop(then_body, &label, false)
+        {
+            continue;
+        }
+        let target_body = else_body[1..].to_vec();
+        if contains_label_or_goto(&target_body) {
+            continue;
+        }
+        let Some(routed_then) =
+            route_gotos_to_target_body(then_body.clone(), &label, target_body.clone(), Vec::new())
+        else {
+            continue;
+        };
+        *then_body = routed_then;
+        *else_body = target_body;
+        return true;
+    }
+    false
+}
+
+fn recover_gotos_to_later_else_label_once(root: &mut Vec<Stmt>) -> bool {
+    let mut i = 0;
+    while i + 1 < root.len() {
+        let mut target_idx = i + 1;
+        while target_idx < root.len().min(i + 48) {
+            let Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } = &root[target_idx]
+            else {
+                target_idx += 1;
+                continue;
+            };
+            let Some(Stmt::Label(label)) = else_body.first() else {
+                target_idx += 1;
+                continue;
+            };
+            let label = label.clone();
+            let leading = root[i..target_idx].to_vec();
+            let leading_gotos = count_gotos_named(&leading, &label);
+            if leading_gotos == 0
+                || contains_label_or_goto_except_gotos(&leading, &label)
+                || has_goto_in_nested_loop(&leading, &label, false)
+                || count_gotos_named(root, &label) != leading_gotos
+                || count_labels_named_outside(root, &label, i, target_idx) != 0
+                || !direct_local_scope_safe(&leading, &root[target_idx + 1..])
+            {
+                target_idx += 1;
+                continue;
+            }
+
+            let target_body = else_body[1..].to_vec();
+            let target_without_label = Stmt::If {
+                cond: cond.clone(),
+                then_body: then_body.clone(),
+                else_body: target_body.clone(),
+            };
+            if target_body.is_empty()
+                || contains_label_or_goto(&target_body)
+                || contains_label_or_goto(std::slice::from_ref(&target_without_label))
+            {
+                target_idx += 1;
+                continue;
+            }
+
+            let Some(mut routed) = route_gotos_to_target_body_deep(
+                leading,
+                &label,
+                target_body,
+                vec![target_without_label],
+            ) else {
+                target_idx += 1;
+                continue;
+            };
+            if routed.is_empty() || contains_label_or_goto(&routed) {
+                target_idx += 1;
+                continue;
+            }
+
+            root.splice(i..=target_idx, routed.drain(..));
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn route_gotos_to_target_body(
+    mut block: Vec<Stmt>,
+    label: &str,
+    target_body: Vec<Stmt>,
+    normal_continuation: Vec<Stmt>,
+) -> Option<Vec<Stmt>> {
+    if block.is_empty() {
+        return Some(normal_continuation);
+    }
+
+    let first = block.remove(0);
+    if count_gotos_named_stmt(&first, label) == 0 {
+        let mut out = vec![first];
+        out.extend(route_gotos_to_target_body(
+            block,
+            label,
+            target_body,
+            normal_continuation,
+        )?);
+        return Some(out);
+    }
+
+    match first {
+        Stmt::Goto(target) if target == label => Some(target_body),
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            let continuation = append_blocks(block, normal_continuation);
+            let then_body = if count_gotos_named(&then_body, label) > 0 {
+                route_gotos_to_target_body(
+                    then_body,
+                    label,
+                    target_body.clone(),
+                    continuation.clone(),
+                )?
+            } else {
+                append_blocks(then_body, continuation.clone())
+            };
+            let else_body = if count_gotos_named(&else_body, label) > 0 {
+                route_gotos_to_target_body(else_body, label, target_body, continuation)?
+            } else {
+                append_blocks(else_body, continuation)
+            };
+            Some(vec![Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            }])
+        }
+        _ => None,
+    }
+}
+
+fn route_gotos_to_target_body_deep(
+    mut block: Vec<Stmt>,
+    label: &str,
+    target_body: Vec<Stmt>,
+    normal_continuation: Vec<Stmt>,
+) -> Option<Vec<Stmt>> {
+    if block.is_empty() {
+        return Some(normal_continuation);
+    }
+
+    let first = block.remove(0);
+    if count_gotos_named_stmt(&first, label) == 0 {
+        let mut out = vec![first];
+        out.extend(route_gotos_to_target_body_deep(
+            block,
+            label,
+            target_body,
+            normal_continuation,
+        )?);
+        return Some(out);
+    }
+
+    match first {
+        Stmt::Goto(target) if target == label => Some(target_body),
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            let continuation = append_blocks(block, normal_continuation);
+            let then_path = append_blocks(then_body, continuation.clone());
+            let else_path = append_blocks(else_body, continuation);
+            let then_body = if count_gotos_named(&then_path, label) > 0 {
+                route_gotos_to_target_body_deep(then_path, label, target_body.clone(), Vec::new())?
+            } else {
+                then_path
+            };
+            let else_body = if count_gotos_named(&else_path, label) > 0 {
+                route_gotos_to_target_body_deep(else_path, label, target_body, Vec::new())?
+            } else {
+                else_path
+            };
+            Some(vec![Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            }])
+        }
+        _ => None,
+    }
+}
+
+fn recover_if_join_once(root: &mut Vec<Stmt>) -> bool {
+    for i in 0..root.len() {
+        if let Some((label, transformed)) = recover_nested_if_join(root, i) {
+            let goto_count = count_gotos_named(root, &label);
+            root[i] = transformed;
+            let Some(label_idx) = root[i + 1..]
+                .iter()
+                .position(|stmt| matches!(stmt, Stmt::Label(name) if name == &label))
+                .map(|offset| i + 1 + offset)
+            else {
+                continue;
+            };
+            let transformed_gotos = count_gotos_named_stmt(&root[i], &label);
+            if goto_count == transformed_gotos {
+                root.drain(i + 1..=label_idx);
+            } else {
+                root.drain(i + 1..label_idx);
+            }
+            return true;
+        }
+
+        let Some((label, goto_in_then)) = trailing_branch_goto(&root[i]) else {
+            continue;
+        };
+        let Some(label_idx) = root[i + 1..]
+            .iter()
+            .position(|stmt| matches!(stmt, Stmt::Label(name) if name == &label))
+            .map(|offset| i + 1 + offset)
+        else {
+            continue;
+        };
+        if label_idx <= i + 1 {
+            continue;
+        }
+
+        let mut fallback = root[i + 1..label_idx].to_vec();
+        if fallback.is_empty() || contains_label_or_goto(&fallback) {
+            continue;
+        }
+        widen_locals_read_after_join(&mut fallback, &root[label_idx + 1..]);
+        if !direct_local_scope_safe(&fallback, &root[label_idx + 1..]) {
+            continue;
+        }
+
+        let goto_count = count_gotos_named(root, &label);
+        if goto_count == 0 {
+            continue;
+        }
+
+        let Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } = &mut root[i]
+        else {
+            continue;
+        };
+
+        if goto_in_then {
+            then_body.pop();
+            else_body.extend(fallback);
+        } else {
+            else_body.pop();
+            then_body.extend(fallback);
+        }
+
+        let remove_label = goto_count == 1;
+        if then_body.is_empty() && else_body.is_empty() {
+            if is_pure(cond) {
+                root.remove(i);
+            } else {
+                root[i] = Stmt::Call(cond.clone());
+            }
+            if remove_label {
+                root.drain(i + 1..=label_idx);
+            } else {
+                root.drain(i + 1..label_idx);
+            }
+        } else {
+            if remove_label {
+                root.drain(i + 1..=label_idx);
+            } else {
+                root.drain(i + 1..label_idx);
+            }
+        }
+        return true;
+    }
+    false
+}
+
+fn recover_orphan_if_join_once(root: &mut Vec<Stmt>, labels: &BTreeSet<String>) -> bool {
+    for i in 0..root.len() {
+        let goto_labels = goto_names_in_stmt(&root[i]);
+        if goto_labels.len() != 1 {
+            continue;
+        }
+        let label = goto_labels.into_iter().next().unwrap();
+        if labels.contains(&label)
+            || has_goto_in_nested_loop(std::slice::from_ref(&root[i]), &label, false)
+        {
+            continue;
+        }
+        let continuation = root[i + 1..].to_vec();
+        if !is_short_straight_line_tail(&continuation) {
+            continue;
+        }
+        let Some(transformed) = absorb_join_in_stmt(root[i].clone(), &label, continuation) else {
+            continue;
+        };
+        root[i] = transformed;
+        root.truncate(i + 1);
+        return true;
+    }
+    false
+}
+
+fn recover_orphan_if_skip_to_end_once(root: &mut Vec<Stmt>, labels: &BTreeSet<String>) -> bool {
+    for i in 0..root.len() {
+        let Some((skip_cond, label)) = conditional_goto_expr(&root[i], None) else {
+            continue;
+        };
+        if labels.contains(&label)
+            || has_goto_in_nested_loop(std::slice::from_ref(&root[i]), &label, false)
+        {
+            continue;
+        }
+        let tail = root[i + 1..].to_vec();
+        if tail.is_empty() || tail.len() > 64 || contains_label_or_goto(&tail) {
+            continue;
+        }
+        root[i] = Stmt::If {
+            cond: negate_condition(skip_cond),
+            then_body: tail,
+            else_body: Vec::new(),
+        };
+        root.truncate(i + 1);
+        return true;
+    }
+    false
+}
+
+fn is_short_straight_line_tail(stmts: &[Stmt]) -> bool {
+    !stmts.is_empty()
+        && stmts.len() <= 8
+        && stmts.iter().all(|stmt| {
+            matches!(
+                stmt,
+                Stmt::Assign { .. }
+                    | Stmt::Call(_)
+                    | Stmt::Return(_)
+                    | Stmt::Break
+                    | Stmt::Continue
+            )
+        })
+        && !contains_label_or_goto(stmts)
+}
+
+fn recover_nested_if_join(root: &[Stmt], index: usize) -> Option<(String, Stmt)> {
+    let stmt = root.get(index)?;
+    if !matches!(stmt, Stmt::If { .. }) {
+        return None;
+    }
+    let labels = goto_names_in_stmt(stmt);
+    if labels.len() != 1 {
+        return None;
+    }
+    let label = labels.into_iter().next()?;
+    if has_goto_in_nested_loop(std::slice::from_ref(stmt), &label, false) {
+        return None;
+    }
+    let label_idx = root[index + 1..]
+        .iter()
+        .position(|stmt| matches!(stmt, Stmt::Label(name) if name == &label))
+        .map(|offset| index + 1 + offset)?;
+    if label_idx < index + 1 {
+        return None;
+    }
+    let mut continuation = root[index + 1..label_idx].to_vec();
+    if contains_label_or_goto(&continuation) {
+        return None;
+    }
+    if !continuation.is_empty() {
+        widen_locals_read_after_join(&mut continuation, &root[label_idx + 1..]);
+        if !direct_local_scope_safe(&continuation, &root[label_idx + 1..]) {
+            return None;
+        }
+    }
+    let transformed = absorb_join_in_stmt(stmt.clone(), &label, continuation)?;
+    Some((label, transformed))
+}
+
+fn absorb_join_in_stmt(stmt: Stmt, label: &str, continuation: Vec<Stmt>) -> Option<Stmt> {
+    let Stmt::If {
+        cond,
+        then_body,
+        else_body,
+    } = stmt
+    else {
+        return None;
+    };
+    Some(Stmt::If {
+        cond,
+        then_body: absorb_join_in_block(then_body, label, continuation.clone())?,
+        else_body: absorb_join_in_block(else_body, label, continuation)?,
+    })
+}
+
+fn absorb_join_in_block(
+    mut block: Vec<Stmt>,
+    label: &str,
+    continuation: Vec<Stmt>,
+) -> Option<Vec<Stmt>> {
+    if block.is_empty() {
+        return Some(continuation);
+    }
+
+    let first = block.remove(0);
+    if count_gotos_named_stmt(&first, label) == 0 {
+        let mut out = vec![first];
+        out.extend(absorb_join_in_block(block, label, continuation)?);
+        return Some(out);
+    }
+
+    match first {
+        Stmt::Goto(target) if target == label => Some(Vec::new()),
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            let rest_continuation = append_blocks(block, continuation);
+            let then_body = absorb_join_in_block(then_body, label, rest_continuation.clone())?;
+            let else_body = absorb_join_in_block(else_body, label, rest_continuation)?;
+            Some(vec![Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            }])
+        }
+        _ => None,
+    }
+}
+
+fn append_blocks(mut first: Vec<Stmt>, second: Vec<Stmt>) -> Vec<Stmt> {
+    if block_ends_terminated(&first) {
+        first
+    } else {
+        first.extend(second);
+        first
+    }
+}
+
+fn block_ends_terminated(block: &[Stmt]) -> bool {
+    matches!(
+        block.last(),
+        Some(Stmt::Return(_) | Stmt::Break | Stmt::Continue | Stmt::Goto(_))
+    )
+}
+
+fn trailing_branch_goto(stmt: &Stmt) -> Option<(String, bool)> {
+    let Stmt::If {
+        then_body,
+        else_body,
+        ..
+    } = stmt
+    else {
+        return None;
+    };
+
+    match (then_body.last(), else_body.last()) {
+        (Some(Stmt::Goto(label)), None) | (Some(Stmt::Goto(label)), Some(_)) => {
+            Some((label.clone(), true))
+        }
+        (None, Some(Stmt::Goto(label))) | (Some(_), Some(Stmt::Goto(label))) => {
+            Some((label.clone(), false))
+        }
+        _ => None,
+    }
+}
+
+fn widen_locals_read_after_join(stmts: &mut [Stmt], following: &[Stmt]) {
+    let mut read_after = BTreeSet::new();
+    for stmt in stmts.iter() {
+        if let Stmt::Local { names, .. } = stmt {
+            for name in names {
+                if following
+                    .iter()
+                    .any(|following_stmt| stmt_reads_var_recursive(following_stmt, name))
+                {
+                    read_after.insert(name.clone());
+                }
+            }
+        }
+    }
+    if read_after.is_empty() {
+        return;
+    }
+
+    for stmt in stmts {
+        let Stmt::Local { names, values } = stmt else {
+            continue;
+        };
+        if names.iter().any(|name| read_after.contains(name)) {
+            *stmt = Stmt::Assign {
+                targets: names.iter().cloned().map(Expr::Var).collect(),
+                values: values.clone(),
+            };
+        }
+    }
 }
 
 fn recover_if_else_once(root: &mut Vec<Stmt>) -> bool {
@@ -3318,9 +6416,51 @@ fn split_reused_registers_in_block(stmts: &mut [Stmt], unsplittable: &BTreeSet<S
     }
 }
 
+fn collect_split_candidates_recursive(
+    stmts: &[Stmt],
+    unsplittable: &BTreeSet<String>,
+    candidates: &mut BTreeSet<String>,
+) {
+    let mut block_vars = BTreeSet::new();
+    collect_block_vars(stmts, &mut block_vars);
+    candidates.extend(
+        block_vars
+            .into_iter()
+            .filter(|name| is_synthetic(name) && !unsplittable.contains(name)),
+    );
+
+    for stmt in stmts {
+        match stmt {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_split_candidates_recursive(then_body, unsplittable, candidates);
+                collect_split_candidates_recursive(else_body, unsplittable, candidates);
+            }
+            Stmt::While { body, .. }
+            | Stmt::Repeat { body, .. }
+            | Stmt::NumericFor { body, .. }
+            | Stmt::GenericFor { body, .. } => {
+                collect_split_candidates_recursive(body, unsplittable, candidates);
+            }
+            _ => {}
+        }
+    }
+}
+
 pub fn split_reused_registers(stmts: &mut [Stmt], protected: &BTreeSet<String>) {
+    if count_stmts(stmts) > 600 {
+        return;
+    }
     let mut unsplittable = protected.clone();
     collect_unsplittable(stmts, false, &mut unsplittable);
+    let mut candidates = BTreeSet::new();
+    collect_split_candidates_recursive(stmts, &unsplittable, &mut candidates);
+    if candidates.len() > 80 {
+        return;
+    }
     split_reused_registers_in_block(stmts, &unsplittable);
 }
 
@@ -3580,6 +6720,818 @@ mod tests {
         let rendered = render_block(&stmts, 0);
         assert!(!rendered.contains("key = 60"), "{rendered}");
         assert!(rendered.contains("config.Timeout = timeout"), "{rendered}");
+    }
+
+    #[test]
+    fn keeps_pure_store_before_goto_after_last_local_read() {
+        let mut stmts = vec![Stmt::If {
+            cond: Expr::Var("bad".into()),
+            then_body: vec![
+                Stmt::Assign {
+                    targets: vec![Expr::Var("valid".into())],
+                    values: vec![Expr::Bool(false)],
+                },
+                Stmt::Goto("join".into()),
+            ],
+            else_body: Vec::new(),
+        }];
+
+        remove_dead_pure_stores_after_last_read(&mut stmts, &BTreeSet::new());
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("valid = false"), "{rendered}");
+        assert!(rendered.contains("goto join"), "{rendered}");
+    }
+
+    #[test]
+    fn does_not_inline_join_value_after_prior_goto() {
+        let mut stmts = vec![
+            Stmt::NumericFor {
+                var: "i".into(),
+                start: Expr::Num("1".into()),
+                limit: Expr::Var("n".into()),
+                step: None,
+                body: vec![Stmt::If {
+                    cond: Expr::Var("bad".into()),
+                    then_body: vec![Stmt::Goto("join".into())],
+                    else_body: Vec::new(),
+                }],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("valid".into())],
+                values: vec![Expr::Bool(true)],
+            },
+            Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("valid".into()))),
+                then_body: vec![Stmt::Return(vec![Expr::Str("\"bad\"".into())])],
+                else_body: Vec::new(),
+            },
+        ];
+
+        single_use_inline(&mut stmts, &BTreeSet::new());
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("valid = true"), "{rendered}");
+        assert!(rendered.contains("if not valid then"), "{rendered}");
+        assert!(!rendered.contains("if not true then"), "{rendered}");
+    }
+
+    #[test]
+    fn loop_bool_selector_gotos_become_breaks() {
+        let mut stmts = vec![
+            Stmt::NumericFor {
+                var: "i".into(),
+                start: Expr::Num("1".into()),
+                limit: Expr::Var("len".into()),
+                step: None,
+                body: vec![Stmt::If {
+                    cond: Expr::Var("bad".into()),
+                    then_body: vec![
+                        Stmt::Assign {
+                            targets: vec![Expr::Var("valid".into())],
+                            values: vec![Expr::Bool(false)],
+                        },
+                        Stmt::Goto("join".into()),
+                    ],
+                    else_body: Vec::new(),
+                }],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("valid".into())],
+                values: vec![Expr::Bool(true)],
+            },
+            Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Bool(true))),
+                then_body: vec![Stmt::Return(vec![Expr::Str("\"bad\"".into())])],
+                else_body: Vec::new(),
+            },
+        ];
+
+        recover_loop_bool_selector_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("valid = true"), "{rendered}");
+        assert!(rendered.contains("valid = false"), "{rendered}");
+        assert!(rendered.contains("break"), "{rendered}");
+        assert!(rendered.contains("if not valid then"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+        assert!(!rendered.contains("if not true then"), "{rendered}");
+    }
+
+    #[test]
+    fn loop_bool_assignment_gotos_become_breaks() {
+        let mut stmts = vec![
+            Stmt::NumericFor {
+                var: "i".into(),
+                start: Expr::Num("1".into()),
+                limit: Expr::Var("len".into()),
+                step: None,
+                body: vec![Stmt::If {
+                    cond: Expr::Var("bad".into()),
+                    then_body: vec![
+                        Stmt::Assign {
+                            targets: vec![Expr::Var("valid".into())],
+                            values: vec![Expr::Bool(false)],
+                        },
+                        Stmt::Goto("join".into()),
+                    ],
+                    else_body: Vec::new(),
+                }],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("valid".into())],
+                values: vec![Expr::Bool(true)],
+            },
+            Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("valid".into()))),
+                then_body: vec![Stmt::Return(vec![Expr::Str("\"bad\"".into())])],
+                else_body: Vec::new(),
+            },
+        ];
+
+        recover_loop_bool_selector_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.starts_with("valid = true"), "{rendered}");
+        assert!(rendered.contains("valid = false"), "{rendered}");
+        assert!(rendered.contains("break"), "{rendered}");
+        assert!(rendered.contains("if not valid then"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+    }
+
+    #[test]
+    fn loop_bool_assignment_false_default_rewrites_constant_guard() {
+        let mut stmts = vec![
+            Stmt::GenericFor {
+                vars: vec!["i".into()],
+                exprs: vec![Expr::Var("items".into())],
+                body: vec![Stmt::If {
+                    cond: Expr::Var("missing".into()),
+                    then_body: vec![
+                        Stmt::Assign {
+                            targets: vec![Expr::Var("found".into())],
+                            values: vec![Expr::Bool(true)],
+                        },
+                        Stmt::Goto("join".into()),
+                    ],
+                    else_body: Vec::new(),
+                }],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("found".into())],
+                values: vec![Expr::Bool(false)],
+            },
+            Stmt::If {
+                cond: Expr::Bool(false),
+                then_body: vec![Stmt::Call(Expr::Call(
+                    Box::new(Expr::Var("useFound".into())),
+                    Vec::new(),
+                ))],
+                else_body: Vec::new(),
+            },
+        ];
+
+        recover_loop_bool_selector_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.starts_with("found = false"), "{rendered}");
+        assert!(rendered.contains("found = true"), "{rendered}");
+        assert!(rendered.contains("break"), "{rendered}");
+        assert!(rendered.contains("if found then"), "{rendered}");
+        assert!(!rendered.contains("if false then"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+    }
+
+    #[test]
+    fn loop_bool_guard_gotos_become_breaks() {
+        let mut stmts = vec![
+            Stmt::While {
+                cond: Expr::Var("running".into()),
+                body: vec![Stmt::If {
+                    cond: Expr::Var("hit".into()),
+                    then_body: vec![
+                        Stmt::Assign {
+                            targets: vec![Expr::Var("checked".into())],
+                            values: vec![Expr::Bool(true)],
+                        },
+                        Stmt::Goto("join".into()),
+                    ],
+                    else_body: Vec::new(),
+                }],
+            },
+            Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("checked".into()))),
+                then_body: vec![Stmt::Call(Expr::Call(
+                    Box::new(Expr::Var("fallback".into())),
+                    Vec::new(),
+                ))],
+                else_body: Vec::new(),
+            },
+        ];
+
+        recover_loop_bool_selector_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("checked = true"), "{rendered}");
+        assert!(rendered.contains("break"), "{rendered}");
+        assert!(rendered.contains("if not checked then"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+    }
+
+    #[test]
+    fn trailing_missing_loop_goto_is_removed() {
+        let mut stmts = vec![Stmt::While {
+            cond: Expr::Var("running".into()),
+            body: vec![
+                Stmt::Call(Expr::Call(Box::new(Expr::Var("step".into())), Vec::new())),
+                Stmt::Goto("loop_head".into()),
+            ],
+        }];
+
+        recover_loop_bool_selector_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("step()"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+    }
+
+    #[test]
+    fn tail_branch_missing_loop_gotos_are_removed() {
+        let mut stmts = vec![Stmt::While {
+            cond: Expr::Var("running".into()),
+            body: vec![Stmt::If {
+                cond: Expr::Var("left".into()),
+                then_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("index".into())],
+                        values: vec![Expr::Var("leftIndex".into())],
+                    },
+                    Stmt::Goto("loop_head".into()),
+                ],
+                else_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("index".into())],
+                        values: vec![Expr::Var("rightIndex".into())],
+                    },
+                    Stmt::Goto("loop_head".into()),
+                ],
+            }],
+        }];
+
+        recover_loop_bool_selector_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("index = leftIndex"), "{rendered}");
+        assert!(rendered.contains("index = rightIndex"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+    }
+
+    #[test]
+    fn terminal_label_gotos_become_returns() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Binary(
+                    "==",
+                    Box::new(Expr::Var("event".into())),
+                    Box::new(Expr::Str("\"RunTween\"".into())),
+                ),
+                then_body: vec![
+                    Stmt::Call(Expr::Call(Box::new(Expr::Var("run".into())), Vec::new())),
+                    Stmt::Goto("done".into()),
+                    Stmt::Call(Expr::Call(
+                        Box::new(Expr::Var("unreachable".into())),
+                        Vec::new(),
+                    )),
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::Call(Expr::Call(Box::new(Expr::Var("after".into())), Vec::new())),
+            Stmt::Label("done".into()),
+            Stmt::Return(Vec::new()),
+        ];
+
+        replace_terminal_label_gotos_with_return(&mut stmts);
+        drop_unreachable(&mut stmts);
+        remove_unused_labels(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("return"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+        assert!(!rendered.contains("::done::"), "{rendered}");
+        assert!(!rendered.contains("unreachable"), "{rendered}");
+        assert!(rendered.contains("after()"), "{rendered}");
+    }
+
+    #[test]
+    fn terminal_label_tail_gotos_become_tail_returns() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("is_value".into()),
+                then_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("next".into())],
+                        values: vec![Expr::Var("value".into())],
+                    },
+                    Stmt::Goto("done".into()),
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Var("is_velocity".into()),
+                then_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("next".into())],
+                        values: vec![Expr::Var("velocity".into())],
+                    },
+                    Stmt::Goto("done".into()),
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("next".into())],
+                values: vec![Expr::Var("fallback".into())],
+            },
+            Stmt::Label("done".into()),
+            Stmt::Assign {
+                targets: vec![Expr::Var("current".into())],
+                values: vec![Expr::Var("next".into())],
+            },
+        ];
+
+        replace_terminal_label_tail_gotos(&mut stmts);
+        remove_unused_labels(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert_eq!(rendered.matches("current = next").count(), 3, "{rendered}");
+        assert_eq!(rendered.matches("return").count(), 2, "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+        assert!(!rendered.contains("::done::"), "{rendered}");
+    }
+
+    #[test]
+    fn loop_gotos_to_terminal_label_tail_become_tail_returns() {
+        let mut stmts = vec![
+            Stmt::While {
+                cond: Expr::Bool(true),
+                body: vec![
+                    Stmt::If {
+                        cond: Expr::Var("finished".into()),
+                        then_body: vec![Stmt::Goto("done".into())],
+                        else_body: Vec::new(),
+                    },
+                    Stmt::Call(Expr::Call(Box::new(Expr::Var("step".into())), Vec::new())),
+                ],
+            },
+            Stmt::Label("done".into()),
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Field(
+                    Box::new(Expr::Var("debug".into())),
+                    "profileend".into(),
+                )),
+                Vec::new(),
+            )),
+            Stmt::Return(vec![Expr::Var("result".into())]),
+        ];
+
+        replace_loop_gotos_to_terminal_label_tail(&mut stmts);
+        remove_unused_labels(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert_eq!(
+            rendered.matches("debug.profileend()").count(),
+            2,
+            "{rendered}"
+        );
+        assert!(rendered.contains("return result"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+        assert!(!rendered.contains("::done::"), "{rendered}");
+    }
+
+    #[test]
+    fn terminal_label_tail_rewrites_direct_gotos_before_removing_label() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("fast_path".into()),
+                then_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("result".into())],
+                        values: vec![Expr::Var("fast".into())],
+                    },
+                    Stmt::Goto("done".into()),
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("result".into())],
+                values: vec![Expr::Var("middle".into())],
+            },
+            Stmt::Goto("done".into()),
+            Stmt::Assign {
+                targets: vec![Expr::Var("result".into())],
+                values: vec![Expr::Var("fallback".into())],
+            },
+            Stmt::Label("done".into()),
+            Stmt::Assign {
+                targets: vec![Expr::Var("out".into())],
+                values: vec![Expr::Var("result".into())],
+            },
+        ];
+
+        replace_terminal_label_tail_gotos(&mut stmts);
+        remove_unused_labels(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert_eq!(rendered.matches("out = result").count(), 3, "{rendered}");
+        assert!(!rendered.contains("goto done"), "{rendered}");
+        assert!(!rendered.contains("::done::"), "{rendered}");
+    }
+
+    #[test]
+    fn orphan_gotos_to_terminal_continuation_are_duplicated() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::MethodCall(
+                    Box::new(Expr::Var("candidate".into())),
+                    "IsA".into(),
+                    vec![Expr::Str("\"Sound\"".into())],
+                ),
+                then_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("sound".into())],
+                        values: vec![Expr::Var("candidate".into())],
+                    },
+                    Stmt::Goto("done".into()),
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("sound".into())],
+                values: vec![Expr::MethodCall(
+                    Box::new(Expr::Var("candidate".into())),
+                    "FindFirstChildWhichIsA".into(),
+                    vec![Expr::Str("\"Sound\"".into())],
+                )],
+            },
+            Stmt::If {
+                cond: Expr::Binary(
+                    "==",
+                    Box::new(Expr::Var("sound".into())),
+                    Box::new(Expr::Nil),
+                ),
+                then_body: vec![Stmt::Return(vec![Expr::Nil])],
+                else_body: Vec::new(),
+            },
+            Stmt::Return(vec![Expr::Var("sound".into())]),
+        ];
+
+        replace_orphan_gotos_with_terminal_continuation(&mut stmts);
+        drop_unreachable(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(!rendered.contains("goto done"), "{rendered}");
+        assert_eq!(rendered.matches("return sound").count(), 2, "{rendered}");
+        assert!(rendered.contains("if sound == nil then"), "{rendered}");
+    }
+
+    #[test]
+    fn orphan_terminal_continuation_keeps_ambiguous_join_vars() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("use_a".into()),
+                then_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("a".into())],
+                        values: vec![Expr::Num("1".into())],
+                    },
+                    Stmt::Goto("done".into()),
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Var("use_b".into()),
+                then_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("b".into())],
+                        values: vec![Expr::Num("2".into())],
+                    },
+                    Stmt::Goto("done".into()),
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::Return(vec![Expr::Var("a".into())]),
+        ];
+
+        replace_orphan_gotos_with_terminal_continuation(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("goto done"), "{rendered}");
+    }
+
+    #[test]
+    fn orphan_fallback_gotos_become_else_branch() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("cached".into()),
+                then_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("value".into())],
+                        values: vec![Expr::Var("cached".into())],
+                    },
+                    Stmt::Goto("joined".into()),
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::Local {
+                names: vec!["computed".into()],
+                values: vec![Expr::Call(
+                    Box::new(Expr::Var("compute".into())),
+                    Vec::new(),
+                )],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("value".into())],
+                values: vec![Expr::Var("computed".into())],
+            },
+            Stmt::If {
+                cond: Expr::Var("value".into()),
+                then_body: vec![Stmt::Call(Expr::Call(
+                    Box::new(Expr::Var("use".into())),
+                    vec![Expr::Var("value".into())],
+                ))],
+                else_body: Vec::new(),
+            },
+        ];
+
+        recover_orphan_if_fallback_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("if cached then"), "{rendered}");
+        assert!(
+            rendered.contains("else\n\tlocal computed = compute()"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("if value then\n\tuse(value)\nend"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("goto joined"), "{rendered}");
+    }
+
+    #[test]
+    fn orphan_skip_block_gotos_become_guarded_block() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("cursorFree".into()),
+                then_body: vec![Stmt::Goto("joined".into())],
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Binary(
+                    "==",
+                    Box::new(Expr::Var("currentInput".into())),
+                    Box::new(Expr::Str("\"Touch\"".into())),
+                ),
+                then_body: vec![Stmt::Goto("joined".into())],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("mouseDelta".into())],
+                values: vec![Expr::Call(
+                    Box::new(Expr::Field(
+                        Box::new(Expr::Var("UserInputService".into())),
+                        "GetMouseDelta".into(),
+                    )),
+                    Vec::new(),
+                )],
+            },
+            Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("cursorFree".into()))),
+                then_body: vec![Stmt::Assign {
+                    targets: vec![Expr::Var("mouseDelta".into())],
+                    values: vec![Expr::Binary(
+                        "+",
+                        Box::new(Expr::Var("mouseDelta".into())),
+                        Box::new(Expr::Var("pendingDelta".into())),
+                    )],
+                }],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Field(
+                    Box::new(Expr::Var("controller".into())),
+                    "PendingTouchLookDelta".into(),
+                )],
+                values: vec![Expr::Field(
+                    Box::new(Expr::Var("Vector2".into())),
+                    "zero".into(),
+                )],
+            },
+            Stmt::Local {
+                names: vec!["now".into()],
+                values: vec![Expr::Call(Box::new(Expr::Var("tick".into())), Vec::new())],
+            },
+        ];
+
+        recover_orphan_skip_blocks(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(
+            rendered.contains("if not cursorFree and currentInput ~= \"Touch\" then"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("mouseDelta = UserInputService.GetMouseDelta()"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("controller.PendingTouchLookDelta = Vector2.zero"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("local now = tick()"), "{rendered}");
+        assert!(!rendered.contains("goto joined"), "{rendered}");
+    }
+
+    #[test]
+    fn orphan_skip_block_stops_at_first_value_read() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("skip".into()),
+                then_body: vec![Stmt::Goto("joined".into())],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("value".into())],
+                values: vec![Expr::Call(
+                    Box::new(Expr::Var("compute".into())),
+                    Vec::new(),
+                )],
+            },
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Var("use".into())),
+                vec![Expr::Var("value".into())],
+            )),
+        ];
+
+        recover_orphan_skip_blocks(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(
+            rendered.contains("if not skip then\n\tvalue = compute()\nend"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("use(value)"), "{rendered}");
+        assert!(!rendered.contains("goto joined"), "{rendered}");
+    }
+
+    #[test]
+    fn nested_orphan_skip_goto_routes_following_block() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("hasDirectDelta".into()),
+                then_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("opened".into())],
+                        values: vec![Expr::Var("directDelta".into())],
+                    },
+                    Stmt::Goto("joined".into()),
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::Local {
+                names: vec!["thumbstick".into()],
+                values: vec![Expr::Field(
+                    Box::new(Expr::Var("self".into())),
+                    "LastThumbstickInput".into(),
+                )],
+            },
+            Stmt::If {
+                cond: Expr::Var("thumbstick".into()),
+                then_body: vec![Stmt::Assign {
+                    targets: vec![Expr::Var("opened".into())],
+                    values: vec![Expr::Call(
+                        Box::new(Expr::Var("fromThumbstick".into())),
+                        vec![Expr::Var("thumbstick".into())],
+                    )],
+                }],
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Var("opened".into()),
+                then_body: vec![Stmt::Call(Expr::Call(
+                    Box::new(Expr::Var("apply".into())),
+                    vec![Expr::Var("opened".into())],
+                ))],
+                else_body: Vec::new(),
+            },
+        ];
+
+        recover_nested_orphan_skip_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("if hasDirectDelta then"), "{rendered}");
+        assert!(
+            rendered.contains("else\n\tthumbstick = self.LastThumbstickInput"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("apply(opened)"), "{rendered}");
+        assert!(!rendered.contains("goto joined"), "{rendered}");
+    }
+
+    #[test]
+    fn return_only_labels_become_direct_returns() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("done".into()),
+                then_body: vec![Stmt::Goto("exit".into())],
+                else_body: Vec::new(),
+            },
+            Stmt::Call(Expr::Call(Box::new(Expr::Var("work".into())), Vec::new())),
+            Stmt::If {
+                cond: Expr::Var("failed".into()),
+                then_body: vec![Stmt::Label("exit".into()), Stmt::Return(Vec::new())],
+                else_body: Vec::new(),
+            },
+        ];
+
+        replace_return_label_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(
+            rendered.contains("if done then\n\treturn\nend"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("goto exit"), "{rendered}");
+        assert!(!rendered.contains("::exit::"), "{rendered}");
+    }
+
+    #[test]
+    fn return_only_labels_keep_conflicting_return_values() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("done".into()),
+                then_body: vec![Stmt::Goto("exit".into())],
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Var("a".into()),
+                then_body: vec![
+                    Stmt::Label("exit".into()),
+                    Stmt::Return(vec![Expr::Bool(true)]),
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Var("b".into()),
+                then_body: vec![
+                    Stmt::Label("exit".into()),
+                    Stmt::Return(vec![Expr::Bool(false)]),
+                ],
+                else_body: Vec::new(),
+            },
+        ];
+
+        replace_return_label_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("goto exit"), "{rendered}");
+        assert!(rendered.contains("::exit::"), "{rendered}");
+    }
+
+    #[test]
+    fn orphan_terminal_goto_becomes_return_and_enables_guard_cleanup() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Binary(
+                    "~=",
+                    Box::new(Expr::Var("name".into())),
+                    Box::new(Expr::Str("\"damper\"".into())),
+                ),
+                then_body: vec![Stmt::If {
+                    cond: Expr::Binary(
+                        "~=",
+                        Box::new(Expr::Var("name".into())),
+                        Box::new(Expr::Str("\"d\"".into())),
+                    ),
+                    then_body: vec![Stmt::Goto("missing_end".into())],
+                    else_body: Vec::new(),
+                }],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("value".into())],
+                values: vec![Expr::Var("damper".into())],
+            },
+            Stmt::Goto("missing_tail".into()),
+            Stmt::Return(Vec::new()),
+        ];
+
+        replace_orphan_terminal_goto_with_return(&mut stmts);
+        recover_orphan_if_join_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("if name == \"damper\" or name == \"d\" then"));
+        assert!(rendered.contains("return"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
     }
 
     #[test]
@@ -3891,6 +7843,980 @@ mod tests {
     }
 
     #[test]
+    fn recovers_goto_into_labeled_if_gate_with_unrelated_backedge() {
+        let mut stmts = vec![
+            Stmt::Label("loop_start".into()),
+            Stmt::If {
+                cond: Expr::Var("missing_a".into()),
+                then_body: vec![Stmt::Goto("retry".into())],
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Var("missing_b".into()),
+                then_body: vec![
+                    Stmt::Label("retry".into()),
+                    Stmt::Call(Expr::Call(Box::new(Expr::Var("wait".into())), Vec::new())),
+                    Stmt::Goto("loop_start".into()),
+                ],
+                else_body: Vec::new(),
+            },
+        ];
+
+        recover_goto_into_if_gates(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(
+            rendered.contains("if missing_a or missing_b then"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("goto loop_start"), "{rendered}");
+        assert!(!rendered.contains("goto retry"), "{rendered}");
+        assert!(!rendered.contains("::retry::"), "{rendered}");
+    }
+
+    #[test]
+    fn recovers_goto_into_later_labeled_if_gate() {
+        let mut stmts = vec![
+            Stmt::Assign {
+                targets: vec![Expr::Var("allowed".into())],
+                values: vec![Expr::Field(
+                    Box::new(Expr::Var("item".into())),
+                    "IsMolotov".into(),
+                )],
+            },
+            Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("allowed".into()))),
+                then_body: vec![Stmt::Goto("accepted".into())],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("allowed".into())],
+                values: vec![Expr::Field(
+                    Box::new(Expr::Var("item".into())),
+                    "Lit".into(),
+                )],
+            },
+            Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("allowed".into()))),
+                then_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("allowed".into())],
+                        values: vec![Expr::Field(
+                            Box::new(Expr::Var("item".into())),
+                            "Thrown".into(),
+                        )],
+                    },
+                    Stmt::If {
+                        cond: Expr::Unary("not ", Box::new(Expr::Var("allowed".into()))),
+                        then_body: vec![
+                            Stmt::Label("accepted".into()),
+                            Stmt::Call(Expr::Call(Box::new(Expr::Var("equip".into())), Vec::new())),
+                        ],
+                        else_body: Vec::new(),
+                    },
+                ],
+                else_body: Vec::new(),
+            },
+        ];
+
+        recover_goto_into_if_gates(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(
+            rendered.contains("if not allowed then\n\tequip()"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("else\n\tallowed = item.Lit"),
+            "{rendered}"
+        );
+        assert_eq!(rendered.matches("equip()").count(), 2, "{rendered}");
+        assert!(!rendered.contains("goto accepted"), "{rendered}");
+        assert!(!rendered.contains("::accepted::"), "{rendered}");
+    }
+
+    #[test]
+    fn later_labeled_if_gate_allows_reused_label_names_outside_region() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("first".into()),
+                then_body: vec![Stmt::Goto("L6".into())],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("first".into())],
+                values: vec![Expr::Var("fallback".into())],
+            },
+            Stmt::If {
+                cond: Expr::Var("fallback".into()),
+                then_body: vec![
+                    Stmt::Label("L6".into()),
+                    Stmt::Call(Expr::Call(
+                        Box::new(Expr::Var("useFirst".into())),
+                        Vec::new(),
+                    )),
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Var("second".into()),
+                then_body: vec![Stmt::Goto("L6".into())],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("second".into())],
+                values: vec![Expr::Var("fallback2".into())],
+            },
+            Stmt::If {
+                cond: Expr::Var("fallback2".into()),
+                then_body: vec![
+                    Stmt::Label("L6".into()),
+                    Stmt::Call(Expr::Call(
+                        Box::new(Expr::Var("useSecond".into())),
+                        Vec::new(),
+                    )),
+                ],
+                else_body: Vec::new(),
+            },
+        ];
+
+        recover_goto_into_if_gates(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("useFirst()"), "{rendered}");
+        assert!(rendered.contains("useSecond()"), "{rendered}");
+        assert!(!rendered.contains("goto L6"), "{rendered}");
+        assert!(!rendered.contains("::L6::"), "{rendered}");
+    }
+
+    #[test]
+    fn nested_goto_to_later_label_routes_fallthrough_prefix() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("upright".into()),
+                then_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("allowed".into())],
+                        values: vec![Expr::Field(
+                            Box::new(Expr::Var("item".into())),
+                            "IsDynamite".into(),
+                        )],
+                    },
+                    Stmt::If {
+                        cond: Expr::Unary("not ", Box::new(Expr::Var("allowed".into()))),
+                        then_body: vec![
+                            Stmt::Assign {
+                                targets: vec![Expr::Var("allowed".into())],
+                                values: vec![Expr::Field(
+                                    Box::new(Expr::Var("item".into())),
+                                    "IsMolotov".into(),
+                                )],
+                            },
+                            Stmt::If {
+                                cond: Expr::Unary("not ", Box::new(Expr::Var("allowed".into()))),
+                                then_body: vec![Stmt::Goto("accepted".into())],
+                                else_body: Vec::new(),
+                            },
+                        ],
+                        else_body: Vec::new(),
+                    },
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("allowed".into())],
+                values: vec![Expr::Field(
+                    Box::new(Expr::Var("item".into())),
+                    "Lit".into(),
+                )],
+            },
+            Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("allowed".into()))),
+                then_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("allowed".into())],
+                        values: vec![Expr::Field(
+                            Box::new(Expr::Var("item".into())),
+                            "Thrown".into(),
+                        )],
+                    },
+                    Stmt::If {
+                        cond: Expr::Unary("not ", Box::new(Expr::Var("allowed".into()))),
+                        then_body: vec![
+                            Stmt::Label("accepted".into()),
+                            Stmt::Call(Expr::Call(Box::new(Expr::Var("equip".into())), Vec::new())),
+                        ],
+                        else_body: Vec::new(),
+                    },
+                ],
+                else_body: Vec::new(),
+            },
+        ];
+
+        recover_goto_into_if_gates(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("equip()"), "{rendered}");
+        assert!(!rendered.contains("goto accepted"), "{rendered}");
+        assert!(!rendered.contains("::accepted::"), "{rendered}");
+    }
+
+    #[test]
+    fn recovers_goto_into_labeled_elseif_chain() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("skip".into()),
+                then_body: vec![Stmt::Goto("fallback".into())],
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Var("isSprinting".into()),
+                then_body: vec![
+                    Stmt::Label("fallback".into()),
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("canCrouch".into())],
+                        values: vec![Expr::Bool(false)],
+                    },
+                ],
+                else_body: vec![Stmt::If {
+                    cond: Expr::Var("isSwimming".into()),
+                    then_body: vec![
+                        Stmt::Label("fallback".into()),
+                        Stmt::Assign {
+                            targets: vec![Expr::Var("canCrouch".into())],
+                            values: vec![Expr::Bool(false)],
+                        },
+                    ],
+                    else_body: vec![Stmt::Assign {
+                        targets: vec![Expr::Var("canCrouch".into())],
+                        values: vec![Expr::Bool(true)],
+                    }],
+                }],
+            },
+        ];
+
+        recover_goto_into_if_gates(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(
+            rendered.contains("if skip or isSprinting then"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("elseif isSwimming then"), "{rendered}");
+        assert!(!rendered.contains("goto fallback"), "{rendered}");
+        assert!(!rendered.contains("::fallback::"), "{rendered}");
+    }
+
+    #[test]
+    fn recovers_goto_into_later_duplicated_labeled_elseif_chain() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("skipSetup".into()),
+                then_body: vec![Stmt::Goto("blocked".into())],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("sprinting".into())],
+                values: vec![Expr::Field(
+                    Box::new(Expr::Var("self".into())),
+                    "IsSprinting".into(),
+                )],
+            },
+            Stmt::If {
+                cond: Expr::Var("sprinting".into()),
+                then_body: vec![
+                    Stmt::Label("blocked".into()),
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("canCrouch".into())],
+                        values: vec![Expr::Bool(false)],
+                    },
+                ],
+                else_body: vec![Stmt::If {
+                    cond: Expr::Unary("not ", Box::new(Expr::Var("upright".into()))),
+                    then_body: vec![
+                        Stmt::Label("blocked".into()),
+                        Stmt::Assign {
+                            targets: vec![Expr::Var("canCrouch".into())],
+                            values: vec![Expr::Bool(false)],
+                        },
+                    ],
+                    else_body: vec![Stmt::Assign {
+                        targets: vec![Expr::Var("canCrouch".into())],
+                        values: vec![Expr::Bool(true)],
+                    }],
+                }],
+            },
+        ];
+
+        recover_goto_into_if_gates(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("if skipSetup then"), "{rendered}");
+        assert!(rendered.contains("canCrouch = false"), "{rendered}");
+        assert!(
+            rendered.contains("else\n\tsprinting = self.IsSprinting"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("elseif not upright then"), "{rendered}");
+        assert!(!rendered.contains("goto blocked"), "{rendered}");
+        assert!(!rendered.contains("::blocked::"), "{rendered}");
+    }
+
+    #[test]
+    fn recovers_gotos_to_later_else_label() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Binary(
+                    "<=",
+                    Box::new(Expr::Var("magnitude".into())),
+                    Box::new(Expr::Num("0".into())),
+                ),
+                then_body: vec![
+                    Stmt::If {
+                        cond: Expr::Unary("not ", Box::new(Expr::Var("swimming".into()))),
+                        then_body: vec![Stmt::Goto("reset".into())],
+                        else_body: Vec::new(),
+                    },
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("magnitude".into())],
+                        values: vec![Expr::Field(
+                            Box::new(Expr::Var("velocity".into())),
+                            "Y".into(),
+                        )],
+                    },
+                    Stmt::If {
+                        cond: Expr::Binary(
+                            "<=",
+                            Box::new(Expr::Var("magnitude".into())),
+                            Box::new(Expr::Num("2".into())),
+                        ),
+                        then_body: vec![Stmt::Goto("reset".into())],
+                        else_body: Vec::new(),
+                    },
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("deg".into())],
+                        values: vec![Expr::Num("2".into())],
+                    },
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("sitting".into())],
+                values: vec![Expr::Field(
+                    Box::new(Expr::Var("self".into())),
+                    "Sitting".into(),
+                )],
+            },
+            Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("sitting".into()))),
+                then_body: vec![Stmt::Call(Expr::Call(
+                    Box::new(Expr::Var("move".into())),
+                    Vec::new(),
+                ))],
+                else_body: vec![
+                    Stmt::Label("reset".into()),
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("lastMoveAngle".into())],
+                        values: vec![Expr::Nil],
+                    },
+                ],
+            },
+        ];
+
+        recover_gotos_to_later_else_label(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("lastMoveAngle = nil"), "{rendered}");
+        assert!(rendered.contains("move()"), "{rendered}");
+        assert!(!rendered.contains("goto reset"), "{rendered}");
+        assert!(!rendered.contains("::reset::"), "{rendered}");
+    }
+
+    #[test]
+    fn retargets_missing_goto_to_next_sibling_label() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("skip".into()),
+                then_body: vec![Stmt::Goto("missing".into())],
+                else_body: Vec::new(),
+            },
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Var("fallback".into())),
+                Vec::new(),
+            )),
+            Stmt::Label("join".into()),
+            Stmt::Call(Expr::Call(Box::new(Expr::Var("tail".into())), Vec::new())),
+        ];
+
+        retarget_missing_gotos_to_next_label(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("goto join"), "{rendered}");
+        assert!(!rendered.contains("goto missing"), "{rendered}");
+    }
+
+    #[test]
+    fn recovers_multistmt_orphan_skip_gotos() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("first".into()),
+                then_body: vec![
+                    Stmt::Call(Expr::Call(Box::new(Expr::Var("setup".into())), Vec::new())),
+                    Stmt::If {
+                        cond: Expr::Var("done".into()),
+                        then_body: vec![Stmt::Goto("join".into())],
+                        else_body: Vec::new(),
+                    },
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Var("fallback".into())),
+                Vec::new(),
+            )),
+            Stmt::If {
+                cond: Expr::Var("done".into()),
+                then_body: vec![Stmt::Goto("join".into())],
+                else_body: Vec::new(),
+            },
+            Stmt::Call(Expr::Call(Box::new(Expr::Var("tail".into())), Vec::new())),
+        ];
+
+        recover_nested_orphan_skip_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("setup()"), "{rendered}");
+        assert!(rendered.contains("fallback()"), "{rendered}");
+        assert!(rendered.contains("tail()"), "{rendered}");
+        assert!(!rendered.contains("goto join"), "{rendered}");
+    }
+
+    #[test]
+    fn multistmt_orphan_skip_includes_fallback_assignment() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("fromConfig".into()),
+                then_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("text".into())],
+                        values: vec![Expr::Field(
+                            Box::new(Expr::Var("config".into())),
+                            "Display".into(),
+                        )],
+                    },
+                    Stmt::Goto("join".into()),
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Var("fromItem".into()),
+                then_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("text".into())],
+                        values: vec![Expr::Field(
+                            Box::new(Expr::Var("item".into())),
+                            "Display".into(),
+                        )],
+                    },
+                    Stmt::Goto("join".into()),
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("text".into())],
+                values: vec![Expr::Field(
+                    Box::new(Expr::Var("item".into())),
+                    "Type".into(),
+                )],
+            },
+            Stmt::Call(Expr::Call(Box::new(Expr::Var("tail".into())), Vec::new())),
+        ];
+
+        recover_nested_orphan_skip_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("text = item.Type"), "{rendered}");
+        assert!(rendered.contains("tail()"), "{rendered}");
+        assert!(!rendered.contains("goto join"), "{rendered}");
+    }
+
+    #[test]
+    fn loop_find_goto_becomes_break_with_default_before_loop() {
+        let mut stmts = vec![
+            Stmt::GenericFor {
+                vars: vec!["i".into(), "item".into()],
+                exprs: vec![Expr::Var("items".into())],
+                body: vec![
+                    Stmt::If {
+                        cond: Expr::Binary(
+                            "~=",
+                            Box::new(Expr::Field(Box::new(Expr::Var("item".into())), "id".into())),
+                            Box::new(Expr::Var("wanted".into())),
+                        ),
+                        then_body: vec![Stmt::Continue],
+                        else_body: Vec::new(),
+                    },
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("found".into())],
+                        values: vec![Expr::Var("item".into())],
+                    },
+                    Stmt::Goto("found_join".into()),
+                ],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("found".into())],
+                values: vec![Expr::Nil],
+            },
+            Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("found".into()))),
+                then_body: vec![Stmt::Return(Vec::new())],
+                else_body: Vec::new(),
+            },
+        ];
+
+        recover_loop_find_breaks(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.starts_with("found = nil"), "{rendered}");
+        assert!(rendered.contains("break"), "{rendered}");
+        assert!(rendered.contains("if not found then"), "{rendered}");
+        assert!(!rendered.contains("goto found_join"), "{rendered}");
+    }
+
+    #[test]
+    fn loop_find_labeled_join_moves_default_before_loop() {
+        let mut stmts = vec![
+            Stmt::GenericFor {
+                vars: vec!["i".into(), "item".into()],
+                exprs: vec![Expr::Var("items".into())],
+                body: vec![
+                    Stmt::If {
+                        cond: Expr::Binary(
+                            "~=",
+                            Box::new(Expr::Field(
+                                Box::new(Expr::Var("item".into())),
+                                "Name".into(),
+                            )),
+                            Box::new(Expr::Str("\"Fruit Magnet\"".into())),
+                        ),
+                        then_body: vec![Stmt::Continue],
+                        else_body: Vec::new(),
+                    },
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("range".into())],
+                        values: vec![Expr::Binary(
+                            "or",
+                            Box::new(Expr::Field(
+                                Box::new(Expr::Var("item".into())),
+                                "Range".into(),
+                            )),
+                            Box::new(Expr::Num("63".into())),
+                        )],
+                    },
+                    Stmt::Goto("join".into()),
+                ],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("range".into())],
+                values: vec![Expr::Num("63".into())],
+            },
+            Stmt::Label("join".into()),
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Var("useRange".into())),
+                Vec::new(),
+            )),
+        ];
+
+        recover_loop_find_breaks(&mut stmts);
+        remove_unused_labels(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.starts_with("range = 63"), "{rendered}");
+        assert!(rendered.contains("break"), "{rendered}");
+        assert!(rendered.contains("useRange()"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+        assert!(!rendered.contains("::join::"), "{rendered}");
+    }
+
+    #[test]
+    fn loop_find_labeled_join_moves_pure_fallback_block_before_loop() {
+        let mut stmts = vec![
+            Stmt::GenericFor {
+                vars: vec!["i".into(), "entry".into()],
+                exprs: vec![Expr::Var("buckets".into())],
+                body: vec![
+                    Stmt::If {
+                        cond: Expr::Binary(
+                            ">=",
+                            Box::new(Expr::Var("amount".into())),
+                            Box::new(Expr::Field(
+                                Box::new(Expr::Var("entry".into())),
+                                "Max".into(),
+                            )),
+                        ),
+                        then_body: vec![Stmt::Continue],
+                        else_body: Vec::new(),
+                    },
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("name".into())],
+                        values: vec![Expr::Field(
+                            Box::new(Expr::Var("entry".into())),
+                            "Name".into(),
+                        )],
+                    },
+                    Stmt::Goto("join".into()),
+                ],
+            },
+            Stmt::Local {
+                names: vec!["last".into()],
+                values: vec![Expr::Var("buckets".into())],
+            },
+            Stmt::Local {
+                names: vec!["count".into()],
+                values: vec![Expr::Unary("#", Box::new(Expr::Var("last".into())))],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("name".into())],
+                values: vec![Expr::Field(
+                    Box::new(Expr::Index(
+                        Box::new(Expr::Var("last".into())),
+                        Box::new(Expr::Var("count".into())),
+                    )),
+                    "Name".into(),
+                )],
+            },
+            Stmt::Label("join".into()),
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Var("useName".into())),
+                Vec::new(),
+            )),
+        ];
+
+        recover_loop_find_breaks(&mut stmts);
+        remove_unused_labels(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.starts_with("local last = buckets"), "{rendered}");
+        assert!(rendered.contains("break"), "{rendered}");
+        assert!(rendered.contains("useName()"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+        assert!(!rendered.contains("::join::"), "{rendered}");
+    }
+
+    #[test]
+    fn forward_label_skip_gotos_wrap_short_region() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Unary(
+                    "not ",
+                    Box::new(Expr::Call(
+                        Box::new(Expr::Var("isMouse".into())),
+                        Vec::new(),
+                    )),
+                ),
+                then_body: vec![Stmt::If {
+                    cond: Expr::Binary(
+                        "~=",
+                        Box::new(Expr::Var("kind".into())),
+                        Box::new(Expr::Var("Keyboard".into())),
+                    ),
+                    then_body: vec![Stmt::Goto("touch".into())],
+                    else_body: Vec::new(),
+                }],
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Var("debounced".into()),
+                then_body: vec![Stmt::Return(Vec::new())],
+                else_body: Vec::new(),
+            },
+            Stmt::Label("touch".into()),
+            Stmt::If {
+                cond: Expr::Var("isTouch".into()),
+                then_body: vec![Stmt::Assign {
+                    targets: vec![Expr::Var("device".into())],
+                    values: vec![Expr::Str("\"PC\"".into())],
+                }],
+                else_body: Vec::new(),
+            },
+        ];
+
+        recover_forward_label_skip_gotos(&mut stmts);
+        remove_unused_labels(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("repeat"), "{rendered}");
+        assert!(rendered.contains("break"), "{rendered}");
+        assert!(rendered.contains("if isTouch then"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+        assert!(!rendered.contains("::touch::"), "{rendered}");
+    }
+
+    #[test]
+    fn forward_label_skip_gotos_wrap_multiple_guards() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("ready".into()))),
+                then_body: vec![Stmt::Goto("done".into())],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("elapsed".into())],
+                values: vec![Expr::Call(Box::new(Expr::Var("tick".into())), Vec::new())],
+            },
+            Stmt::If {
+                cond: Expr::Var("blocked".into()),
+                then_body: vec![Stmt::Goto("done".into())],
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Binary(
+                    "<",
+                    Box::new(Expr::Var("elapsed".into())),
+                    Box::new(Expr::Var("duration".into())),
+                ),
+                then_body: vec![Stmt::Goto("done".into())],
+                else_body: Vec::new(),
+            },
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Var("advance".into())),
+                Vec::new(),
+            )),
+            Stmt::Label("done".into()),
+            Stmt::Assign {
+                targets: vec![Expr::Var("holding".into())],
+                values: vec![Expr::Bool(true)],
+            },
+        ];
+
+        recover_forward_label_skip_gotos(&mut stmts);
+        remove_unused_labels(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("repeat"), "{rendered}");
+        assert_eq!(rendered.matches("break").count(), 3, "{rendered}");
+        assert!(rendered.contains("holding = true"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+        assert!(!rendered.contains("::done::"), "{rendered}");
+    }
+
+    #[test]
+    fn missing_label_skip_to_block_end_wraps_suffix() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("active".into()))),
+                then_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("state".into())],
+                        values: vec![Expr::Str("\"CHARGING\"".into())],
+                    },
+                    Stmt::Goto("done".into()),
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("target".into()))),
+                then_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Var("state".into())],
+                        values: vec![Expr::Str("\"CHARGING\"".into())],
+                    },
+                    Stmt::Goto("done".into()),
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Var("root".into()),
+                then_body: vec![Stmt::Assign {
+                    targets: vec![Expr::Var("state".into())],
+                    values: vec![Expr::Str("\"CHARGING\"".into())],
+                }],
+                else_body: vec![Stmt::Return(Vec::new())],
+            },
+        ];
+
+        recover_missing_label_skip_to_block_end_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("repeat"), "{rendered}");
+        assert_eq!(rendered.matches("break").count(), 2, "{rendered}");
+        assert!(rendered.contains("if root then"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+    }
+
+    #[test]
+    fn missing_guard_skip_to_block_end_inverts_tail_with_break() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("hasTool".into()))),
+                then_body: vec![Stmt::If {
+                    cond: Expr::Call(Box::new(Expr::Var("insidePlot".into())), Vec::new()),
+                    then_body: vec![Stmt::Goto("done".into())],
+                    else_body: Vec::new(),
+                }],
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Var("cancelled".into()),
+                then_body: vec![Stmt::Break],
+                else_body: Vec::new(),
+            },
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Var("createArrow".into())),
+                Vec::new(),
+            )),
+        ];
+
+        recover_missing_guard_skip_to_block_end_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("if "), "{rendered}");
+        assert!(rendered.contains("break"), "{rendered}");
+        assert!(rendered.contains("createArrow()"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+    }
+
+    #[test]
+    fn duplicate_labeled_terminal_body_replaces_goto() {
+        let terminal_body = vec![
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Field(
+                    Box::new(Expr::Var("prompt".into())),
+                    "Connect".into(),
+                )),
+                Vec::new(),
+            )),
+            Stmt::Return(Vec::new()),
+        ];
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("humanoid".into()))),
+                then_body: {
+                    let mut body = vec![Stmt::Label("setup".into())];
+                    body.extend(terminal_body.clone());
+                    body
+                },
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("animator".into()))),
+                then_body: {
+                    let mut body = vec![Stmt::Label("setup".into())];
+                    body.extend(terminal_body.clone());
+                    body
+                },
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("track".into())],
+                values: vec![Expr::Call(
+                    Box::new(Expr::Var("loadAnimation".into())),
+                    Vec::new(),
+                )],
+            },
+            Stmt::Goto("setup".into()),
+        ];
+
+        recover_duplicate_labeled_terminal_bodies(&mut stmts);
+        remove_unused_labels(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("track = loadAnimation()"), "{rendered}");
+        assert_eq!(rendered.matches("return").count(), 3, "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+        assert!(!rendered.contains("::setup::"), "{rendered}");
+    }
+
+    #[test]
+    fn duplicate_labeled_nonterminal_body_replaces_goto() {
+        let shared_body = vec![
+            Stmt::If {
+                cond: Expr::Var("touchInput".into()),
+                then_body: vec![Stmt::Return(Vec::new())],
+                else_body: Vec::new(),
+            },
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Field(
+                    Box::new(Expr::Var("handler".into())),
+                    "Run".into(),
+                )),
+                Vec::new(),
+            )),
+        ];
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("mouseInput".into()))),
+                then_body: {
+                    let mut body = vec![Stmt::Label("fallback".into())];
+                    body.extend(shared_body.clone());
+                    body
+                },
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("permitted".into()))),
+                then_body: {
+                    let mut body = vec![Stmt::Label("fallback".into())];
+                    body.extend(shared_body.clone());
+                    body
+                },
+                else_body: Vec::new(),
+            },
+            Stmt::Call(Expr::Call(Box::new(Expr::Var("commit".into())), Vec::new())),
+            Stmt::Goto("fallback".into()),
+        ];
+
+        recover_duplicate_labeled_bodies(&mut stmts);
+        remove_unused_labels(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("commit()"), "{rendered}");
+        assert_eq!(rendered.matches("handler.Run()").count(), 3, "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+        assert!(!rendered.contains("::fallback::"), "{rendered}");
+    }
+
+    #[test]
+    fn recovers_goto_into_nested_labeled_if_gate() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("reuseTrack".into()),
+                then_body: vec![Stmt::Goto("sync".into())],
+                else_body: Vec::new(),
+            },
+            Stmt::If {
+                cond: Expr::Var("oppositeTrack".into()),
+                then_body: vec![Stmt::If {
+                    cond: Expr::Var("samePair".into()),
+                    then_body: vec![
+                        Stmt::Label("sync".into()),
+                        Stmt::Call(Expr::Call(
+                            Box::new(Expr::Var("syncTracks".into())),
+                            Vec::new(),
+                        )),
+                    ],
+                    else_body: Vec::new(),
+                }],
+                else_body: Vec::new(),
+            },
+        ];
+
+        recover_goto_into_if_gates(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(
+            rendered.contains("if reuseTrack or oppositeTrack then"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("if reuseTrack or samePair then"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("goto sync"), "{rendered}");
+        assert!(!rendered.contains("::sync::"), "{rendered}");
+    }
+
+    #[test]
     fn recovers_top_test_while_goto() {
         let mut stmts = vec![
             Stmt::Local {
@@ -4000,6 +8926,208 @@ mod tests {
         let rendered = render_block(&stmts, 0);
         assert!(rendered.contains("::L0::"), "{rendered}");
         assert_eq!(rendered.matches("goto L0").count(), 2, "{rendered}");
+    }
+
+    #[test]
+    fn recovers_if_join_goto_as_else_branch() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("has_canvas_size".into()),
+                then_body: vec![
+                    Stmt::Assign {
+                        targets: vec![Expr::Field(
+                            Box::new(Expr::Var("surfaceGui".into())),
+                            "CanvasSize".into(),
+                        )],
+                        values: vec![Expr::Var("canvasSize".into())],
+                    },
+                    Stmt::Goto("join".into()),
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Field(
+                    Box::new(Expr::Var("surfaceGui".into())),
+                    "CanvasSize".into(),
+                )],
+                values: vec![Expr::Call(
+                    Box::new(Expr::Field(
+                        Box::new(Expr::Var("Vector2".into())),
+                        "new".into(),
+                    )),
+                    vec![Expr::Var("x".into()), Expr::Var("y".into())],
+                )],
+            },
+            Stmt::Label("join".into()),
+            Stmt::Return(vec![Expr::Var("surfaceGui".into())]),
+        ];
+
+        recover_if_join_gotos(&mut stmts);
+        remove_unused_labels(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("else"), "{rendered}");
+        assert!(rendered.contains("Vector2.new(x, y)"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+        assert!(!rendered.contains("::"), "{rendered}");
+    }
+
+    #[test]
+    fn branch_gotos_to_following_label_become_repeat_breaks() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("enabled".into()),
+                then_body: vec![
+                    Stmt::Call(Expr::Call(Box::new(Expr::Var("start".into())), Vec::new())),
+                    Stmt::If {
+                        cond: Expr::Var("done".into()),
+                        then_body: vec![Stmt::Goto("joined".into())],
+                        else_body: Vec::new(),
+                    },
+                    Stmt::Call(Expr::Call(Box::new(Expr::Var("finish".into())), Vec::new())),
+                    Stmt::Goto("joined".into()),
+                ],
+                else_body: vec![Stmt::Call(Expr::Call(
+                    Box::new(Expr::Var("fallback".into())),
+                    Vec::new(),
+                ))],
+            },
+            Stmt::Label("joined".into()),
+            Stmt::Call(Expr::Call(Box::new(Expr::Var("after".into())), Vec::new())),
+        ];
+
+        recover_branch_gotos_to_following_label(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("repeat"), "{rendered}");
+        assert!(rendered.contains("until true"), "{rendered}");
+        assert!(rendered.contains("break"), "{rendered}");
+        assert!(rendered.contains("after()"), "{rendered}");
+        assert!(!rendered.contains("goto joined"), "{rendered}");
+        assert!(!rendered.contains("::joined::"), "{rendered}");
+    }
+
+    #[test]
+    fn recovers_short_orphan_if_join_tail() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Var("is_model".into()),
+                then_body: vec![Stmt::If {
+                    cond: Expr::Var("primary_part".into()),
+                    then_body: vec![
+                        Stmt::Assign {
+                            targets: vec![Expr::Var("base_part".into())],
+                            values: vec![Expr::Var("primary_part".into())],
+                        },
+                        Stmt::Goto("missing_join".into()),
+                    ],
+                    else_body: Vec::new(),
+                }],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("base_part".into())],
+                values: vec![Expr::MethodCall(
+                    Box::new(Expr::Var("instance".into())),
+                    "FindFirstChildWhichIsA".into(),
+                    vec![Expr::Str("\"BasePart\"".into()), Expr::Bool(true)],
+                )],
+            },
+        ];
+
+        recover_orphan_if_join_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("else"), "{rendered}");
+        assert!(rendered.contains("base_part = primary_part"), "{rendered}");
+        assert!(
+            rendered.contains("base_part = instance:FindFirstChildWhichIsA"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("goto"), "{rendered}");
+    }
+
+    #[test]
+    fn leaves_long_orphan_if_join_tail() {
+        let mut stmts = vec![Stmt::If {
+            cond: Expr::Var("accepted".into()),
+            then_body: vec![Stmt::Goto("missing_join".into())],
+            else_body: Vec::new(),
+        }];
+        for i in 0..9 {
+            stmts.push(Stmt::Assign {
+                targets: vec![Expr::Var(format!("v{i}"))],
+                values: vec![Expr::Num(i.to_string())],
+            });
+        }
+        stmts.push(Stmt::Goto("other".into()));
+
+        recover_orphan_if_join_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("goto missing_join"), "{rendered}");
+    }
+
+    #[test]
+    fn recovers_orphan_skip_to_terminal_tail() {
+        let mut stmts = vec![
+            Stmt::If {
+                cond: Expr::Binary(
+                    "~=",
+                    Box::new(Expr::Var("name".into())),
+                    Box::new(Expr::Str("\"acceleration\"".into())),
+                ),
+                then_body: vec![Stmt::If {
+                    cond: Expr::Binary(
+                        "~=",
+                        Box::new(Expr::Var("name".into())),
+                        Box::new(Expr::Str("\"a\"".into())),
+                    ),
+                    then_body: vec![Stmt::Goto("missing_end".into())],
+                    else_body: Vec::new(),
+                }],
+                else_body: Vec::new(),
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("value".into())],
+                values: vec![Expr::Call(
+                    Box::new(Expr::Var("compute".into())),
+                    Vec::new(),
+                )],
+            },
+            Stmt::Return(vec![Expr::Var("value".into())]),
+        ];
+
+        recover_orphan_if_join_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(
+            rendered.contains("if name == \"acceleration\" or name == \"a\" then"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("return value"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+    }
+
+    #[test]
+    fn leaves_orphan_skip_tail_with_fallback_control_flow() {
+        let mut stmts = vec![Stmt::If {
+            cond: Expr::Var("skip".into()),
+            then_body: vec![Stmt::Goto("missing_end".into())],
+            else_body: Vec::new(),
+        }];
+        for i in 0..9 {
+            stmts.push(Stmt::Assign {
+                targets: vec![Expr::Var("value".into())],
+                values: vec![Expr::Num(i.to_string())],
+            });
+        }
+        stmts.push(Stmt::Goto("other".into()));
+
+        recover_orphan_if_join_gotos(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("goto missing_end"), "{rendered}");
     }
 
     #[test]
@@ -4180,6 +9308,76 @@ mod tests {
         assert!(!rendered.contains("goto"), "{rendered}");
         assert!(!rendered.contains("::L0::"), "{rendered}");
         assert!(!rendered.contains("::L1::"), "{rendered}");
+    }
+
+    #[test]
+    fn recovers_label_loop_with_iteration_setup_and_nested_backedge() {
+        let mut stmts = vec![
+            Stmt::Label("L0".into()),
+            Stmt::Local {
+                names: vec!["remaining".into()],
+                values: vec![Expr::Var("budget".into())],
+            },
+            Stmt::Local {
+                names: vec!["step".into()],
+                values: vec![Expr::Num("1".into())],
+            },
+            Stmt::If {
+                cond: Expr::Binary(
+                    ">",
+                    Box::new(Expr::Var("remaining".into())),
+                    Box::new(Expr::Num("0".into())),
+                ),
+                then_body: vec![Stmt::If {
+                    cond: Expr::Binary(
+                        "<",
+                        Box::new(Expr::Var("count".into())),
+                        Box::new(Expr::Num("7".into())),
+                    ),
+                    then_body: vec![
+                        Stmt::NumericFor {
+                            var: "i".into(),
+                            start: Expr::Num("1".into()),
+                            limit: Expr::Num("2".into()),
+                            step: None,
+                            body: vec![Stmt::Call(Expr::Call(
+                                Box::new(Expr::Var("tick".into())),
+                                Vec::new(),
+                            ))],
+                        },
+                        Stmt::Assign {
+                            targets: vec![Expr::Var("budget".into())],
+                            values: vec![Expr::Binary(
+                                "-",
+                                Box::new(Expr::Var("budget".into())),
+                                Box::new(Expr::Var("step".into())),
+                            )],
+                        },
+                        Stmt::Assign {
+                            targets: vec![Expr::Var("count".into())],
+                            values: vec![Expr::Binary(
+                                "+",
+                                Box::new(Expr::Var("count".into())),
+                                Box::new(Expr::Num("1".into())),
+                            )],
+                        },
+                        Stmt::Goto("L0".into()),
+                    ],
+                    else_body: Vec::new(),
+                }],
+                else_body: Vec::new(),
+            },
+            Stmt::Call(Expr::Call(Box::new(Expr::Var("done".into())), Vec::new())),
+        ];
+
+        recover_natural_loops(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(rendered.contains("while true do"), "{rendered}");
+        assert!(rendered.contains("continue"), "{rendered}");
+        assert!(rendered.contains("break"), "{rendered}");
+        assert!(!rendered.contains("goto"), "{rendered}");
+        assert!(!rendered.contains("::L0::"), "{rendered}");
     }
 
     #[test]

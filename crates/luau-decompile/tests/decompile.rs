@@ -5,7 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use luau_bytecode::parse_and_validate;
+use luau_bytecode::{parse_and_validate, parse_normalized};
 use luau_decompile::decompile;
 
 fn root() -> PathBuf {
@@ -68,6 +68,59 @@ fn all_files() -> Vec<PathBuf> {
         .unwrap()
         .map(|e| e.unwrap().path())
         .filter(|p| p.extension().map(|x| x == "luauc").unwrap_or(false))
+        .collect();
+    v.sort();
+    v
+}
+
+const IN_GAME_DEFAULT_MAX_BYTES: u64 = 512 * 1024;
+
+fn in_game_bytecode_files() -> Vec<PathBuf> {
+    in_game_bytecode_files_by_size(|len| len <= IN_GAME_DEFAULT_MAX_BYTES)
+}
+
+fn in_game_large_bytecode_files() -> Vec<PathBuf> {
+    in_game_bytecode_files_by_size(|len| len > IN_GAME_DEFAULT_MAX_BYTES)
+}
+
+fn in_game_bytecode_files_by_size(keep_size: impl Fn(u64) -> bool) -> Vec<PathBuf> {
+    let dir = root().join("roblox-studio-cases").join("in_game");
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut v: Vec<PathBuf> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            let Some(name) = p.file_name().and_then(|name| name.to_str()) else {
+                return false;
+            };
+            let is_bytecode_luau = name.ends_with(".luau") && name.contains("Bytecode");
+            let size_ok = p
+                .metadata()
+                .map(|metadata| keep_size(metadata.len()))
+                .unwrap_or(false);
+            is_bytecode_luau && size_ok
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+fn in_game_all_bytecode_files() -> Vec<PathBuf> {
+    let dir = root().join("roblox-studio-cases").join("in_game");
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut v: Vec<PathBuf> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.ends_with(".luau") && name.contains("Bytecode"))
+                .unwrap_or(false)
+        })
         .collect();
     v.sort();
     v
@@ -876,6 +929,145 @@ fn warning_header_conditional_on_remaining_gotos() {
         "Warning header emitted for structured output:\n{}",
         out.source
     );
+}
+
+#[test]
+fn rtween_bytecode_structures_without_gotos() {
+    let path = root()
+        .join("roblox-studio-cases")
+        .join("in_game")
+        .join("RTween_ModuleScript_Bytecode.luau");
+    let bytes = fs::read(&path).unwrap();
+    let (module, multiplier) = parse_normalized(&bytes).unwrap();
+    assert_ne!(
+        multiplier, 1,
+        "RTween fixture should exercise Roblox opcode decoding"
+    );
+    let decompiled = decompile(&module);
+    assert!(
+        !decompiled.partial,
+        "RTween bytecode should fully structure, reports={:?}\n{}",
+        decompiled.per_proto, decompiled.source
+    );
+    assert!(
+        !decompiled
+            .source
+            .contains("-- Some regions use goto/labels"),
+        "RTween should not emit the goto warning:\n{}",
+        decompiled.source
+    );
+    assert!(
+        !decompiled.source.contains("goto ") && !decompiled.source.contains("::L"),
+        "RTween output should not contain raw goto/labels:\n{}",
+        decompiled.source
+    );
+    assert!(
+        recompiles(&decompiled.source, "rtween"),
+        "RTween output must recompile:\n{}",
+        decompiled.source
+    );
+}
+
+#[test]
+fn in_game_bytecode_fixtures_decompile_without_panic() {
+    let files = in_game_bytecode_files();
+    assert!(
+        !files.is_empty(),
+        "expected in-game Roblox bytecode fixtures under roblox-studio-cases/in_game"
+    );
+
+    for path in files {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("in_game_fixture");
+        let bytes = fs::read(&path).unwrap();
+        let (module, _multiplier) = parse_normalized(&bytes).unwrap();
+        let decompiled = decompile(&module);
+        assert!(
+            !decompiled.source.trim().is_empty(),
+            "{name}: empty decompile output"
+        );
+    }
+}
+
+#[test]
+#[ignore = "large Roblox bytecode fixtures are intentionally excluded from the default suite"]
+fn in_game_large_bytecode_fixtures_decompile_without_panic() {
+    let files = in_game_large_bytecode_files();
+    assert!(
+        !files.is_empty(),
+        "expected large in-game Roblox bytecode fixtures under roblox-studio-cases/in_game"
+    );
+
+    for path in files {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("in_game_large_fixture");
+        let bytes = fs::read(&path).unwrap();
+        let (module, _multiplier) = parse_normalized(&bytes).unwrap();
+        let decompiled = decompile(&module);
+        assert!(
+            !decompiled.source.trim().is_empty(),
+            "{name}: empty decompile output"
+        );
+    }
+}
+
+#[test]
+fn in_game_clean_bytecode_fixtures_stay_structured() {
+    let files = in_game_bytecode_files();
+    assert!(
+        !files.is_empty(),
+        "expected in-game Roblox bytecode fixtures under roblox-studio-cases/in_game"
+    );
+
+    for path in files {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("in_game_fixture");
+        let bytes = fs::read(&path).unwrap();
+        let (module, _multiplier) = parse_normalized(&bytes).unwrap();
+        let decompiled = decompile(&module);
+        assert!(
+            !decompiled.partial,
+            "{name}: expected fully structured output, reports={:?}\n{}",
+            decompiled.per_proto, decompiled.source
+        );
+        assert!(
+            !decompiled
+                .source
+                .contains("-- Some regions use goto/labels")
+                && !decompiled.source.contains("goto ")
+                && !decompiled.source.contains("::L"),
+            "{name}: structured in-game fixture should not contain goto/labels:\n{}",
+            decompiled.source
+        );
+        assert!(
+            recompiles(&decompiled.source, name),
+            "{name}: decompiled output must recompile:\n{}",
+            decompiled.source
+        );
+    }
+}
+
+#[test]
+fn in_game_fixture_discovery_includes_copied_bytecode_names() {
+    let files = in_game_all_bytecode_files();
+    if files.iter().any(|path| {
+        path.file_name().and_then(|name| name.to_str())
+            == Some("SharedData_ModuleScript_Bytecode copy.luau")
+    }) {
+        assert!(
+            in_game_bytecode_files().iter().any(|path| {
+                path.file_name().and_then(|name| name.to_str())
+                    == Some("SharedData_ModuleScript_Bytecode copy.luau")
+            }),
+            "copied bytecode fixture names should be included in the default in-game fixture set"
+        );
+    }
 }
 
 #[test]

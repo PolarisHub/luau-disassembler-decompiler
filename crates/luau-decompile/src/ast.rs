@@ -208,7 +208,11 @@ fn render_stmt(out: &mut String, s: &Stmt, indent: usize) {
         }
         Stmt::Call(e) => {
             pad(out, indent);
-            let _ = writeln!(out, "{}", render_expr_at(e, indent));
+            if expr_can_be_statement(e) {
+                let _ = writeln!(out, "{}", render_expr_at(e, indent));
+            } else {
+                let _ = writeln!(out, "_ = {}", render_expr_at(e, indent));
+            }
         }
         Stmt::Return(exprs) => {
             pad(out, indent);
@@ -303,6 +307,10 @@ fn render_stmt(out: &mut String, s: &Stmt, indent: usize) {
             let _ = writeln!(out, "-- {text}");
         }
     }
+}
+
+fn expr_can_be_statement(e: &Expr) -> bool {
+    matches!(e, Expr::Call(_, _) | Expr::MethodCall(_, _, _))
 }
 
 fn render_if_statement(
@@ -645,7 +653,16 @@ fn render_table(fields: &[TableField], indent: usize) -> String {
 fn render_table_field(fld: &TableField, indent: usize) -> String {
     match fld {
         TableField::Item(e) => render_expr_at(e, indent),
-        TableField::Named(n, e) => format!("{n} = {}", render_expr_at(e, indent)),
+        TableField::Named(n, e) if is_luau_identifier(n) => {
+            format!("{n} = {}", render_expr_at(e, indent))
+        }
+        TableField::Named(n, e) => {
+            format!(
+                "[{}] = {}",
+                quoted_luau_string(n),
+                render_expr_at(e, indent)
+            )
+        }
         TableField::Keyed(k, v) => {
             format!(
                 "[{}] = {}",
@@ -655,6 +672,43 @@ fn render_table_field(fld: &TableField, indent: usize) -> String {
         }
     }
 }
+
+fn is_luau_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    if !chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+        return false;
+    }
+    !LUAU_KEYWORDS.contains(&name)
+}
+
+fn quoted_luau_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for b in text.bytes() {
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("\\{b}")),
+        }
+    }
+    out.push('"');
+    out
+}
+
+const LUAU_KEYWORDS: &[&str] = &[
+    "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in", "local",
+    "nil", "not", "or", "repeat", "return", "then", "true", "until", "while", "continue",
+];
 
 fn table_needs_multiline(fields: &[TableField]) -> bool {
     fields.len() > 3
@@ -783,6 +837,19 @@ mod tests {
             TableField::Keyed(Expr::Num("2".into()), Expr::Bool(true)),
         ]);
         assert_eq!(render_expr(&t), "{1, k = \"v\", [2] = true}");
+    }
+
+    #[test]
+    fn non_call_expression_statement_is_assigned_to_discard() {
+        let stmt = Stmt::Call(Expr::Binary(
+            "==",
+            Box::new(Expr::Call(
+                Box::new(Expr::Var("readBits".into())),
+                vec![Expr::Num("1".into())],
+            )),
+            Box::new(Expr::Num("1".into())),
+        ));
+        assert_eq!(render_block(&[stmt], 0), "_ = readBits(1) == 1\n");
     }
 
     #[test]
@@ -1102,6 +1169,15 @@ mod tests {
             TableField::Keyed(Expr::Str("\"other\"".into()), Expr::Bool(true)),
         ]);
         assert_eq!(render_expr(&t3), "{1, key = \"val\", [\"other\"] = true}");
+
+        let t_keyword = Expr::Table(vec![
+            TableField::Named("nil".into(), Expr::Bool(true)),
+            TableField::Named("has-dash".into(), Expr::Num("1".into())),
+        ]);
+        assert_eq!(
+            render_expr(&t_keyword),
+            "{[\"nil\"] = true, [\"has-dash\"] = 1}"
+        );
 
         let t4 = Expr::Table(vec![
             TableField::Item(Expr::Table(vec![TableField::Item(Expr::Num("1".into()))])),

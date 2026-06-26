@@ -27,6 +27,9 @@ use luau_bytecode::opcode::*;
 use luau_bytecode::{capture_type, Constant, Module, Proto, StringRef};
 use luau_disasm::{compute_labels, render_constant_at};
 
+const GOTO_STRUCTURING_NOTE: &str =
+    "control flow rendered with goto/labels (structuring incomplete)";
+
 /// Result of decompiling a whole module.
 #[derive(Debug, Clone)]
 pub struct Decompiled {
@@ -65,7 +68,9 @@ pub fn decompile(module: &Module) -> Decompiled {
     let mut source = String::new();
     if partial {
         source.push_str("-- Decompiled by luau-decompile (best-effort reconstruction).\n");
-        source.push_str("-- Github repository https://github.com/PolarisHub/luau-disassembler-decompiler.\n\n");
+        source.push_str(
+            "-- Github repository https://github.com/PolarisHub/luau-disassembler-decompiler.\n\n",
+        );
         if has_gotos_or_labels {
             source.push_str("-- Some regions use goto/labels where structuring is incomplete.\n\n");
         } else {
@@ -73,7 +78,9 @@ pub fn decompile(module: &Module) -> Decompiled {
         }
     } else {
         source.push_str("-- Decompiled by luau-decompile.\n");
-        source.push_str("-- Github repository https://github.com/PolarisHub/luau-disassembler-decompiler.\n\n");
+        source.push_str(
+            "-- Github repository https://github.com/PolarisHub/luau-disassembler-decompiler.\n\n",
+        );
     }
     source.push_str(&body);
 
@@ -109,9 +116,20 @@ fn decompile_proto(
     cleanup::recover_if_skip_gotos(&mut stmts);
     cleanup::recover_goto_into_if_gates(&mut stmts);
     cleanup::recover_if_else_gotos(&mut stmts);
+    cleanup::recover_else_label_gotos(&mut stmts);
+    cleanup::recover_gotos_to_later_else_label(&mut stmts);
+    cleanup::recover_forward_label_skip_gotos(&mut stmts);
+    cleanup::recover_duplicate_labeled_terminal_bodies(&mut stmts);
+    cleanup::recover_duplicate_labeled_bodies(&mut stmts);
+    cleanup::recover_missing_guard_skip_to_block_end_gotos(&mut stmts);
+    cleanup::recover_missing_label_skip_to_block_end_gotos(&mut stmts);
+    cleanup::recover_if_join_gotos(&mut stmts);
+    cleanup::recover_orphan_if_join_gotos(&mut stmts);
     cleanup::recover_top_test_while_gotos(&mut stmts);
     cleanup::recover_backward_goto_while(&mut stmts);
     cleanup::merge_leading_while_break_guards(&mut stmts);
+    cleanup::recover_loop_bool_selector_gotos(&mut stmts);
+    cleanup::recover_loop_find_breaks(&mut stmts);
 
     // Captured registers, upvalues, and globals are excluded from inlining/elimination:
     // closures must keep the variables they close over, and a write to an upvalue or global
@@ -150,6 +168,8 @@ fn decompile_proto(
     cleanup::recover_if_skip_gotos(&mut stmts);
     cleanup::recover_top_test_while_gotos(&mut stmts);
     cleanup::merge_leading_while_break_guards(&mut stmts);
+    cleanup::recover_loop_bool_selector_gotos(&mut stmts);
+    cleanup::recover_loop_find_breaks(&mut stmts);
     // A constant `1` step on a numeric for is implicit.
     drop_unit_for_steps(&mut stmts);
 
@@ -208,28 +228,108 @@ fn decompile_proto(
     cleanup::recover_guard_else_gotos(&mut stmts);
     cleanup::recover_if_skip_gotos(&mut stmts);
     cleanup::recover_if_else_gotos(&mut stmts);
+    cleanup::recover_else_label_gotos(&mut stmts);
+    cleanup::recover_gotos_to_later_else_label(&mut stmts);
+    cleanup::recover_forward_label_skip_gotos(&mut stmts);
+    cleanup::recover_duplicate_labeled_terminal_bodies(&mut stmts);
+    cleanup::recover_duplicate_labeled_bodies(&mut stmts);
+    cleanup::recover_missing_guard_skip_to_block_end_gotos(&mut stmts);
+    cleanup::recover_missing_label_skip_to_block_end_gotos(&mut stmts);
+    cleanup::recover_if_join_gotos(&mut stmts);
+    cleanup::recover_orphan_if_join_gotos(&mut stmts);
     cleanup::recover_top_test_while_gotos(&mut stmts);
     cleanup::recover_backward_goto_while(&mut stmts);
     cleanup::recover_natural_loops(&mut stmts);
     cleanup::merge_leading_while_break_guards(&mut stmts);
+    cleanup::recover_loop_bool_selector_gotos(&mut stmts);
+    cleanup::recover_loop_find_breaks(&mut stmts);
     cleanup::recover_loop_carried_call_updates(&mut stmts);
     cleanup::simplify_repeat_return_guards(&mut stmts);
     cleanup::remove_dead_literal_markers(&mut stmts);
     cleanup::dead_store_elim(&mut stmts, &protected);
     cleanup::remove_dead_pure_stores_after_last_read(&mut stmts, &protected);
+    cleanup::replace_terminal_label_tail_gotos(&mut stmts);
+    cleanup::replace_loop_gotos_to_terminal_label_tail(&mut stmts);
+    cleanup::replace_orphan_terminal_goto_with_return(&mut stmts);
+    cleanup::recover_orphan_if_join_gotos(&mut stmts);
+    cleanup::replace_orphan_terminal_goto_with_return(&mut stmts);
+    cleanup::recover_orphan_if_join_gotos(&mut stmts);
+    cleanup::recover_orphan_if_fallback_gotos(&mut stmts);
+    cleanup::recover_orphan_skip_blocks(&mut stmts);
+    cleanup::recover_nested_orphan_skip_gotos(&mut stmts);
+    cleanup::replace_orphan_gotos_with_terminal_continuation(&mut stmts);
+    cleanup::replace_terminal_label_gotos_with_return(&mut stmts);
+    cleanup::replace_return_label_gotos(&mut stmts);
+    cleanup::recover_goto_into_if_gates(&mut stmts);
+    cleanup::recover_else_label_gotos(&mut stmts);
+    cleanup::recover_gotos_to_later_else_label(&mut stmts);
+    cleanup::recover_forward_label_skip_gotos(&mut stmts);
+    cleanup::recover_duplicate_labeled_terminal_bodies(&mut stmts);
+    cleanup::recover_duplicate_labeled_bodies(&mut stmts);
+    cleanup::recover_missing_guard_skip_to_block_end_gotos(&mut stmts);
+    cleanup::recover_missing_label_skip_to_block_end_gotos(&mut stmts);
+    cleanup::recover_if_join_gotos(&mut stmts);
+    cleanup::recover_orphan_if_join_gotos(&mut stmts);
+    cleanup::recover_top_test_while_gotos(&mut stmts);
+    cleanup::recover_backward_goto_while(&mut stmts);
+    cleanup::recover_natural_loops(&mut stmts);
+    cleanup::merge_leading_while_break_guards(&mut stmts);
+    cleanup::recover_loop_find_breaks(&mut stmts);
+    cleanup::drop_unreachable(&mut stmts);
+    cleanup::remove_redundant_gotos(&mut stmts);
+    cleanup::remove_trailing_sibling_gotos(&mut stmts);
+    cleanup::remove_unused_labels(&mut stmts);
+    cleanup::retarget_missing_gotos_to_next_label(&mut stmts);
+    cleanup::recover_goto_into_if_gates(&mut stmts);
+    cleanup::recover_else_label_gotos(&mut stmts);
+    cleanup::recover_gotos_to_later_else_label(&mut stmts);
+    cleanup::recover_forward_label_skip_gotos(&mut stmts);
+    cleanup::recover_duplicate_labeled_terminal_bodies(&mut stmts);
+    cleanup::recover_duplicate_labeled_bodies(&mut stmts);
+    cleanup::recover_missing_guard_skip_to_block_end_gotos(&mut stmts);
+    cleanup::recover_missing_label_skip_to_block_end_gotos(&mut stmts);
+    cleanup::recover_branch_gotos_to_following_label(&mut stmts);
+    cleanup::recover_if_join_gotos(&mut stmts);
+    cleanup::recover_orphan_if_join_gotos(&mut stmts);
+    cleanup::drop_unreachable(&mut stmts);
+    cleanup::remove_redundant_gotos(&mut stmts);
+    cleanup::remove_trailing_sibling_gotos(&mut stmts);
+    cleanup::remove_unused_labels(&mut stmts);
+    cleanup::retarget_missing_gotos_to_next_label(&mut stmts);
+    cleanup::recover_top_test_while_gotos(&mut stmts);
+    cleanup::recover_backward_goto_while(&mut stmts);
+    cleanup::recover_natural_loops(&mut stmts);
+    cleanup::merge_leading_while_break_guards(&mut stmts);
+    cleanup::drop_unreachable(&mut stmts);
+    cleanup::remove_redundant_gotos(&mut stmts);
+    cleanup::remove_trailing_sibling_gotos(&mut stmts);
+    cleanup::remove_unused_labels(&mut stmts);
+    cleanup::recover_forward_label_skip_gotos(&mut stmts);
+    cleanup::recover_duplicate_labeled_terminal_bodies(&mut stmts);
+    cleanup::recover_duplicate_labeled_bodies(&mut stmts);
+    cleanup::recover_missing_guard_skip_to_block_end_gotos(&mut stmts);
+    cleanup::recover_missing_label_skip_to_block_end_gotos(&mut stmts);
+    cleanup::drop_unreachable(&mut stmts);
+    cleanup::remove_redundant_gotos(&mut stmts);
+    cleanup::remove_trailing_sibling_gotos(&mut stmts);
+    cleanup::remove_unused_labels(&mut stmts);
     cleanup::drop_trailing_empty_return(&mut stmts);
     let hoist_names = cleanup::assigned_locals(&stmts, &non_local);
 
     // Determine `partial` from the FINAL tree: a proto is partial only if some unstructured
     // control flow (a goto/label) survived all recovery passes, or a nested closure was partial.
-    let partial = contains_unstructured(&stmts) || d.has_partial_child;
     let has_unstructured = contains_unstructured(&stmts);
+    let partial = has_unstructured || d.has_partial_child;
+    let mut notes = d.notes.clone();
+    if !has_unstructured {
+        notes.retain(|note| note != GOTO_STRUCTURING_NOTE);
+    }
     reports.push(ProtoReport {
         index: proto_idx,
         name: module.resolve(proto.debug_name).map(|c| c.into_owned()),
         partial,
         has_unstructured,
-        notes: d.notes.clone(),
+        notes,
     });
 
     // Hoist all materialized non-parameter locals so every assignment has a declaration in
@@ -260,17 +360,80 @@ fn decompile_proto(
 fn contains_unstructured(stmts: &[Stmt]) -> bool {
     stmts.iter().any(|s| match s {
         Stmt::Goto(_) | Stmt::Label(_) => true,
+        Stmt::Local { values, .. } => values.iter().any(expr_contains_unstructured),
+        Stmt::Assign { targets, values } => {
+            targets.iter().chain(values).any(expr_contains_unstructured)
+        }
+        Stmt::Call(expr) => expr_contains_unstructured(expr),
+        Stmt::Return(values) => values.iter().any(expr_contains_unstructured),
         Stmt::If {
+            cond,
             then_body,
             else_body,
+        } => {
+            expr_contains_unstructured(cond)
+                || contains_unstructured(then_body)
+                || contains_unstructured(else_body)
+        }
+        Stmt::While { cond, body } => {
+            expr_contains_unstructured(cond) || contains_unstructured(body)
+        }
+        Stmt::Repeat { body, cond } => {
+            contains_unstructured(body) || expr_contains_unstructured(cond)
+        }
+        Stmt::NumericFor {
+            start,
+            limit,
+            step,
+            body,
             ..
-        } => contains_unstructured(then_body) || contains_unstructured(else_body),
-        Stmt::While { body, .. }
-        | Stmt::Repeat { body, .. }
-        | Stmt::NumericFor { body, .. }
-        | Stmt::GenericFor { body, .. } => contains_unstructured(body),
-        _ => false,
+        } => {
+            expr_contains_unstructured(start)
+                || expr_contains_unstructured(limit)
+                || step.as_ref().is_some_and(expr_contains_unstructured)
+                || contains_unstructured(body)
+        }
+        Stmt::GenericFor { exprs, body, .. } => {
+            exprs.iter().any(expr_contains_unstructured) || contains_unstructured(body)
+        }
+        Stmt::Break | Stmt::Continue | Stmt::Comment(_) => false,
     })
+}
+
+fn expr_contains_unstructured(expr: &Expr) -> bool {
+    match expr {
+        Expr::Closure { text, .. } => text.contains("goto L") || text.contains("::L"),
+        Expr::Index(base, key) => {
+            expr_contains_unstructured(base) || expr_contains_unstructured(key)
+        }
+        Expr::Field(base, _) => expr_contains_unstructured(base),
+        Expr::Call(func, args) => {
+            expr_contains_unstructured(func) || args.iter().any(expr_contains_unstructured)
+        }
+        Expr::MethodCall(object, _, args) => {
+            expr_contains_unstructured(object) || args.iter().any(expr_contains_unstructured)
+        }
+        Expr::Unary(_, inner) => expr_contains_unstructured(inner),
+        Expr::Binary(_, left, right) => {
+            expr_contains_unstructured(left) || expr_contains_unstructured(right)
+        }
+        Expr::Table(fields) => fields.iter().any(|field| match field {
+            TableField::Item(value) | TableField::Named(_, value) => {
+                expr_contains_unstructured(value)
+            }
+            TableField::Keyed(key, value) => {
+                expr_contains_unstructured(key) || expr_contains_unstructured(value)
+            }
+        }),
+        Expr::Nil
+        | Expr::Bool(_)
+        | Expr::Num(_)
+        | Expr::Str(_)
+        | Expr::Vector(_)
+        | Expr::Var(_)
+        | Expr::Vararg
+        | Expr::Raw(_) => false,
+    }
 }
 
 struct Decompiler<'a> {
@@ -903,6 +1066,12 @@ impl<'a> Decompiler<'a> {
         }
 
         if last_taken == guard {
+            if let Some(next) =
+                self.try_all_jumps_to_else_join(&jumps, guard, last, hi, stmts, loop_ctx)
+            {
+                return Some(next);
+            }
+
             // All jumps target the fallback block G, which sits after the accepted body:
             //
             //   if not a then goto G end
@@ -1026,6 +1195,78 @@ impl<'a> Decompiler<'a> {
         }
         Some(body)
     }
+
+    fn try_all_jumps_to_else_join(
+        &mut self,
+        jumps: &[usize],
+        else_start: usize,
+        last_jump: usize,
+        hi: usize,
+        stmts: &mut Vec<Stmt>,
+        loop_ctx: Option<(usize, usize)>,
+    ) -> Option<usize> {
+        for &j in jumps {
+            if jump_target(self.proto.code[j], j) != Some(else_start) {
+                return None;
+            }
+        }
+
+        let last_len = Opcode::from_u8(insn_op(self.proto.code[last_jump]))?
+            .length()
+            .max(1);
+        let accepted_start = last_jump + last_len;
+        if accepted_start >= else_start {
+            return None;
+        }
+
+        let accepted_last = self.last_instr_before(accepted_start, else_start)?;
+        if Opcode::from_u8(insn_op(self.proto.code[accepted_last]))? != Opcode::JUMP {
+            return None;
+        }
+        let end = jump_target(self.proto.code[accepted_last], accepted_last)?;
+        if end <= else_start || end > hi {
+            return None;
+        }
+        if loop_ctx.is_some_and(|(cont, brk)| end == cont || end == brk) {
+            return None;
+        }
+
+        self.flush_inline(stmts);
+        let accepted_body = self.emit_body(accepted_start, accepted_last, loop_ctx);
+        let else_body = self.emit_body(else_start, end, loop_ctx);
+        if accepted_body.is_empty() && else_body.is_empty() {
+            return None;
+        }
+
+        let mut body = accepted_body;
+        for (idx, &jump_pc) in jumps.iter().enumerate().rev() {
+            let op = Opcode::from_u8(insn_op(self.proto.code[jump_pc]))?;
+            let jump_len = op.length().max(1);
+            let after_jump = jump_pc + jump_len;
+            let next_boundary = if idx + 1 < jumps.len() {
+                jumps[idx + 1]
+            } else {
+                accepted_start
+            };
+            if after_jump < next_boundary {
+                let mut intervening = self.emit_body(after_jump, next_boundary, loop_ctx);
+                intervening.extend(body);
+                body = intervening;
+            } else if after_jump > next_boundary {
+                return None;
+            }
+
+            body = vec![Stmt::If {
+                cond: self.taken_condition(op, jump_pc),
+                then_body: else_body.clone(),
+                else_body: body,
+            }];
+        }
+
+        stmts.extend(body);
+        Some(end)
+    }
+
     /// Whether `op` is something that cannot legally appear between two `and`-linked guard
     /// jumps. The compiler only emits straight-line evaluation between such jumps.
     fn op_breaks_chain(&self, op: Opcode) -> bool {
@@ -1419,6 +1660,7 @@ impl<'a> Decompiler<'a> {
 
             // --- control flow: faithful goto fallback ---
             JUMP | JUMPBACK | JUMPX => {
+                self.flush_inline(stmts);
                 stmts.push(Stmt::Goto(self.target_label(insn, pc)));
                 self.mark_partial_goto();
             }
@@ -2185,7 +2427,7 @@ impl<'a> Decompiler<'a> {
     }
 
     fn mark_partial_goto(&mut self) {
-        self.note("control flow rendered with goto/labels (structuring incomplete)");
+        self.note(GOTO_STRUCTURING_NOTE);
     }
 
     fn note(&mut self, msg: &str) {

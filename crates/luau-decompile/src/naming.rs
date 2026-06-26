@@ -651,7 +651,7 @@ pub fn smart_rename_with_event(
     // Pass 3: Resolve final unique names in a stable order
     let mut map = BTreeMap::new();
     for &orig in &ordered {
-        if let Some(base) = base_map.get(orig).cloned() {
+        if let Some(base) = base_map.get(orig).and_then(|base| sanitize(base)) {
             let unique = unique_name(&base, &reserved);
             reserved.insert(unique.clone());
             map.insert(orig.clone(), unique);
@@ -1973,6 +1973,21 @@ mod tests {
         }];
         let map = smart_rename(&stmts, &[String::from("v0")], false);
         assert_eq!(map.get("v0").map(String::as_str), Some("end_"));
+    }
+
+    #[test]
+    fn unsafe_string_key_candidates_are_sanitized() {
+        let stmts = vec![Stmt::Assign {
+            targets: vec![Expr::Index(
+                Box::new(Expr::Var("tables".into())),
+                Box::new(Expr::Str("\"\\0\\0\\0\"".into())),
+            )],
+            values: vec![Expr::Var("p1".into())],
+        }];
+
+        let map = smart_rename(&stmts, &[], false);
+
+        assert_eq!(map.get("p1").map(String::as_str), Some("_000"));
     }
 
     #[test]
