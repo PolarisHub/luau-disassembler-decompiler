@@ -5,6 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+use luau_bytecode::opcode::Opcode;
 use luau_bytecode::{parse_and_validate, parse_normalized};
 use luau_decompile::decompile;
 
@@ -60,6 +61,255 @@ fn compile_inline_source(tag: &str, source: &str) -> Option<Vec<u8>> {
             .map(|&b| (3..=11).contains(&b))
             .unwrap_or(false);
     ok.then_some(output.stdout)
+}
+
+fn push_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push(((value as u8) & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn push_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn abc(op: Opcode, a: u8, b: u8, c: u8) -> u32 {
+    (op as u32) | ((a as u32) << 8) | ((b as u32) << 16) | ((c as u32) << 24)
+}
+
+fn ad(op: Opcode, a: u8, d: i16) -> u32 {
+    (op as u32) | ((a as u32) << 8) | (((d as u16) as u32) << 16)
+}
+
+fn push_string_table(out: &mut Vec<u8>, strings: &[&str]) {
+    push_varint(out, strings.len() as u64);
+    for string in strings {
+        push_varint(out, string.len() as u64);
+        out.extend_from_slice(string.as_bytes());
+    }
+}
+
+fn push_minimal_proto(
+    out: &mut Vec<u8>,
+    max_stack: u8,
+    code: &[u32],
+    constants: impl FnOnce(&mut Vec<u8>),
+) {
+    out.push(max_stack);
+    out.push(0); // num params
+    out.push(0); // num upvalues
+    out.push(0); // is vararg
+    out.push(0); // flags
+    push_varint(out, 0); // type-info size
+
+    push_varint(out, code.len() as u64);
+    for &word in code {
+        push_u32(out, word);
+    }
+
+    constants(out);
+
+    push_varint(out, 0); // child protos
+    push_varint(out, 0); // line defined
+    push_varint(out, 0); // debug name
+    out.push(0); // no line info
+    out.push(0); // no debug info
+}
+
+fn push_minimal_proto_v11(
+    out: &mut Vec<u8>,
+    max_stack: u8,
+    code: &[u32],
+    constants: impl FnOnce(&mut Vec<u8>),
+    feedback: &[u32],
+) {
+    push_minimal_proto(out, max_stack, code, constants);
+    push_varint(out, feedback.len() as u64);
+    for &pc in feedback {
+        out.push(0); // LFT_CALLTARGET
+        push_varint(out, pc as u64);
+    }
+}
+
+fn version8_integer_blob() -> Vec<u8> {
+    let mut out = vec![8, 1];
+    push_string_table(&mut out, &[]);
+    push_varint(&mut out, 1);
+    push_minimal_proto(
+        &mut out,
+        1,
+        &[ad(Opcode::LOADK, 0, 0), abc(Opcode::RETURN, 0, 2, 0)],
+        |out| {
+            push_varint(out, 1);
+            out.push(luau_bytecode::constant_tag::INTEGER);
+            out.push(0);
+            push_varint(out, 42);
+        },
+    );
+    push_varint(&mut out, 0);
+    out
+}
+
+fn version9_udata_blob() -> Vec<u8> {
+    let mut out = vec![9, 1];
+    push_string_table(&mut out, &["object", "Foo"]);
+    push_varint(&mut out, 1);
+    push_minimal_proto(
+        &mut out,
+        1,
+        &[
+            abc(Opcode::GETGLOBAL, 0, 0, 0),
+            0,
+            abc(Opcode::GETUDATAKS, 0, 0, 0),
+            0x1234_0001,
+            abc(Opcode::RETURN, 0, 2, 0),
+        ],
+        |out| {
+            push_varint(out, 2);
+            out.push(luau_bytecode::constant_tag::STRING);
+            push_varint(out, 1);
+            out.push(luau_bytecode::constant_tag::STRING);
+            push_varint(out, 2);
+        },
+    );
+    push_varint(&mut out, 0);
+    out
+}
+
+fn version9_udata_namecall_blob() -> Vec<u8> {
+    let mut out = vec![9, 1];
+    push_string_table(&mut out, &["object", "Foo"]);
+    push_varint(&mut out, 1);
+    push_minimal_proto(
+        &mut out,
+        2,
+        &[
+            abc(Opcode::GETGLOBAL, 1, 0, 0),
+            0,
+            abc(Opcode::NAMECALLUDATA, 0, 1, 0),
+            0xCAFE_0001,
+            abc(Opcode::CALL, 0, 2, 2),
+            abc(Opcode::RETURN, 0, 2, 0),
+        ],
+        |out| {
+            push_varint(out, 2);
+            out.push(luau_bytecode::constant_tag::STRING);
+            push_varint(out, 1);
+            out.push(luau_bytecode::constant_tag::STRING);
+            push_varint(out, 2);
+        },
+    );
+    push_varint(&mut out, 0);
+    out
+}
+
+fn version9_udata_set_blob() -> Vec<u8> {
+    let mut out = vec![9, 1];
+    push_string_table(&mut out, &["object", "Foo"]);
+    push_varint(&mut out, 1);
+    push_minimal_proto(
+        &mut out,
+        2,
+        &[
+            abc(Opcode::GETGLOBAL, 0, 0, 0),
+            0,
+            abc(Opcode::LOADN, 1, 5, 0),
+            abc(Opcode::SETUDATAKS, 1, 0, 0),
+            0xBEEF_0001,
+            abc(Opcode::RETURN, 0, 1, 0),
+        ],
+        |out| {
+            push_varint(out, 2);
+            out.push(luau_bytecode::constant_tag::STRING);
+            push_varint(out, 1);
+            out.push(luau_bytecode::constant_tag::STRING);
+            push_varint(out, 2);
+        },
+    );
+    push_varint(&mut out, 0);
+    out
+}
+
+fn version10_newclassmember_blob() -> Vec<u8> {
+    let mut out = vec![10, 1];
+    push_string_table(&mut out, &["Class", "Foo"]);
+    push_varint(&mut out, 1);
+    push_minimal_proto(
+        &mut out,
+        2,
+        &[
+            abc(Opcode::GETGLOBAL, 0, 0, 0),
+            0,
+            ad(Opcode::LOADK, 1, 2),
+            abc(Opcode::NEWCLASSMEMBER, 0, 0, 1),
+            1,
+            abc(Opcode::RETURN, 0, 1, 0),
+        ],
+        |out| {
+            push_varint(out, 3);
+            out.push(luau_bytecode::constant_tag::STRING);
+            push_varint(out, 1);
+            out.push(luau_bytecode::constant_tag::STRING);
+            push_varint(out, 2);
+            out.push(luau_bytecode::constant_tag::INTEGER);
+            out.push(0);
+            push_varint(out, 123);
+        },
+    );
+    push_varint(&mut out, 0);
+    out
+}
+
+fn version11_callfb_blob() -> Vec<u8> {
+    let mut out = vec![11, 1];
+    push_string_table(&mut out, &["callback"]);
+    push_varint(&mut out, 1);
+    push_minimal_proto_v11(
+        &mut out,
+        1,
+        &[
+            abc(Opcode::GETGLOBAL, 0, 0, 0),
+            0,
+            abc(Opcode::CALLFB, 0, 1, 1),
+            0,
+            abc(Opcode::RETURN, 0, 1, 0),
+        ],
+        |out| {
+            push_varint(out, 1);
+            out.push(luau_bytecode::constant_tag::STRING);
+            push_varint(out, 1);
+        },
+        &[2],
+    );
+    push_varint(&mut out, 0);
+    out
+}
+
+fn version11_cmpproto_blob() -> Vec<u8> {
+    let mut out = vec![11, 1];
+    push_string_table(&mut out, &["callback"]);
+    push_varint(&mut out, 1);
+    push_minimal_proto_v11(
+        &mut out,
+        1,
+        &[
+            abc(Opcode::GETGLOBAL, 0, 0, 0),
+            0,
+            ad(Opcode::CMPPROTO, 0, 1),
+            7,
+            abc(Opcode::RETURN, 0, 1, 0),
+        ],
+        |out| {
+            push_varint(out, 1);
+            out.push(luau_bytecode::constant_tag::STRING);
+            push_varint(out, 1);
+        },
+        &[],
+    );
+    push_varint(&mut out, 0);
+    out
 }
 
 fn all_files() -> Vec<PathBuf> {
@@ -128,6 +378,29 @@ fn in_game_all_bytecode_files() -> Vec<PathBuf> {
 
 fn compact_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn duplicate_not_operand_in_while(source: &str) -> Option<String> {
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let Some(cond) = trimmed
+            .strip_prefix("while ")
+            .and_then(|text| text.strip_suffix(" do"))
+        else {
+            continue;
+        };
+        let mut seen = Vec::new();
+        for operand in cond.split(" and ").map(str::trim) {
+            if !operand.starts_with("not ") {
+                continue;
+            }
+            if seen.iter().any(|seen_operand| seen_operand == operand) {
+                return Some(trimmed.to_string());
+            }
+            seen.push(operand.to_string());
+        }
+    }
+    None
 }
 
 fn generated_stress_sources() -> Vec<(String, String)> {
@@ -230,6 +503,134 @@ fn straight_line_functions_are_not_partial() {
             out.per_proto
         );
     }
+}
+
+#[test]
+fn decompiles_bytecode_version_8_integer_constants() {
+    let module = parse_and_validate(&version8_integer_blob()).unwrap();
+    assert_eq!(module.version, 8);
+
+    let out = decompile(&module);
+    assert!(
+        !out.partial,
+        "v8 integer sample should be complete: {out:?}"
+    );
+    assert!(
+        out.source.contains("return 42"),
+        "v8 integer constant should decompile as a number:\n{}",
+        out.source
+    );
+}
+
+#[test]
+fn decompiles_bytecode_version_9_udata_field_access() {
+    let module = parse_and_validate(&version9_udata_blob()).unwrap();
+    assert_eq!(module.version, 9);
+
+    let out = decompile(&module);
+    assert!(!out.partial, "v9 udata sample should be complete: {out:?}");
+    assert!(
+        !out.source.contains("unhandled op GETUDATAKS"),
+        "v9 userdata field opcode must not be emitted as unhandled:\n{}",
+        out.source
+    );
+    assert!(
+        out.source.contains("return object.Foo"),
+        "v9 userdata field access should use the low 16-bit key from AUX:\n{}",
+        out.source
+    );
+
+    let module = parse_and_validate(&version9_udata_namecall_blob()).unwrap();
+    let out = decompile(&module);
+    assert!(
+        !out.partial,
+        "v9 udata namecall should be complete: {out:?}"
+    );
+    assert!(
+        !out.source.contains("unhandled op NAMECALLUDATA"),
+        "v9 userdata namecall opcode must not be emitted as unhandled:\n{}",
+        out.source
+    );
+    assert!(
+        out.source.contains("return object:Foo()"),
+        "v9 userdata namecall should use the low 16-bit key from AUX:\n{}",
+        out.source
+    );
+
+    let module = parse_and_validate(&version9_udata_set_blob()).unwrap();
+    let out = decompile(&module);
+    assert!(!out.partial, "v9 udata set should be complete: {out:?}");
+    assert!(
+        !out.source.contains("unhandled op SETUDATAKS"),
+        "v9 userdata set opcode must not be emitted as unhandled:\n{}",
+        out.source
+    );
+    assert!(
+        out.source.contains("object.Foo = 5"),
+        "v9 userdata set should use the low 16-bit key from AUX:\n{}",
+        out.source
+    );
+}
+
+#[test]
+fn decompiles_bytecode_version_10_class_member_registration() {
+    let module = parse_and_validate(&version10_newclassmember_blob()).unwrap();
+    assert_eq!(module.version, 10);
+
+    let out = decompile(&module);
+    assert!(
+        !out.partial,
+        "v10 NEWCLASSMEMBER sample should be complete: {out:?}"
+    );
+    assert!(
+        !out.source.contains("unhandled op NEWCLASSMEMBER"),
+        "v10 class-member opcode must not be emitted as unhandled:\n{}",
+        out.source
+    );
+    assert!(
+        out.source.contains("Class.Foo = 123"),
+        "v10 class-member registration should print as a field assignment:\n{}",
+        out.source
+    );
+}
+
+#[test]
+fn decompiles_bytecode_version_11_cmpproto_feedback_guard() {
+    let module = parse_and_validate(&version11_callfb_blob()).unwrap();
+    assert_eq!(module.version, 11);
+
+    let out = decompile(&module);
+    assert!(
+        !out.partial,
+        "v11 CALLFB sample should be complete: {out:?}"
+    );
+    assert!(
+        !out.source.contains("unhandled op CALLFB"),
+        "v11 CALLFB opcode must not be emitted as unhandled:\n{}",
+        out.source
+    );
+    assert!(
+        out.source.contains("callback()"),
+        "v11 CALLFB should decompile as a normal call:\n{}",
+        out.source
+    );
+
+    let module = parse_and_validate(&version11_cmpproto_blob()).unwrap();
+    assert_eq!(module.version, 11);
+
+    let out = decompile(&module);
+    assert!(
+        !out.source.contains("unhandled op CMPPROTO"),
+        "v11 CMPPROTO opcode must not be emitted as unhandled:\n{}",
+        out.source
+    );
+    assert!(
+        out.per_proto.iter().any(|report| report
+            .notes
+            .iter()
+            .any(|note| note == "CMPPROTO feedback guard approximated")),
+        "v11 CMPPROTO should be recorded as an explicit feedback-guard approximation: {out:?}"
+    );
 }
 
 #[test]
@@ -964,6 +1365,33 @@ fn rtween_bytecode_structures_without_gotos() {
     assert!(
         recompiles(&decompiled.source, "rtween"),
         "RTween output must recompile:\n{}",
+        decompiled.source
+    );
+}
+
+#[test]
+fn elevators_capture_names_do_not_collapse_into_duplicate_conditions() {
+    let path = root()
+        .join("roblox-studio-cases")
+        .join("in_game")
+        .join("Elevators_ModuleScript_Bytecode.luau");
+    let bytes = fs::read(&path).unwrap();
+    let (module, _multiplier) = parse_normalized(&bytes).unwrap();
+    let decompiled = decompile(&module);
+
+    assert!(
+        !decompiled.partial,
+        "Elevators bytecode should fully structure, reports={:?}\n{}",
+        decompiled.per_proto, decompiled.source
+    );
+    assert!(
+        !decompiled.source.contains("goto ") && !decompiled.source.contains("::L"),
+        "Elevators output should not contain raw goto/labels:\n{}",
+        decompiled.source
+    );
+    assert!(
+        duplicate_not_operand_in_while(&decompiled.source).is_none(),
+        "captured upvalues must not collapse into duplicate while operands:\n{}",
         decompiled.source
     );
 }

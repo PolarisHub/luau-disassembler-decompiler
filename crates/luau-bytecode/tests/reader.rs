@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use luau_bytecode::opcode::{insn_op, Opcode};
 use luau_bytecode::{parse, parse_and_validate, Constant, ErrorKind};
 
 fn corpus_dir() -> PathBuf {
@@ -16,6 +17,132 @@ fn corpus_dir() -> PathBuf {
 fn read_bytecode(rel: &str) -> Vec<u8> {
     let path = corpus_dir().join(rel);
     fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+fn push_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push(((value as u8) & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn push_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn abc(op: Opcode, a: u8, b: u8, c: u8) -> u32 {
+    (op as u32) | ((a as u32) << 8) | ((b as u32) << 16) | ((c as u32) << 24)
+}
+
+fn ad(op: Opcode, a: u8, d: i16) -> u32 {
+    (op as u32) | ((a as u32) << 8) | (((d as u16) as u32) << 16)
+}
+
+fn push_string_table(out: &mut Vec<u8>, strings: &[&str]) {
+    push_varint(out, strings.len() as u64);
+    for string in strings {
+        push_varint(out, string.len() as u64);
+        out.extend_from_slice(string.as_bytes());
+    }
+}
+
+fn push_minimal_proto(
+    out: &mut Vec<u8>,
+    max_stack: u8,
+    num_params: u8,
+    code: &[u32],
+    constants: impl FnOnce(&mut Vec<u8>),
+) {
+    out.push(max_stack);
+    out.push(num_params);
+    out.push(0); // num upvalues
+    out.push(0); // is vararg
+    out.push(0); // flags
+    push_varint(out, 0); // type-info size
+
+    push_varint(out, code.len() as u64);
+    for &word in code {
+        push_u32(out, word);
+    }
+
+    constants(out);
+
+    push_varint(out, 0); // child protos
+    push_varint(out, 0); // line defined
+    push_varint(out, 0); // debug name
+    out.push(0); // no line info
+    out.push(0); // no debug info
+}
+
+fn version8_integer_blob() -> Vec<u8> {
+    let mut out = vec![8, 1]; // bytecode version, type-info version
+    push_string_table(&mut out, &[]);
+    push_varint(&mut out, 1); // proto count
+    push_minimal_proto(
+        &mut out,
+        1,
+        0,
+        &[ad(Opcode::LOADK, 0, 0), abc(Opcode::RETURN, 0, 2, 0)],
+        |out| {
+            push_varint(out, 1);
+            out.push(luau_bytecode::constant_tag::INTEGER);
+            out.push(0); // positive
+            push_varint(out, 42);
+        },
+    );
+    push_varint(&mut out, 0); // main proto
+    out
+}
+
+fn version9_udata_blob() -> Vec<u8> {
+    let mut out = vec![9, 1]; // bytecode version, type-info version
+    push_string_table(&mut out, &["object", "Foo"]);
+    push_varint(&mut out, 1); // proto count
+    push_minimal_proto(
+        &mut out,
+        1,
+        0,
+        &[
+            abc(Opcode::GETGLOBAL, 0, 0, 0),
+            0, // K0: "object"
+            abc(Opcode::GETUDATAKS, 0, 0, 0),
+            0x1234_0001, // low 16 bits are K1; high 16 bits are cached slot
+            abc(Opcode::RETURN, 0, 2, 0),
+        ],
+        |out| {
+            push_varint(out, 2);
+            out.push(luau_bytecode::constant_tag::STRING);
+            push_varint(out, 1);
+            out.push(luau_bytecode::constant_tag::STRING);
+            push_varint(out, 2);
+        },
+    );
+    push_varint(&mut out, 0); // main proto
+    out
+}
+
+fn version10_class_shape_blob() -> Vec<u8> {
+    let mut out = vec![10, 1]; // bytecode version, type-info version
+    push_string_table(&mut out, &["MyClass", "Health", "Damage"]);
+    push_varint(&mut out, 1); // proto count
+    push_minimal_proto(&mut out, 1, 0, &[abc(Opcode::RETURN, 0, 1, 0)], |out| {
+        push_varint(out, 4);
+        out.push(luau_bytecode::constant_tag::STRING);
+        push_varint(out, 1);
+        out.push(luau_bytecode::constant_tag::STRING);
+        push_varint(out, 2);
+        out.push(luau_bytecode::constant_tag::STRING);
+        push_varint(out, 3);
+        out.push(luau_bytecode::constant_tag::CLASS_SHAPE);
+        push_varint(out, 0); // class name constant
+        push_varint(out, 1); // properties
+        push_varint(out, 1); // methods
+        push_varint(out, 1); // property member: Health
+        push_varint(out, 2); // method member: Damage
+    });
+    push_varint(&mut out, 0); // main proto
+    out
 }
 
 fn corpus_files() -> Vec<PathBuf> {
@@ -79,6 +206,44 @@ fn reads_version_11_sample() {
     let bytes = read_bytecode("bytecode-v11/01_literals.luauc");
     let module = parse_and_validate(&bytes).unwrap();
     assert_eq!(module.version, 11);
+}
+
+#[test]
+fn reads_version_8_integer_constants() {
+    let module = parse_and_validate(&version8_integer_blob()).unwrap();
+    assert_eq!(module.version, 8);
+    assert_eq!(module.types_version, 1);
+    assert_eq!(module.protos.len(), 1);
+    assert_eq!(
+        module.protos[0].constants,
+        vec![Constant::Integer(42)],
+        "v8 added LBC_CONSTANT_INTEGER"
+    );
+}
+
+#[test]
+fn reads_version_9_udata_field_opcodes() {
+    let module = parse_and_validate(&version9_udata_blob()).unwrap();
+    assert_eq!(module.version, 9);
+    assert_eq!(module.types_version, 1);
+    assert_eq!(insn_op(module.protos[0].code[2]), Opcode::GETUDATAKS as u8);
+}
+
+#[test]
+fn reads_version_10_class_shape_constants() {
+    let module = parse_and_validate(&version10_class_shape_blob()).unwrap();
+    assert_eq!(module.version, 10);
+    assert_eq!(module.types_version, 1);
+    assert_eq!(
+        module.protos[0].constants[3],
+        Constant::ClassShape {
+            name: 0,
+            num_properties: 1,
+            num_methods: 1,
+            members: vec![1, 2],
+        },
+        "v10 added LBC_CONSTANT_CLASS_SHAPE"
+    );
 }
 
 #[test]

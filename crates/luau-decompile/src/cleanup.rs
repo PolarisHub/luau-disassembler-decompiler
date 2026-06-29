@@ -132,6 +132,199 @@ pub fn remove_dead_pure_stores_after_last_read(root: &mut Vec<Stmt>, protected: 
     while dead_after_last_read_in_block(root, protected) {}
 }
 
+/// Remove duplicated pure condition checks introduced by conservative goto recovery.
+///
+/// The common shape is:
+///
+/// ```lua
+/// if not x then
+///     if not x then
+///         return
+///     end
+/// end
+/// ```
+///
+/// Once the outer branch is entered, the inner condition is known. Re-evaluating it is only
+/// removable when the expression is pure and syntactically identical. The same pass also folds
+/// pure `a and a` / `a or a` expression noise.
+pub fn simplify_redundant_conditions(root: &mut [Stmt]) {
+    for stmt in root.iter_mut() {
+        simplify_redundant_condition_exprs(stmt);
+        for_each_block_mut(stmt, |block| simplify_redundant_conditions(block));
+    }
+
+    while simplify_redundant_nested_if_once(root) {}
+}
+
+fn simplify_redundant_nested_if_once(root: &mut [Stmt]) -> bool {
+    for stmt in root {
+        let Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } = stmt
+        else {
+            continue;
+        };
+        if !else_body.is_empty() || then_body.len() != 1 || !is_pure(cond) {
+            continue;
+        }
+        let Stmt::If {
+            cond: inner_cond,
+            then_body: inner_then,
+            else_body: inner_else,
+        } = &then_body[0]
+        else {
+            continue;
+        };
+        if !inner_else.is_empty() || inner_cond != cond {
+            continue;
+        }
+        *then_body = inner_then.clone();
+        return true;
+    }
+    false
+}
+
+fn simplify_redundant_condition_exprs(stmt: &mut Stmt) {
+    match stmt {
+        Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::Repeat { cond, .. } => {
+            simplify_expr(cond);
+        }
+        Stmt::Local { values, .. } | Stmt::Assign { values, .. } | Stmt::Return(values) => {
+            for value in values {
+                simplify_expr(value);
+            }
+        }
+        Stmt::Call(expr) => {
+            simplify_expr(expr);
+        }
+        Stmt::NumericFor {
+            start, limit, step, ..
+        } => {
+            simplify_expr(start);
+            simplify_expr(limit);
+            if let Some(step) = step {
+                simplify_expr(step);
+            }
+        }
+        Stmt::GenericFor { exprs, .. } => {
+            for expr in exprs {
+                simplify_expr(expr);
+            }
+        }
+        Stmt::Break | Stmt::Continue | Stmt::Label(_) | Stmt::Goto(_) | Stmt::Comment(_) => {}
+    }
+}
+
+fn simplify_expr(expr: &mut Expr) -> bool {
+    let mut changed = match expr {
+        Expr::Index(base, key) => simplify_expr(base) | simplify_expr(key),
+        Expr::Field(base, _) => simplify_expr(base),
+        Expr::Call(callee, args) => {
+            let mut changed = simplify_expr(callee);
+            for arg in args {
+                changed |= simplify_expr(arg);
+            }
+            changed
+        }
+        Expr::MethodCall(receiver, _, args) => {
+            let mut changed = simplify_expr(receiver);
+            for arg in args {
+                changed |= simplify_expr(arg);
+            }
+            changed
+        }
+        Expr::Unary("not ", inner) => {
+            let mut changed = simplify_expr(inner);
+            if let Some(simplified) = simplify_not_operand(inner) {
+                **inner = simplified;
+                changed = true;
+            }
+            changed
+        }
+        Expr::Unary(_, inner) => simplify_expr(inner),
+        Expr::Binary(_, left, right) => simplify_expr(left) | simplify_expr(right),
+        Expr::Table(fields) => {
+            let mut changed = false;
+            for field in fields {
+                match field {
+                    TableField::Item(value) | TableField::Named(_, value) => {
+                        changed |= simplify_expr(value);
+                    }
+                    TableField::Keyed(key, value) => {
+                        changed |= simplify_expr(key);
+                        changed |= simplify_expr(value);
+                    }
+                }
+            }
+            changed
+        }
+        Expr::Nil
+        | Expr::Bool(_)
+        | Expr::Num(_)
+        | Expr::Str(_)
+        | Expr::Vector(_)
+        | Expr::Var(_)
+        | Expr::Vararg
+        | Expr::Closure { .. }
+        | Expr::Raw(_) => false,
+    };
+
+    if let Expr::Binary(op @ ("and" | "or"), _, _) = expr {
+        let op = *op;
+        let mut operands = Vec::new();
+        collect_same_binary_operands(expr, op, &mut operands);
+
+        let mut unique = Vec::with_capacity(operands.len());
+        for operand in operands {
+            if is_pure(&operand) && unique.iter().any(|existing| existing == &operand) {
+                changed = true;
+            } else {
+                unique.push(operand);
+            }
+        }
+
+        if changed {
+            *expr = rebuild_binary_chain(op, unique);
+        }
+    }
+    changed
+}
+
+fn simplify_not_operand(expr: &Expr) -> Option<Expr> {
+    match expr {
+        Expr::Binary("or", left, right) if matches!(right.as_ref(), Expr::Nil) && is_pure(left) => {
+            Some(*left.clone())
+        }
+        Expr::Binary("or", left, right) if matches!(left.as_ref(), Expr::Nil) && is_pure(right) => {
+            Some(*right.clone())
+        }
+        _ => None,
+    }
+}
+
+fn collect_same_binary_operands(expr: &Expr, op: &'static str, out: &mut Vec<Expr>) {
+    match expr {
+        Expr::Binary(inner_op, left, right) if *inner_op == op => {
+            collect_same_binary_operands(left, op, out);
+            collect_same_binary_operands(right, op, out);
+        }
+        other => out.push(other.clone()),
+    }
+}
+
+fn rebuild_binary_chain(op: &'static str, mut operands: Vec<Expr>) -> Expr {
+    if operands.is_empty() {
+        return Expr::Bool(true);
+    }
+    let mut expr = operands.remove(0);
+    for operand in operands {
+        expr = Expr::Binary(op, Box::new(expr), Box::new(operand));
+    }
+    expr
+}
+
 fn dead_after_last_read_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool {
     for i in 0..block.len() {
         let Some((name, val)) = sole_var_assign(&block[i]) else {
@@ -6678,6 +6871,63 @@ mod tests {
         assert!(rendered.contains("until saved or tries >= 3"), "{rendered}");
         assert!(!rendered.contains("v8 = 3"), "{rendered}");
         assert!(!rendered.contains("if saved then"), "{rendered}");
+    }
+
+    #[test]
+    fn simplifies_duplicate_nested_guards() {
+        let mut stmts = vec![Stmt::If {
+            cond: Expr::Unary("not ", Box::new(Expr::Var("value".into()))),
+            then_body: vec![Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("value".into()))),
+                then_body: vec![Stmt::Return(vec![Expr::Table(Vec::new())])],
+                else_body: Vec::new(),
+            }],
+            else_body: Vec::new(),
+        }];
+
+        simplify_redundant_conditions(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert_eq!(
+            rendered.matches("if not value then").count(),
+            1,
+            "{rendered}"
+        );
+        assert!(rendered.contains("return {}"), "{rendered}");
+    }
+
+    #[test]
+    fn simplifies_duplicate_pure_boolean_operands() {
+        let mut stmts = vec![Stmt::While {
+            cond: Expr::Binary(
+                "and",
+                Box::new(Expr::Binary(
+                    "and",
+                    Box::new(Expr::Unary("not ", Box::new(Expr::Var("track".into())))),
+                    Box::new(Expr::Unary("not ", Box::new(Expr::Var("track".into())))),
+                )),
+                Box::new(Expr::Field(
+                    Box::new(Expr::Var("model".into())),
+                    "Parent".into(),
+                )),
+            ),
+            body: vec![Stmt::Call(Expr::Call(
+                Box::new(Expr::Field(
+                    Box::new(Expr::Var("task".into())),
+                    "wait".into(),
+                )),
+                Vec::new(),
+            ))],
+        }];
+
+        simplify_redundant_conditions(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(
+            rendered.contains("while not track and model.Parent do"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("not track and not track"), "{rendered}");
     }
 
     #[test]

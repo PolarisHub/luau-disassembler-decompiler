@@ -129,6 +129,20 @@ fn check_operands(
         }
     }
 
+    // NEWCLASSMEMBER uses C as the initial member value register.
+    if op == NEWCLASSMEMBER {
+        let c = insn_c(word) as u32;
+        if max_reg > 0 && c >= max_reg {
+            return Err(Error::new(
+                pc,
+                ErrorKind::ConstantIndexOutOfRange {
+                    index: c,
+                    count: max_reg,
+                },
+            ));
+        }
+    }
+
     // Register range check for the A field, for opcodes where A is unambiguously a target
     // or source register (it must address a slot within the declared frame). We skip
     // opcodes whose A is not a register (CAPTURE: capture type; FASTCALL*: builtin id;
@@ -228,5 +242,7 @@ fn a_is_register(op: Opcode) -> bool {
             | GETUDATAKS
             | SETUDATAKS
             | NAMECALLUDATA
+            | NEWCLASSMEMBER
+            | CMPPROTO
     )
 }

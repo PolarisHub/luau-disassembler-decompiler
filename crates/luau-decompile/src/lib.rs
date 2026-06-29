@@ -153,6 +153,7 @@ fn decompile_proto(
         cleanup::inline_table_literal_fill_temps(&mut stmts);
         cleanup::recover_loop_carried_call_updates(&mut stmts);
         cleanup::simplify_repeat_return_guards(&mut stmts);
+        cleanup::simplify_redundant_conditions(&mut stmts);
         cleanup::remove_dead_literal_markers(&mut stmts);
         cleanup::single_use_inline(&mut stmts, &protected);
         cleanup::dead_store_elim(&mut stmts, &protected);
@@ -181,8 +182,9 @@ fn decompile_proto(
     // Smart-rename synthesized locals from the expressions they hold (require -> module,
     // GetService -> service, etc.). Renaming a local is always semantics-preserving, so this
     // runs after reconstruction and rewrites the AST consistently.
-    let rename =
+    let mut rename =
         naming::smart_rename_with_event(&stmts, &hoist_names, is_method, event_name.as_deref());
+    avoid_closure_capture_name_collisions(&stmts, &d, &mut rename);
     naming::apply_rename(&mut stmts, &rename);
     for n in hoist_names.iter_mut() {
         if let Some(new) = rename.get(n) {
@@ -210,6 +212,7 @@ fn decompile_proto(
         cleanup::inline_table_literal_fill_temps(&mut stmts);
         cleanup::recover_loop_carried_call_updates(&mut stmts);
         cleanup::simplify_repeat_return_guards(&mut stmts);
+        cleanup::simplify_redundant_conditions(&mut stmts);
         cleanup::remove_dead_literal_markers(&mut stmts);
         cleanup::single_use_inline(&mut stmts, &protected);
         cleanup::dead_store_elim(&mut stmts, &protected);
@@ -245,6 +248,7 @@ fn decompile_proto(
     cleanup::recover_loop_find_breaks(&mut stmts);
     cleanup::recover_loop_carried_call_updates(&mut stmts);
     cleanup::simplify_repeat_return_guards(&mut stmts);
+    cleanup::simplify_redundant_conditions(&mut stmts);
     cleanup::remove_dead_literal_markers(&mut stmts);
     cleanup::dead_store_elim(&mut stmts, &protected);
     cleanup::remove_dead_pure_stores_after_last_read(&mut stmts, &protected);
@@ -275,6 +279,7 @@ fn decompile_proto(
     cleanup::recover_natural_loops(&mut stmts);
     cleanup::merge_leading_while_break_guards(&mut stmts);
     cleanup::recover_loop_find_breaks(&mut stmts);
+    cleanup::simplify_redundant_conditions(&mut stmts);
     cleanup::drop_unreachable(&mut stmts);
     cleanup::remove_redundant_gotos(&mut stmts);
     cleanup::remove_trailing_sibling_gotos(&mut stmts);
@@ -313,6 +318,7 @@ fn decompile_proto(
     cleanup::remove_redundant_gotos(&mut stmts);
     cleanup::remove_trailing_sibling_gotos(&mut stmts);
     cleanup::remove_unused_labels(&mut stmts);
+    cleanup::simplify_redundant_conditions(&mut stmts);
     cleanup::drop_trailing_empty_return(&mut stmts);
     let hoist_names = cleanup::assigned_locals(&stmts, &non_local);
 
@@ -1478,6 +1484,10 @@ impl<'a> Decompiler<'a> {
                 let e = self.field(self.reg(b), aux);
                 self.assign(a, e, stmts);
             }
+            GETUDATAKS => {
+                let e = self.field(self.reg(b), aux_kv16(aux));
+                self.assign(a, e, stmts);
+            }
             GETTABLEN => {
                 let e = Expr::Index(
                     Box::new(self.reg(b)),
@@ -1568,6 +1578,20 @@ impl<'a> Decompiler<'a> {
                     values: vec![self.reg(a)],
                 });
             }
+            SETUDATAKS => {
+                let target = self.field(self.reg(b), aux_kv16(aux));
+                stmts.push(Stmt::Assign {
+                    targets: vec![target],
+                    values: vec![self.reg(a)],
+                });
+            }
+            NEWCLASSMEMBER => {
+                let target = self.field(self.reg(a), aux);
+                stmts.push(Stmt::Assign {
+                    targets: vec![target],
+                    values: vec![self.reg(c)],
+                });
+            }
             SETTABLEN => {
                 let target = Expr::Index(
                     Box::new(self.reg(b)),
@@ -1637,6 +1661,10 @@ impl<'a> Decompiler<'a> {
                 let method = self.string_const(aux);
                 *pending_namecall = Some((a, self.reg(b), method));
             }
+            NAMECALLUDATA => {
+                let method = self.string_const(aux_kv16(aux));
+                *pending_namecall = Some((a, self.reg(b), method));
+            }
             CALL | CALLFB => self.emit_call(a, b, c, multret_top, stmts, pending_namecall),
             RETURN => {
                 // B-1 values from R(A). B==0 means "to top": return R(A) up to the preceding
@@ -1677,6 +1705,15 @@ impl<'a> Decompiler<'a> {
                 let cond = self.eqk_cond(op, a, aux);
                 self.cond_goto(cond, insn, pc, stmts);
             }
+            CMPPROTO => {
+                let cond = Expr::Raw(format!(
+                    "not __luau_proto_matches({}, {})",
+                    render_expr(&self.reg(a)),
+                    aux
+                ));
+                self.note("CMPPROTO feedback guard approximated");
+                self.cond_goto(cond, insn, pc, stmts);
+            }
             FORNPREP => {
                 stmts.push(Stmt::Comment(format!(
                     "numeric for: {} = {}, {}, {} (FORNPREP)",
@@ -1701,10 +1738,6 @@ impl<'a> Decompiler<'a> {
             FASTCALL | FASTCALL1 | FASTCALL2 | FASTCALL2K | FASTCALL3 => {
                 // Optimization hints; the real work is the following CALL.
             }
-            other => {
-                stmts.push(Stmt::Comment(format!("unhandled op {}", other.name())));
-                self.note(&format!("unhandled opcode {}", other.name()));
-            }
         }
 
         // Carry a pending multret across an instruction that only set up the call target
@@ -1716,8 +1749,8 @@ impl<'a> Decompiler<'a> {
         if self.pending_multret.is_none() {
             if let Some(base) = multret_top {
                 let carries = match op {
-                    GETIMPORT | GETGLOBAL | GETUPVAL | MOVE | GETTABLE | GETTABLEKS | GETTABLEN
-                    | NAMECALL => a < base,
+                    GETIMPORT | GETGLOBAL | GETUPVAL | MOVE | GETTABLE | GETTABLEKS
+                    | GETUDATAKS | GETTABLEN | NAMECALL | NAMECALLUDATA => a < base,
                     FASTCALL | FASTCALL1 | FASTCALL2 | FASTCALL2K | FASTCALL3 | PREPVARARGS
                     | NOP | COVERAGE => true,
                     _ => false,
@@ -2546,6 +2579,371 @@ fn substitute_upvalues(text: &str, names: &[String]) -> String {
     String::from_utf8(out).unwrap_or_else(|_| text.to_string())
 }
 
+fn avoid_closure_capture_name_collisions(
+    stmts: &[Stmt],
+    decompiler: &Decompiler<'_>,
+    rename: &mut BTreeMap<String, String>,
+) {
+    let mut taken = final_names_in_proto(stmts, decompiler, rename);
+    let constraints = closure_capture_name_constraints(stmts, decompiler, rename);
+
+    for (source, declared_in_child) in constraints {
+        let current = rename
+            .get(&source)
+            .cloned()
+            .unwrap_or_else(|| source.clone());
+        if !declared_in_child.contains(&current) {
+            continue;
+        }
+
+        let fresh = fresh_capture_name(&current, &declared_in_child, &taken);
+        taken.insert(fresh.clone());
+        rename.insert(source, fresh);
+    }
+}
+
+fn final_names_in_proto(
+    stmts: &[Stmt],
+    decompiler: &Decompiler<'_>,
+    rename: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for r in 0..decompiler.proto.num_params {
+        let name = decompiler.reg_name(r);
+        names.insert(rename.get(&name).cloned().unwrap_or(name));
+    }
+    collect_stmt_decl_names(stmts, rename, &mut names);
+    names
+}
+
+fn collect_stmt_decl_names(
+    stmts: &[Stmt],
+    rename: &BTreeMap<String, String>,
+    out: &mut BTreeSet<String>,
+) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Local { names, .. } => {
+                for name in names {
+                    out.insert(rename.get(name).cloned().unwrap_or_else(|| name.clone()));
+                }
+            }
+            Stmt::NumericFor { var, body, .. } => {
+                out.insert(rename.get(var).cloned().unwrap_or_else(|| var.clone()));
+                collect_stmt_decl_names(body, rename, out);
+            }
+            Stmt::GenericFor { vars, body, .. } => {
+                for name in vars {
+                    out.insert(rename.get(name).cloned().unwrap_or_else(|| name.clone()));
+                }
+                collect_stmt_decl_names(body, rename, out);
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_stmt_decl_names(then_body, rename, out);
+                collect_stmt_decl_names(else_body, rename, out);
+            }
+            Stmt::While { body, .. } | Stmt::Repeat { body, .. } => {
+                collect_stmt_decl_names(body, rename, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn closure_capture_name_constraints(
+    stmts: &[Stmt],
+    decompiler: &Decompiler<'_>,
+    rename: &BTreeMap<String, String>,
+) -> Vec<(String, BTreeSet<String>)> {
+    let mut constraints = Vec::new();
+    for stmt in stmts {
+        collect_closure_capture_constraints_from_stmt(stmt, decompiler, rename, &mut constraints);
+    }
+    constraints
+}
+
+fn collect_closure_capture_constraints_from_stmt(
+    stmt: &Stmt,
+    decompiler: &Decompiler<'_>,
+    rename: &BTreeMap<String, String>,
+    out: &mut Vec<(String, BTreeSet<String>)>,
+) {
+    match stmt {
+        Stmt::Local { values, .. } | Stmt::Return(values) => {
+            for value in values {
+                collect_closure_capture_constraints_from_expr(value, decompiler, rename, out);
+            }
+        }
+        Stmt::Assign { targets, values } => {
+            for target in targets {
+                collect_closure_capture_constraints_from_expr(target, decompiler, rename, out);
+            }
+            for value in values {
+                collect_closure_capture_constraints_from_expr(value, decompiler, rename, out);
+            }
+        }
+        Stmt::Call(expr) => {
+            collect_closure_capture_constraints_from_expr(expr, decompiler, rename, out);
+        }
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            collect_closure_capture_constraints_from_expr(cond, decompiler, rename, out);
+            for stmt in then_body.iter().chain(else_body) {
+                collect_closure_capture_constraints_from_stmt(stmt, decompiler, rename, out);
+            }
+        }
+        Stmt::While { cond, body } | Stmt::Repeat { body, cond } => {
+            collect_closure_capture_constraints_from_expr(cond, decompiler, rename, out);
+            for stmt in body {
+                collect_closure_capture_constraints_from_stmt(stmt, decompiler, rename, out);
+            }
+        }
+        Stmt::NumericFor {
+            start,
+            limit,
+            step,
+            body,
+            ..
+        } => {
+            collect_closure_capture_constraints_from_expr(start, decompiler, rename, out);
+            collect_closure_capture_constraints_from_expr(limit, decompiler, rename, out);
+            if let Some(step) = step {
+                collect_closure_capture_constraints_from_expr(step, decompiler, rename, out);
+            }
+            for stmt in body {
+                collect_closure_capture_constraints_from_stmt(stmt, decompiler, rename, out);
+            }
+        }
+        Stmt::GenericFor { exprs, body, .. } => {
+            for expr in exprs {
+                collect_closure_capture_constraints_from_expr(expr, decompiler, rename, out);
+            }
+            for stmt in body {
+                collect_closure_capture_constraints_from_stmt(stmt, decompiler, rename, out);
+            }
+        }
+        Stmt::Break | Stmt::Continue | Stmt::Label(_) | Stmt::Goto(_) | Stmt::Comment(_) => {}
+    }
+}
+
+fn collect_closure_capture_constraints_from_expr(
+    expr: &Expr,
+    decompiler: &Decompiler<'_>,
+    rename: &BTreeMap<String, String>,
+    out: &mut Vec<(String, BTreeSet<String>)>,
+) {
+    match expr {
+        Expr::Closure { text, captures } => {
+            let declared = declared_names_in_rendered_closure(text);
+            if declared.is_empty() {
+                return;
+            }
+            for capture in captures {
+                if let Capture::Reg(reg) = capture {
+                    let source = decompiler.reg_name(*reg);
+                    let final_name = rename
+                        .get(&source)
+                        .cloned()
+                        .unwrap_or_else(|| source.clone());
+                    if declared.contains(&final_name) {
+                        out.push((source, declared.clone()));
+                    }
+                }
+            }
+        }
+        Expr::Index(base, key) => {
+            collect_closure_capture_constraints_from_expr(base, decompiler, rename, out);
+            collect_closure_capture_constraints_from_expr(key, decompiler, rename, out);
+        }
+        Expr::Field(base, _) | Expr::Unary(_, base) => {
+            collect_closure_capture_constraints_from_expr(base, decompiler, rename, out);
+        }
+        Expr::Call(callee, args) => {
+            collect_closure_capture_constraints_from_expr(callee, decompiler, rename, out);
+            for arg in args {
+                collect_closure_capture_constraints_from_expr(arg, decompiler, rename, out);
+            }
+        }
+        Expr::MethodCall(receiver, _, args) => {
+            collect_closure_capture_constraints_from_expr(receiver, decompiler, rename, out);
+            for arg in args {
+                collect_closure_capture_constraints_from_expr(arg, decompiler, rename, out);
+            }
+        }
+        Expr::Binary(_, left, right) => {
+            collect_closure_capture_constraints_from_expr(left, decompiler, rename, out);
+            collect_closure_capture_constraints_from_expr(right, decompiler, rename, out);
+        }
+        Expr::Table(fields) => {
+            for field in fields {
+                match field {
+                    TableField::Item(value) | TableField::Named(_, value) => {
+                        collect_closure_capture_constraints_from_expr(
+                            value, decompiler, rename, out,
+                        );
+                    }
+                    TableField::Keyed(key, value) => {
+                        collect_closure_capture_constraints_from_expr(key, decompiler, rename, out);
+                        collect_closure_capture_constraints_from_expr(
+                            value, decompiler, rename, out,
+                        );
+                    }
+                }
+            }
+        }
+        Expr::Nil
+        | Expr::Bool(_)
+        | Expr::Num(_)
+        | Expr::Str(_)
+        | Expr::Vector(_)
+        | Expr::Var(_)
+        | Expr::Vararg
+        | Expr::Raw(_) => {}
+    }
+}
+
+fn declared_names_in_rendered_closure(text: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        collect_function_params_from_line(trimmed, &mut names);
+        collect_local_names_from_line(trimmed, &mut names);
+        collect_for_names_from_line(trimmed, &mut names);
+    }
+    names
+}
+
+fn collect_function_params_from_line(line: &str, out: &mut BTreeSet<String>) {
+    let Some(function_pos) = line.find("function") else {
+        return;
+    };
+    let after = &line[function_pos + "function".len()..];
+    let Some(open) = after.find('(') else {
+        return;
+    };
+    let Some(close) = after[open + 1..].find(')') else {
+        return;
+    };
+    collect_comma_names(&after[open + 1..open + 1 + close], out);
+}
+
+fn collect_local_names_from_line(line: &str, out: &mut BTreeSet<String>) {
+    let Some(rest) = line.strip_prefix("local ") else {
+        return;
+    };
+    let rest = rest.strip_prefix("function ").unwrap_or(rest);
+    let end = rest.find(['=', '(']).unwrap_or(rest.len());
+    collect_comma_names(&rest[..end], out);
+}
+
+fn collect_for_names_from_line(line: &str, out: &mut BTreeSet<String>) {
+    let Some(rest) = line.strip_prefix("for ") else {
+        return;
+    };
+    if let Some(end) = rest.find(" in ") {
+        collect_comma_names(&rest[..end], out);
+    } else {
+        let end = rest.find('=').unwrap_or(rest.len());
+        collect_comma_names(&rest[..end], out);
+    }
+}
+
+fn collect_comma_names(text: &str, out: &mut BTreeSet<String>) {
+    for part in text.split(',') {
+        let name = part.trim();
+        if is_plain_ident(name) && name != "_" {
+            out.insert(name.to_string());
+        }
+    }
+}
+
+fn fresh_capture_name(
+    base: &str,
+    declared_in_child: &BTreeSet<String>,
+    taken: &BTreeSet<String>,
+) -> String {
+    let mut stem = format!("outer{}", pascal_identifier_fragment(base));
+    if !is_plain_ident(&stem) || is_luau_keyword(&stem) {
+        stem = "capturedUpvalue".to_string();
+    }
+    let mut candidate = stem.clone();
+    let mut suffix = 2;
+    while declared_in_child.contains(&candidate)
+        || taken.contains(&candidate)
+        || is_luau_keyword(&candidate)
+    {
+        candidate = format!("{stem}{suffix}");
+        suffix += 1;
+    }
+    candidate
+}
+
+fn pascal_identifier_fragment(text: &str) -> String {
+    let mut out = String::new();
+    let mut capitalize_next = true;
+    for ch in text.chars() {
+        if ch == '_' || !ch.is_ascii_alphanumeric() {
+            capitalize_next = true;
+            continue;
+        }
+        if capitalize_next {
+            out.push(ch.to_ascii_uppercase());
+            capitalize_next = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    if out.is_empty() {
+        "Value".to_string()
+    } else {
+        out
+    }
+}
+
+fn is_plain_ident(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn is_luau_keyword(text: &str) -> bool {
+    matches!(
+        text,
+        "and"
+            | "break"
+            | "continue"
+            | "do"
+            | "else"
+            | "elseif"
+            | "end"
+            | "false"
+            | "for"
+            | "function"
+            | "if"
+            | "in"
+            | "local"
+            | "nil"
+            | "not"
+            | "or"
+            | "repeat"
+            | "return"
+            | "then"
+            | "true"
+            | "until"
+            | "while"
+    )
+}
+
 /// A two-way conditional jump (has a taken and a fall-through edge).
 fn is_conditional_jump(op: Opcode) -> bool {
     use Opcode::*;
@@ -2644,5 +3042,47 @@ fn writes_register(op: Opcode, insn: u32, reg: u8) -> bool {
         | JUMPXEQKS | SETTABLE | SETTABLEKS | SETTABLEN | SETUPVAL | SETGLOBAL | RETURN | BREAK
         | FORNPREP | FORGLOOP | FORGPREP | FORGPREP_INEXT | FORGPREP_NEXT => false,
         _ => insn_a(insn) == reg,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rendered_closure_declared_names_include_params_locals_and_loops() {
+        let names = declared_names_in_rendered_closure(
+            "function(input, gameProcessed)\n\
+            \tlocal value, other = 1, 2\n\
+            \tlocal function helper(item)\n\
+            \tend\n\
+            \tfor index, child in children do\n\
+            \tend\n\
+            \tfor step = 1, 3 do\n\
+            \tend\n\
+            end",
+        );
+
+        for expected in [
+            "input",
+            "gameProcessed",
+            "value",
+            "other",
+            "helper",
+            "item",
+            "index",
+            "child",
+            "step",
+        ] {
+            assert!(names.contains(expected), "missing {expected}: {names:?}");
+        }
+    }
+
+    #[test]
+    fn fresh_capture_names_avoid_child_and_parent_collisions() {
+        let declared = BTreeSet::from(["v1".to_string(), "outerV1".to_string()]);
+        let taken = BTreeSet::from(["outerV12".to_string()]);
+
+        assert_eq!(fresh_capture_name("v1", &declared, &taken), "outerV13");
     }
 }

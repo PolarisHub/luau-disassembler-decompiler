@@ -13,7 +13,9 @@ The reader supports the full range the Luau VM accepts: **bytecode versions 3–
 (`LBC_BYTECODE_MIN`..`MAX`) and type-info versions 1–3. Unsupported version bytes are
 rejected with a clear error; the version-0 "compile error" sentinel is surfaced as the
 embedded message. The test corpus is compiled at **version 7** (`LBC_VERSION_TARGET`, the
-stable default) with one version-11 sample to exercise feedback-vector parsing.
+stable default), with explicit coverage for version 8 integer constants, version 9
+userdata field-access opcodes, version 10 class-shape / class-member bytecode, and
+version 11 feedback-vector parsing plus `CALLFB` / `CMPPROTO` opcode handling.
 
 ## The spec is the Luau source, not memory
 
