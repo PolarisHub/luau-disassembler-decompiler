@@ -202,14 +202,19 @@ impl FactCollector {
 
                         if let Expr::Field(_, field) = target {
                             if let Expr::Var(x_name) = value {
-                                self.add_suggestion(x_name, lower_first(field), 8);
+                                let name = param_name_from_field_key(field)
+                                    .unwrap_or_else(|| lower_first(field));
+                                self.add_suggestion(x_name, name, 8);
                             }
                         }
 
                         if let Expr::Index(_, key) = target {
                             if let Expr::Str(lit) = key.as_ref() {
                                 if let Expr::Var(x_name) = value {
-                                    self.add_suggestion(x_name, lower_first(&strip_quotes(lit)), 8);
+                                    let key = strip_quotes(lit);
+                                    let name = param_name_from_field_key(&key)
+                                        .unwrap_or_else(|| lower_first(&key));
+                                    self.add_suggestion(x_name, name, 8);
                                 }
                             }
                         }
@@ -318,6 +323,10 @@ impl FactCollector {
                 if let Expr::Var(base_name) = base.as_ref() {
                     match field.as_str() {
                         "Character" => self.add_suggestion(base_name, "player".to_string(), 8),
+                        "UserId" | "DisplayName" | "PlayerGui" | "Backpack" | "Team"
+                        | "AccountAge" | "MembershipType" | "Neutral" => {
+                            self.add_suggestion(base_name, "player".to_string(), 8)
+                        }
                         "Parent" => {
                             self.add_suggestion(base_name, "instance".to_string(), 6);
                             self.add_suggestion(base_name, "part".to_string(), 4);
@@ -329,9 +338,57 @@ impl FactCollector {
                         "HumanoidRootPart" => {
                             self.add_suggestion(base_name, "character".to_string(), 8)
                         }
-                        "Position" | "CFrame" => {
+                        "PrimaryPart" => self.add_suggestion(base_name, "model".to_string(), 8),
+                        "Health" | "MaxHealth" | "WalkSpeed" | "JumpPower" | "JumpHeight"
+                        | "MoveDirection" | "FloorMaterial" | "Sit" | "RigType" | "Animator" => {
+                            self.add_suggestion(base_name, "humanoid".to_string(), 8);
+                        }
+                        "Position"
+                        | "CFrame"
+                        | "Size"
+                        | "Material"
+                        | "Transparency"
+                        | "Anchored"
+                        | "CanCollide"
+                        | "CanTouch"
+                        | "CanQuery"
+                        | "Massless"
+                        | "AssemblyLinearVelocity"
+                        | "AssemblyAngularVelocity" => {
                             self.add_suggestion(base_name, "part".to_string(), 5);
                             self.add_suggestion(base_name, "attachment".to_string(), 5);
+                        }
+                        "Text" | "TextColor3" | "TextSize" | "Font" | "RichText" => {
+                            self.add_suggestion(base_name, "label".to_string(), 7);
+                            self.add_suggestion(base_name, "guiObject".to_string(), 5);
+                        }
+                        "Visible"
+                        | "AbsoluteSize"
+                        | "AbsolutePosition"
+                        | "AnchorPoint"
+                        | "LayoutOrder"
+                        | "ZIndex"
+                        | "BackgroundColor3"
+                        | "BackgroundTransparency" => {
+                            self.add_suggestion(base_name, "guiObject".to_string(), 7);
+                        }
+                        "MouseButton1Click" | "MouseButton1Down" | "MouseButton1Up"
+                        | "MouseButton2Click" | "MouseButton2Down" | "MouseButton2Up"
+                        | "Activated" => {
+                            self.add_suggestion(base_name, "button".to_string(), 8);
+                        }
+                        "SoundId" | "Volume" | "PlaybackSpeed" | "TimePosition" | "IsPlaying"
+                        | "Looped" => {
+                            self.add_suggestion(base_name, "sound".to_string(), 8);
+                        }
+                        "FieldOfView" | "CameraType" | "CameraSubject" | "Focus" => {
+                            self.add_suggestion(base_name, "camera".to_string(), 8);
+                        }
+                        "Brightness" | "Range" => {
+                            self.add_suggestion(base_name, "light".to_string(), 8);
+                        }
+                        "Part0" | "Part1" | "C0" | "C1" => {
+                            self.add_suggestion(base_name, "weld".to_string(), 8);
                         }
                         _ => {}
                     }
@@ -346,21 +403,105 @@ impl FactCollector {
                         "IsA" => {
                             self.add_suggestion(recv_name, "instance".to_string(), 8);
                             self.add_suggestion(recv_name, "part".to_string(), 6);
+                            if let Some(Expr::Str(class)) = args.first() {
+                                if let Some(name) = class_name_hint(&strip_quotes(class)) {
+                                    self.add_suggestion(recv_name, name, 9);
+                                }
+                            }
                         }
-                        "FindFirstChild" | "WaitForChild" => {
+                        "FindFirstChild"
+                        | "WaitForChild"
+                        | "FindFirstChildOfClass"
+                        | "FindFirstChildWhichIsA"
+                        | "FindFirstAncestor"
+                        | "FindFirstAncestorOfClass"
+                        | "FindFirstAncestorWhichIsA"
+                        | "IsDescendantOf"
+                        | "Destroy"
+                        | "Clone"
+                        | "GetFullName" => {
                             self.add_suggestion(recv_name, "instance".to_string(), 8);
                         }
                         "GetChildren" | "GetDescendants" => {
                             self.add_suggestion(recv_name, "instance".to_string(), 8);
                         }
+                        "LoadAnimation" => {
+                            self.add_suggestion(recv_name, "animator".to_string(), 9);
+                        }
                         "Connect" | "ConnectParallel" | "Once" => {
                             self.add_suggestion(recv_name, "event".to_string(), 8);
+                        }
+                        "Disconnect" => {
+                            self.add_suggestion(recv_name, "connection".to_string(), 9);
                         }
                         "Fire" => {
                             self.add_suggestion(recv_name, "event".to_string(), 8);
                         }
-                        "FireServer" | "InvokeServer" => {
+                        "FireServer" | "FireClient" | "FireAllClients" => {
                             self.add_suggestion(recv_name, "remoteEvent".to_string(), 8);
+                        }
+                        "InvokeServer" | "InvokeClient" => {
+                            self.add_suggestion(recv_name, "remoteFunction".to_string(), 8);
+                        }
+                        "GetPivot" | "PivotTo" | "GetBoundingBox" => {
+                            self.add_suggestion(recv_name, "model".to_string(), 7);
+                        }
+                        "GetAttribute" | "SetAttribute" | "GetAttributeChangedSignal" => {
+                            self.add_suggestion(recv_name, "instance".to_string(), 7);
+                        }
+                        "Kick" | "LoadCharacter" | "GetMouse" | "GetRankInGroup"
+                        | "GetRoleInGroup" | "IsInGroup" => {
+                            self.add_suggestion(recv_name, "player".to_string(), 8);
+                        }
+                        "TakeDamage"
+                        | "ChangeState"
+                        | "GetState"
+                        | "MoveTo"
+                        | "GetPlayingAnimationTracks"
+                        | "UnequipTools"
+                        | "EquipTool"
+                        | "ApplyDescription"
+                        | "GetAppliedDescription" => {
+                            self.add_suggestion(recv_name, "humanoid".to_string(), 8);
+                        }
+                        "GetTouchingParts"
+                        | "GetMass"
+                        | "ApplyImpulse"
+                        | "ApplyAngularImpulse"
+                        | "SetNetworkOwner"
+                        | "GetNetworkOwner" => {
+                            self.add_suggestion(recv_name, "part".to_string(), 8);
+                        }
+                        "TweenPosition" | "TweenSize" | "TweenSizeAndPosition" => {
+                            self.add_suggestion(recv_name, "guiObject".to_string(), 8);
+                        }
+                        "JSONDecode" | "JSONEncode" => {
+                            self.add_suggestion(recv_name, "httpService".to_string(), 8);
+                        }
+                        "AddTag" | "RemoveTag" | "HasTag" | "GetTagged" => {
+                            self.add_suggestion(recv_name, "collectionService".to_string(), 8);
+                        }
+                        "GetAsync" | "SetAsync" | "UpdateAsync" | "IncrementAsync"
+                        | "RemoveAsync" => {
+                            self.add_suggestion(recv_name, "dataStore".to_string(), 8);
+                        }
+                        "PublishAsync" | "SubscribeAsync" => {
+                            self.add_suggestion(recv_name, "messagingService".to_string(), 8);
+                        }
+                        "CreatePath" => {
+                            self.add_suggestion(recv_name, "pathfindingService".to_string(), 8);
+                        }
+                        "BindToRenderStep" | "UnbindFromRenderStep" => {
+                            self.add_suggestion(recv_name, "runService".to_string(), 8);
+                        }
+                        "BindAction" | "BindActionAtPriority" | "UnbindAction" => {
+                            self.add_suggestion(recv_name, "contextActionService".to_string(), 8);
+                        }
+                        "GetInstanceAddedSignal" | "GetInstanceRemovedSignal" => {
+                            self.add_suggestion(recv_name, "collectionService".to_string(), 8);
+                        }
+                        "Create" if args.len() >= 3 => {
+                            self.add_suggestion(recv_name, "tweenService".to_string(), 8);
                         }
                         _ => {}
                     }
@@ -374,7 +515,87 @@ impl FactCollector {
                     }
                     "FindFirstChild" | "WaitForChild" | "FindFirstAncestor" => {
                         if let Some(Expr::Var(arg_name)) = args.first() {
+                            self.add_suggestion(arg_name, "childName".to_string(), 7);
                             self.add_suggestion(arg_name, "name".to_string(), 5);
+                        }
+                    }
+                    "IsA" => {
+                        if let Some(Expr::Var(arg_name)) = args.first() {
+                            self.add_suggestion(arg_name, "className".to_string(), 8);
+                        }
+                    }
+                    "GetAttribute" => {
+                        if let Some(Expr::Var(arg_name)) = args.first() {
+                            self.add_suggestion(arg_name, "attributeName".to_string(), 7);
+                        }
+                    }
+                    "SetAttribute" => {
+                        if let (Some(Expr::Str(key)), Some(Expr::Var(arg_name))) =
+                            (args.first(), args.get(1))
+                        {
+                            if let Some(name) = param_name_from_field_key(&strip_quotes(key)) {
+                                self.add_suggestion(arg_name, name, 9);
+                            }
+                        }
+                        if let Some(Expr::Var(arg_name)) = args.first() {
+                            self.add_suggestion(arg_name, "attributeName".to_string(), 7);
+                        }
+                    }
+                    "GetPropertyChangedSignal" => {
+                        if let Some(Expr::Var(arg_name)) = args.first() {
+                            self.add_suggestion(arg_name, "propertyName".to_string(), 8);
+                        }
+                    }
+                    "LoadAnimation" => {
+                        if let Some(Expr::Var(arg_name)) = args.first() {
+                            self.add_suggestion(arg_name, "animation".to_string(), 8);
+                        }
+                    }
+                    "AddTag" | "RemoveTag" | "HasTag" | "GetTagged" => {
+                        if let Some(Expr::Var(arg_name)) = args.first() {
+                            self.add_suggestion(arg_name, "tagName".to_string(), 8);
+                        }
+                    }
+                    "GetRankInGroup" | "GetRoleInGroup" | "IsInGroup" => {
+                        if let Some(Expr::Var(arg_name)) = args.first() {
+                            self.add_suggestion(arg_name, "groupId".to_string(), 8);
+                        }
+                    }
+                    "SetNetworkOwner" | "FireClient" | "InvokeClient" => {
+                        if let Some(Expr::Var(arg_name)) = args.first() {
+                            self.add_suggestion(arg_name, "player".to_string(), 8);
+                        }
+                    }
+                    "Create" if args.len() >= 3 => {
+                        if let Some(Expr::Var(arg_name)) = args.first() {
+                            self.add_suggestion(arg_name, "object".to_string(), 6);
+                        }
+                        if let Some(Expr::Var(arg_name)) = args.get(1) {
+                            self.add_suggestion(arg_name, "tweenInfo".to_string(), 8);
+                        }
+                        if let Some(Expr::Var(arg_name)) = args.get(2) {
+                            self.add_suggestion(arg_name, "properties".to_string(), 8);
+                        }
+                    }
+                    "BindToRenderStep" => {
+                        if let Some(Expr::Var(arg_name)) = args.first() {
+                            self.add_suggestion(arg_name, "renderStepName".to_string(), 8);
+                        }
+                        if let Some(Expr::Var(arg_name)) = args.get(2) {
+                            self.add_suggestion(arg_name, "callback".to_string(), 8);
+                        }
+                    }
+                    "BindAction" | "BindActionAtPriority" => {
+                        if let Some(Expr::Var(arg_name)) = args.first() {
+                            self.add_suggestion(arg_name, "actionName".to_string(), 8);
+                        }
+                        if let Some(Expr::Var(arg_name)) = args.get(1) {
+                            self.add_suggestion(arg_name, "callback".to_string(), 8);
+                        }
+                    }
+                    "GetInstanceAddedSignal" | "GetInstanceRemovedSignal" => {
+                        if let Some(Expr::Var(arg_name)) = args.first() {
+                            self.add_suggestion(arg_name, "tagName".to_string(), 8);
                         }
                     }
                     _ => {}
@@ -386,10 +607,28 @@ impl FactCollector {
                 }
             }
             Expr::Call(callee, args) => {
+                if let Some(index) = callback_arg_index(callee) {
+                    if let Some(Expr::Var(arg_name)) = args.get(index) {
+                        self.add_suggestion(arg_name, "callback".to_string(), 8);
+                    }
+                }
                 if let Expr::Var(callee_name) = callee.as_ref() {
                     if callee_name == "require" {
                         if let Some(Expr::Var(arg_name)) = args.first() {
                             self.add_suggestion(arg_name, "module".to_string(), 8);
+                        }
+                    }
+                    if matches!(callee_name.as_str(), "pcall" | "xpcall") {
+                        if let Some(Expr::Var(arg_name)) = args.first() {
+                            self.add_suggestion(arg_name, "callback".to_string(), 8);
+                        }
+                    }
+                    if let Some(Expr::Var(arg_name)) = args.first() {
+                        if callee_name.ends_with("Connect")
+                            || callee_name.ends_with("ConnectParallel")
+                            || callee_name.ends_with("Once")
+                        {
+                            self.add_suggestion(arg_name, "callback".to_string(), 7);
                         }
                     }
                 }
@@ -404,6 +643,13 @@ impl FactCollector {
             }
             Expr::Unary(_, a) => self.visit_expr(a),
             Expr::Binary(op, a, b) => {
+                if matches!(*op, "==" | "~=") {
+                    if let Some((name, type_name)) = type_guard_name(a, b) {
+                        if let Some(base) = type_name_hint(type_name) {
+                            self.add_suggestion(name, base.to_string(), 7);
+                        }
+                    }
+                }
                 if matches!(*op, "<" | "<=" | ">" | ">=" | "==" | "~=") {
                     if let Expr::Var(name) = a.as_ref() {
                         if let Expr::Var(limit_name) = b.as_ref() {
@@ -419,8 +665,22 @@ impl FactCollector {
             Expr::Table(fields) => {
                 for f in fields {
                     match f {
-                        TableField::Item(e) | TableField::Named(_, e) => self.visit_expr(e),
+                        TableField::Item(e) => self.visit_expr(e),
+                        TableField::Named(name, e) => {
+                            if let Expr::Var(var) = e {
+                                if let Some(callback_name) = callback_field_name(name) {
+                                    self.add_suggestion(var, callback_name, 9);
+                                }
+                            }
+                            self.visit_expr(e);
+                        }
                         TableField::Keyed(k, v) => {
+                            if let (Expr::Str(lit), Expr::Var(var)) = (k, v) {
+                                if let Some(callback_name) = callback_field_name(&strip_quotes(lit))
+                                {
+                                    self.add_suggestion(var, callback_name, 9);
+                                }
+                            }
                             self.visit_expr(k);
                             self.visit_expr(v);
                         }
@@ -479,6 +739,120 @@ pub fn smart_rename(
 fn is_candidate_loop_var(name: &str) -> bool {
     const LETTERS: &[&str] = &["i", "j", "k", "l", "m", "o", "p", "q", "r", "s"];
     LETTERS.contains(&name) || name.starts_with("idx")
+}
+
+fn event_param_name(event: &str, index: u32) -> Option<&'static str> {
+    match event {
+        "InputBegan" | "InputChanged" | "InputEnded" => match index {
+            0 => Some("input"),
+            1 => Some("gameProcessed"),
+            _ => None,
+        },
+        "Heartbeat" | "RenderStepped" | "PreSimulation" | "PostSimulation" | "PreRender"
+        | "PreAnimation" => match index {
+            0 => Some("deltaTime"),
+            _ => None,
+        },
+        "Stepped" => match index {
+            0 => Some("time"),
+            1 => Some("deltaTime"),
+            _ => None,
+        },
+        "PlayerAdded" | "PlayerRemoving" | "OnServerEvent" => match index {
+            0 => Some("player"),
+            _ => None,
+        },
+        "OnServerInvoke" => match index {
+            0 => Some("player"),
+            _ => None,
+        },
+        "OnClientEvent" | "OnClientInvoke" => match index {
+            0 => Some("payload"),
+            _ => None,
+        },
+        "CharacterAdded" | "CharacterRemoving" | "CharacterAppearanceLoaded" => match index {
+            0 => Some("character"),
+            _ => None,
+        },
+        "ChildAdded" | "ChildRemoved" => match index {
+            0 => Some("child"),
+            _ => None,
+        },
+        "DescendantAdded" | "DescendantRemoving" => match index {
+            0 => Some("descendant"),
+            _ => None,
+        },
+        "AncestryChanged" => match index {
+            0 => Some("child"),
+            1 => Some("parent"),
+            _ => None,
+        },
+        "Changed" => match index {
+            0 => Some("property"),
+            _ => None,
+        },
+        "Touched" => match index {
+            0 => Some("hit"),
+            _ => None,
+        },
+        "TouchEnded" => match index {
+            0 => Some("otherPart"),
+            _ => None,
+        },
+        "Triggered"
+        | "TriggerEnded"
+        | "PromptTriggered"
+        | "PromptButtonHoldBegan"
+        | "PromptButtonHoldEnded" => match index {
+            0 => Some("player"),
+            _ => None,
+        },
+        "Activated" => match index {
+            0 => Some("input"),
+            1 => Some("clickCount"),
+            _ => None,
+        },
+        "FocusLost" => match index {
+            0 => Some("enterPressed"),
+            1 => Some("input"),
+            _ => None,
+        },
+        "Equipped" => match index {
+            0 => Some("mouse"),
+            _ => None,
+        },
+        "HealthChanged" => match index {
+            0 => Some("health"),
+            _ => None,
+        },
+        "StateChanged" => match index {
+            0 => Some("oldState"),
+            1 => Some("newState"),
+            _ => None,
+        },
+        "Running" | "Climbing" | "Swimming" => match index {
+            0 => Some("speed"),
+            _ => None,
+        },
+        "Jumping" | "FreeFalling" => match index {
+            0 => Some("active"),
+            _ => None,
+        },
+        "Seated" => match index {
+            0 => Some("active"),
+            1 => Some("seatPart"),
+            _ => None,
+        },
+        "AnimationPlayed" => match index {
+            0 => Some("track"),
+            _ => None,
+        },
+        "KeyframeReached" => match index {
+            0 => Some("keyframeName"),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 pub fn smart_rename_with_event(
@@ -554,10 +928,22 @@ pub fn smart_rename_with_event(
         }
     });
 
+    let conflicting_defs: BTreeSet<String> = defs
+        .iter()
+        .filter(|(_, values)| definitions_have_conflicting_names(values))
+        .map(|(name, _)| name.clone())
+        .collect();
+    let stable_candidates: BTreeSet<String> = candidates
+        .iter()
+        .filter(|name| !conflicting_defs.contains(*name))
+        .cloned()
+        .collect();
+
     // Pass 1: Derive base names from defs and suggestions
     for &orig in &ordered {
         let mut suggs = Vec::new();
-        if let Some(list) = defs.get(orig) {
+        let defs_conflict = conflicting_defs.contains(orig);
+        if let Some(list) = defs.get(orig).filter(|_| !defs_conflict) {
             let chosen = if list.len() == 1 {
                 Some(&list[0])
             } else if list[1..].iter().all(|e| expr_references(e, orig)) {
@@ -609,31 +995,17 @@ pub fn smart_rename_with_event(
             }
         }
 
-        if let Some(col_list) = collector.suggestions.get(orig) {
-            suggs.extend(col_list.iter().cloned());
+        if !defs_conflict {
+            if let Some(col_list) = collector.suggestions.get(orig) {
+                suggs.extend(col_list.iter().cloned());
+            }
         }
 
         if let Some(event) = event_name {
             if is_parameter(orig) {
                 let p_num: u32 = orig[1..].parse().unwrap_or(0);
-                match event {
-                    "InputBegan" | "InputChanged" | "InputEnded" => {
-                        if p_num == 0 {
-                            suggs.push(("input".to_string(), 25));
-                        } else if p_num == 1 {
-                            suggs.push(("gameProcessed".to_string(), 25));
-                        }
-                    }
-                    "PlayerAdded" | "PlayerRemoving" | "OnServerEvent" if p_num == 0 => {
-                        suggs.push(("player".to_string(), 25));
-                    }
-                    "ChildAdded" | "ChildRemoved" if p_num == 0 => {
-                        suggs.push(("child".to_string(), 25));
-                    }
-                    "Touched" if p_num == 0 => {
-                        suggs.push(("hit".to_string(), 25));
-                    }
-                    _ => {}
+                if let Some(name) = event_param_name(event, p_num) {
+                    suggs.push((name.to_string(), 25));
                 }
             }
         }
@@ -644,9 +1016,9 @@ pub fn smart_rename_with_event(
     }
 
     // Pass 2: Let special naming helper passes suggest base names for remaining candidates
-    apply_tuple_names(stmts, &candidates, &mut base_map);
-    apply_field_sink_names(stmts, &candidates, &mut base_map);
-    apply_returned_table_names(stmts, &defs, &candidates, &mut base_map);
+    apply_tuple_names(stmts, &stable_candidates, &mut base_map);
+    apply_field_sink_names(stmts, &stable_candidates, &mut base_map);
+    apply_returned_table_names(stmts, &defs, &stable_candidates, &mut base_map);
 
     // Pass 3: Resolve final unique names in a stable order
     let mut map = BTreeMap::new();
@@ -661,17 +1033,56 @@ pub fn smart_rename_with_event(
     map
 }
 
+fn definitions_have_conflicting_names(values: &[Expr]) -> bool {
+    let mut names = BTreeSet::new();
+    for value in values {
+        if let Some(name) = definition_name_vote(value) {
+            names.insert(name);
+            if names.len() > 1 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn definition_name_vote(value: &Expr) -> Option<String> {
+    match value {
+        Expr::Nil | Expr::Bool(_) | Expr::Num(_) | Expr::Str(_) | Expr::Vector(_) => None,
+        Expr::Var(name) if is_synthetic(name) || is_parameter(name) => None,
+        _ => derive_name(value).or_else(|| name_from_value(value)),
+    }
+}
+
 /// Conventional names for the destinations of a known multi-value call.
 fn tuple_names_for(callee: &Expr, n: usize) -> Option<Vec<String>> {
     let name = match callee {
         Expr::Var(f) => last_segment(f)?,
+        _ => call_owner_member(callee).map(|(_, member)| member)?,
+    };
+    tuple_names_for_name(&name, n)
+}
+
+fn tuple_names_for_value(value: &Expr, n: usize) -> Option<Vec<String>> {
+    let name = match value {
+        Expr::Call(callee, _) => return tuple_names_for(callee, n),
+        Expr::MethodCall(_, method, _) => method.clone(),
         _ => return None,
     };
-    let base: &[&str] = match name.as_str() {
+    tuple_names_for_name(&name, n)
+}
+
+fn tuple_names_for_name(name: &str, n: usize) -> Option<Vec<String>> {
+    let base: &[&str] = match name {
         "pcall" | "xpcall" | "resume" => &["ok", "result"],
         "find" => &["startIndex", "endIndex"],
         "next" => &["key", "value"],
         "gsub" => &["replaced", "count"],
+        "GetBoundingBox" => &["cframe", "size"],
+        "WorldToScreenPoint" | "WorldToViewportPoint" => &["screenPoint", "onScreen"],
+        "ViewportPointToRay" | "ScreenPointToRay" => &["ray"],
+        "ToOrientation" | "ToEulerAnglesXYZ" | "ToEulerAnglesYXZ" => &["x", "y", "z"],
+        "ToAxisAngle" => &["axis", "angle"],
         _ => return None,
     };
     Some(
@@ -692,20 +1103,28 @@ fn apply_tuple_names(
     base_map: &mut BTreeMap<String, String>,
 ) {
     for s in stmts {
-        if let Stmt::Assign { targets, values } = s {
-            if values.len() == 1 && targets.len() >= 2 {
-                if let Expr::Call(callee, _) = &values[0] {
-                    if let Some(names) = tuple_names_for(callee, targets.len()) {
-                        for (t, nm) in targets.iter().zip(names.iter()) {
-                            if let Expr::Var(v) = t {
-                                if candidates.contains(v) && !base_map.contains_key(v) {
-                                    base_map.insert(v.clone(), nm.clone());
-                                }
+        match s {
+            Stmt::Local { names, values } if values.len() == 1 && names.len() >= 2 => {
+                if let Some(tuple_names) = tuple_names_for_value(&values[0], names.len()) {
+                    for (name, tuple_name) in names.iter().zip(tuple_names.iter()) {
+                        if candidates.contains(name) {
+                            base_map.insert(name.clone(), tuple_name.clone());
+                        }
+                    }
+                }
+            }
+            Stmt::Assign { targets, values } if values.len() == 1 && targets.len() >= 2 => {
+                if let Some(names) = tuple_names_for_value(&values[0], targets.len()) {
+                    for (t, nm) in targets.iter().zip(names.iter()) {
+                        if let Expr::Var(v) = t {
+                            if candidates.contains(v) {
+                                base_map.insert(v.clone(), nm.clone());
                             }
                         }
                     }
                 }
             }
+            _ => {}
         }
         for_each_child_block(s, |b| apply_tuple_names(b, candidates, base_map));
     }
@@ -733,7 +1152,9 @@ fn apply_field_sink_names(
                         };
                         if let Some(f) = field {
                             if f != "Parent" {
-                                if let Some(base) = sanitize(&field_to_local_name(&f)) {
+                                if let Some(base) = param_name_from_field_key(&f)
+                                    .or_else(|| sanitize(&field_to_local_name(&f)))
+                                {
                                     base_map.insert(name.clone(), base);
                                 }
                             }
@@ -754,11 +1175,14 @@ fn apply_returned_table_names(
     candidates: &BTreeSet<String>,
     base_map: &mut BTreeMap<String, String>,
 ) {
+    let exported_tables = exported_table_candidates(stmts);
     for s in stmts {
         if let Stmt::Return(values) = s {
             if let [Expr::Var(name)] = values.as_slice() {
                 if candidates.contains(name) && !base_map.contains_key(name) {
-                    if let Some([Expr::Table(fields)]) = defs.get(name).map(Vec::as_slice) {
+                    if exported_tables.contains(name) {
+                        base_map.insert(name.clone(), "module".to_string());
+                    } else if let Some([Expr::Table(fields)]) = defs.get(name).map(Vec::as_slice) {
                         let base = returned_table_name(fields);
                         base_map.insert(name.clone(), base.to_string());
                     }
@@ -782,6 +1206,53 @@ fn returned_table_name(fields: &[TableField]) -> &'static str {
     } else {
         "result"
     }
+}
+
+fn exported_table_candidates(stmts: &[Stmt]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for stmt in stmts {
+        if let Stmt::Assign { targets, values } = stmt {
+            if targets.len() == 1 && values.len() == 1 && is_export_value(&values[0]) {
+                match &targets[0] {
+                    Expr::Field(base, field)
+                        if is_module_export_field(field)
+                            && matches!(base.as_ref(), Expr::Var(_)) =>
+                    {
+                        if let Expr::Var(name) = base.as_ref() {
+                            names.insert(name.clone());
+                        }
+                    }
+                    Expr::Index(base, key)
+                        if matches!(base.as_ref(), Expr::Var(_))
+                            && matches!(key.as_ref(), Expr::Str(_)) =>
+                    {
+                        if let (Expr::Var(name), Expr::Str(lit)) = (base.as_ref(), key.as_ref()) {
+                            if is_module_export_field(&strip_quotes(lit)) {
+                                names.insert(name.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for_each_child_block(stmt, |body| names.extend(exported_table_candidates(body)));
+    }
+    names
+}
+
+fn is_export_value(value: &Expr) -> bool {
+    matches!(value, Expr::Closure { .. } | Expr::Table(_))
+        || derive_name(value).is_some()
+        || name_from_value(value).is_some()
+}
+
+fn is_module_export_field(field: &str) -> bool {
+    field.chars().any(|c| c.is_ascii_uppercase())
+        || matches!(
+            field,
+            "new" | "init" | "start" | "stop" | "destroy" | "connect" | "disconnect"
+        )
 }
 
 fn accumulator_name(name: &str, defs: &[Expr]) -> Option<String> {
@@ -970,7 +1441,88 @@ pub(crate) fn is_pure(e: &Expr) -> bool {
             TableField::Item(e) | TableField::Named(_, e) => is_pure(e),
             TableField::Keyed(k, v) => is_pure(k) && is_pure(v),
         }),
-        Expr::Call(..) | Expr::MethodCall(..) | Expr::Raw(_) => false,
+        Expr::Call(callee, args) => args.iter().all(is_pure) && is_pure_builtin_call(callee),
+        Expr::MethodCall(..) | Expr::Raw(_) => false,
+    }
+}
+
+fn is_pure_builtin_call(callee: &Expr) -> bool {
+    let Some((owner, member)) = call_owner_member(callee) else {
+        return false;
+    };
+
+    match owner.as_str() {
+        "Vector2"
+        | "Vector3"
+        | "CFrame"
+        | "Color3"
+        | "UDim"
+        | "UDim2"
+        | "BrickColor"
+        | "Ray"
+        | "Region3"
+        | "Rect"
+        | "NumberRange"
+        | "NumberSequence"
+        | "ColorSequence"
+        | "NumberSequenceKeypoint"
+        | "ColorSequenceKeypoint"
+        | "TweenInfo"
+        | "PhysicalProperties"
+        | "Axes"
+        | "Faces"
+        | "CatalogSearchParams"
+        | "FloatCurveKey"
+        | "RotationCurveKey" => matches!(
+            member.as_str(),
+            "new"
+                | "fromRGB"
+                | "fromHSV"
+                | "fromHex"
+                | "fromScale"
+                | "fromOffset"
+                | "Angles"
+                | "fromAxisAngle"
+                | "fromEulerAnglesXYZ"
+                | "fromEulerAnglesYXZ"
+                | "lookAt"
+                | "fromMatrix"
+                | "identity"
+        ),
+        "math" => matches!(
+            member.as_str(),
+            "abs"
+                | "acos"
+                | "asin"
+                | "atan"
+                | "atan2"
+                | "ceil"
+                | "clamp"
+                | "cos"
+                | "cosh"
+                | "deg"
+                | "exp"
+                | "floor"
+                | "fmod"
+                | "frexp"
+                | "ldexp"
+                | "log"
+                | "log10"
+                | "max"
+                | "min"
+                | "modf"
+                | "noise"
+                | "pow"
+                | "rad"
+                | "round"
+                | "sign"
+                | "sin"
+                | "sinh"
+                | "sqrt"
+                | "tan"
+                | "tanh"
+        ),
+        _ => false,
     }
 }
 
@@ -1018,12 +1570,15 @@ fn rename_stmt(s: &mut Stmt, map: &BTreeMap<String, String>) {
             rename_expr(cond, map);
         }
         Stmt::NumericFor {
+            var,
             start,
             limit,
             step,
             body,
-            ..
         } => {
+            if let Some(new) = map.get(var) {
+                *var = new.clone();
+            }
             rename_expr(start, map);
             rename_expr(limit, map);
             if let Some(s) = step {
@@ -1031,7 +1586,12 @@ fn rename_stmt(s: &mut Stmt, map: &BTreeMap<String, String>) {
             }
             apply_rename(body, map);
         }
-        Stmt::GenericFor { exprs, body, .. } => {
+        Stmt::GenericFor { vars, exprs, body } => {
+            for var in vars.iter_mut() {
+                if let Some(new) = map.get(var) {
+                    *var = new.clone();
+                }
+            }
             exprs.iter_mut().for_each(|e| rename_expr(e, map));
             apply_rename(body, map);
         }
@@ -1093,12 +1653,22 @@ fn collect_all_defs(
     out: &mut BTreeMap<String, Vec<Expr>>,
 ) {
     for s in stmts {
-        if let Stmt::Assign { targets, values } = s {
-            if let (Some(Expr::Var(name)), Some(value)) = (targets.first(), values.first()) {
-                if targets.len() == 1 && candidates.contains(name) {
-                    out.entry(name.clone()).or_default().push(value.clone());
+        match s {
+            Stmt::Local { names, values } => {
+                for (name, value) in names.iter().zip(values.iter()) {
+                    if candidates.contains(name) {
+                        out.entry(name.clone()).or_default().push(value.clone());
+                    }
                 }
             }
+            Stmt::Assign { targets, values } => {
+                if let (Some(Expr::Var(name)), Some(value)) = (targets.first(), values.first()) {
+                    if targets.len() == 1 && candidates.contains(name) {
+                        out.entry(name.clone()).or_default().push(value.clone());
+                    }
+                }
+            }
+            _ => {}
         }
         // Definitions only appear at top level in the current emitter, but recurse so this
         // keeps working once control flow is structured.
@@ -1218,6 +1788,10 @@ pub fn derive_name(e: &Expr) -> Option<String> {
                     }
                 }
             }
+            // game.ReplicatedStorage/game.Players are service aliases and read best as services.
+            if is_var(base, "game") && roblox_service_name(field) {
+                return sanitize(field);
+            }
             // Conventional names for well-known Roblox properties.
             if let Some(n) = roblox_field_name(field) {
                 return Some(n.to_string());
@@ -1233,7 +1807,10 @@ pub fn derive_name(e: &Expr) -> Option<String> {
         }
         // #players -> playerCount ; #t -> count
         Expr::Unary(op, inner) if *op == "#" => Some(length_name(inner)),
+        Expr::Table(fields) => table_collection_name(fields),
         // Boolean-shaped expressions stored in a local: nil checks, emptiness checks.
+        Expr::Binary("and", a, b) => derive_short_circuit_name("and", a, b),
+        Expr::Binary("or", a, b) => derive_short_circuit_name("or", a, b),
         Expr::Binary(op, a, b) => derive_bool_name(op, a, b),
         _ => None,
     }
@@ -1248,14 +1825,76 @@ fn roblox_field_name(field: &str) -> Option<&'static str> {
         "CurrentCamera" => "camera",
         "CFrame" => "cframe",
         "Position" => "position",
+        "Size" => "size",
+        "Color" => "color",
+        "Health" => "health",
+        "MaxHealth" => "maxHealth",
+        "WalkSpeed" => "walkSpeed",
+        "JumpPower" => "jumpPower",
+        "JumpHeight" => "jumpHeight",
+        "MoveDirection" => "moveDirection",
+        "Transparency" => "transparency",
+        "Brightness" => "brightness",
+        "Volume" => "volume",
+        "Text" => "text",
+        "Value" => "value",
         "Velocity" | "AssemblyLinearVelocity" => "velocity",
         "Parent" => "parent",
         _ => return None,
     })
 }
 
+fn roblox_service_name(field: &str) -> bool {
+    matches!(
+        field,
+        "Players"
+            | "ReplicatedStorage"
+            | "ServerStorage"
+            | "ServerScriptService"
+            | "StarterGui"
+            | "StarterPack"
+            | "StarterPlayer"
+            | "RunService"
+            | "TweenService"
+            | "Debris"
+            | "Lighting"
+            | "Workspace"
+            | "CollectionService"
+            | "UserInputService"
+            | "ContextActionService"
+            | "HttpService"
+            | "TeleportService"
+            | "MarketplaceService"
+            | "DataStoreService"
+            | "MemoryStoreService"
+            | "MessagingService"
+            | "BadgeService"
+            | "PhysicsService"
+            | "PathfindingService"
+            | "GuiService"
+            | "InsertService"
+            | "LogService"
+            | "PolicyService"
+            | "ProximityPromptService"
+            | "AnalyticsService"
+            | "ReplicatedFirst"
+            | "Teams"
+            | "VoiceChatService"
+            | "LocalizationService"
+            | "TextService"
+            | "TestService"
+            | "TextChatService"
+            | "SoundService"
+            | "Chat"
+    )
+}
+
 /// Name a boolean-valued local after the shape of its condition.
 fn derive_bool_name(op: &str, a: &Expr, b: &Expr) -> Option<String> {
+    if let Some(name) = positive_bool_compare_name(op, a, b) {
+        return Some(name);
+    }
+
     let noun = |e: &Expr| name_from_value(e).map(|n| upper_first(&n));
     match (op, b) {
         // x ~= nil -> hasX ; x == nil -> missingX
@@ -1268,6 +1907,54 @@ fn derive_bool_name(op: &str, a: &Expr, b: &Expr) -> Option<String> {
         (">", Expr::Num(z)) if z == "0" && matches!(a, Expr::Unary("#", _)) => {
             Some("hasItems".to_string())
         }
+        _ => None,
+    }
+}
+
+fn derive_short_circuit_name(op: &str, a: &Expr, b: &Expr) -> Option<String> {
+    let yielded = match op {
+        "and" => b,
+        "or" => a,
+        _ => return None,
+    };
+    derive_name(yielded).or_else(|| name_from_value(yielded))
+}
+
+fn positive_bool_compare_name(op: &str, a: &Expr, b: &Expr) -> Option<String> {
+    let (subject, literal) = match (bool_lit(a), bool_lit(b)) {
+        (None, Some(value)) => (a, value),
+        (Some(value), None) => (b, value),
+        _ => return None,
+    };
+    let positive = match op {
+        "==" => true,
+        "~=" => false,
+        _ => return None,
+    };
+    if positive != literal {
+        return None;
+    }
+    boolean_subject_name(subject)
+}
+
+fn bool_lit(expr: &Expr) -> Option<bool> {
+    match expr {
+        Expr::Bool(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn boolean_subject_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Field(_, field) => sanitize(&field_to_local_name(field.trim_start_matches('_'))),
+        Expr::Index(_, key) => match key.as_ref() {
+            Expr::Str(lit) => sanitize(&field_to_local_name(&strip_quotes(lit))),
+            _ => None,
+        },
+        Expr::MethodCall(_, method, args) if method == "GetAttribute" => match args.first() {
+            Some(Expr::Str(lit)) => sanitize(&field_to_local_name(&strip_quotes(lit))),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -1288,6 +1975,8 @@ fn derive_from_call(callee: &Expr, args: &[Expr]) -> Option<String> {
             "tick" => return Some("now".to_string()),
             "newproxy" => return Some("proxy".to_string()),
             "select" => return Some("selected".to_string()),
+            "pairs" => return Some("iterator".to_string()),
+            "ipairs" => return Some("iterator".to_string()),
             _ => {}
         }
     }
@@ -1297,11 +1986,13 @@ fn derive_from_call(callee: &Expr, args: &[Expr]) -> Option<String> {
         // Instance.new("Class") -> lowercased class name.
         if owner == "Instance" && member == "new" {
             if let Some(Expr::Str(lit)) = args.first() {
-                return sanitize(&lower_first(&strip_quotes(lit)));
+                let class_name = strip_quotes(lit);
+                return class_name_hint(&class_name)
+                    .or_else(|| sanitize(&lower_first(&class_name)));
             }
         }
         if member == "GetService" {
-            return args.first().and_then(name_from_value);
+            return service_name_arg(args);
         }
         // Roblox datatype constructors: Vector3.new -> vector, Color3.fromRGB -> color, ...
         if let Some(n) = datatype_value_name(&owner) {
@@ -1316,18 +2007,44 @@ fn derive_from_call(callee: &Expr, args: &[Expr]) -> Option<String> {
             ("table", "create") => return Some("list".to_string()),
             ("table", "clone") => return Some("copy".to_string()),
             ("math", "random") => return Some("random".to_string()),
+            ("math", "clamp") => return Some("clamped".to_string()),
+            ("math", "min") => return Some("min".to_string()),
+            ("math", "max") => return Some("max".to_string()),
             ("math", "floor") | ("math", "ceil") | ("math", "round") => {
                 return Some("rounded".to_string())
             }
             ("math", "sqrt") => return Some("root".to_string()),
+            ("math", "abs") => return Some("absolute".to_string()),
+            ("math", "sin") | ("math", "cos") | ("math", "tan") => {
+                return Some("angleValue".to_string())
+            }
+            ("debug", "traceback") => return Some("traceback".to_string()),
             ("os", "time") | ("os", "clock") => return Some("now".to_string()),
             ("os", "date") => return Some("date".to_string()),
             ("task", "wait") => return Some("dt".to_string()),
+            ("task", "spawn") | ("task", "defer") | ("task", "delay") => {
+                return Some("thread".to_string())
+            }
+            ("DateTime", "now")
+            | ("DateTime", "fromUnixTimestamp")
+            | ("DateTime", "fromUnixTimestampMillis")
+            | ("DateTime", "fromUniversalTime")
+            | ("DateTime", "fromLocalTime")
+            | ("DateTime", "fromIsoDate") => return Some("dateTime".to_string()),
+            ("Random", "new") => return Some("random".to_string()),
+            ("RaycastParams", "new") => return Some("raycastParams".to_string()),
+            ("OverlapParams", "new") => return Some("overlapParams".to_string()),
+            ("NumberSequenceKeypoint", "new") => return Some("keypoint".to_string()),
+            ("ColorSequenceKeypoint", "new") => return Some("keypoint".to_string()),
+            ("coroutine", "create") => return Some("thread".to_string()),
+            ("coroutine", "wrap") => return Some("wrapped".to_string()),
+            ("buffer", "create") | ("buffer", "fromstring") => return Some("buffer".to_string()),
             ("string", "format") => return Some("formatted".to_string()),
             ("string", "gsub") => return Some("replaced".to_string()),
             ("string", "split") => return Some("parts".to_string()),
             ("string", "rep") => return Some("repeated".to_string()),
             ("string", "sub") => return Some("substring".to_string()),
+            ("utf8", "len") => return Some("length".to_string()),
             _ => {}
         }
         if member == "new" {
@@ -1346,8 +2063,12 @@ fn derive_from_call(callee: &Expr, args: &[Expr]) -> Option<String> {
 }
 
 fn derive_from_method(recv: &Expr, method: &str, args: &[Expr]) -> Option<String> {
+    if method == "Create" && receiver_mentions(recv, "tween") {
+        return Some("tween".to_string());
+    }
+
     match method {
-        "GetService" => args.first().and_then(name_from_value),
+        "GetService" => service_name_arg(args),
         // Child lookups by literal name: keep the child name verbatim (PascalCase reads well).
         "FindFirstChild" | "WaitForChild" | "FindFirstAncestor" => {
             args.first().and_then(name_from_value)
@@ -1357,7 +2078,10 @@ fn derive_from_method(recv: &Expr, method: &str, args: &[Expr]) -> Option<String
         | "FindFirstChildWhichIsA"
         | "FindFirstAncestorOfClass"
         | "FindFirstAncestorWhichIsA" => match args.first() {
-            Some(Expr::Str(lit)) => sanitize(&lower_first(&strip_quotes(lit))),
+            Some(Expr::Str(lit)) => {
+                let class_name = strip_quotes(lit);
+                class_name_hint(&class_name).or_else(|| sanitize(&lower_first(&class_name)))
+            }
             _ => None,
         },
         // Signal connections -> <event>Connection.
@@ -1391,10 +2115,28 @@ fn derive_from_method(recv: &Expr, method: &str, args: &[Expr]) -> Option<String
         "Dot" => Some("dotProduct".to_string()),
         "Cross" => Some("crossProduct".to_string()),
         "Lerp" => Some("lerped".to_string()),
+        "LoadAnimation" => Some("track".to_string()),
+        "GetMouse" => Some("mouse".to_string()),
         "GetMouseLocation" => Some("mouseLocation".to_string()),
         "GetMouseDelta" => Some("mouseDelta".to_string()),
+        "GetFullName" => Some("fullName".to_string()),
+        "GetDebugId" => Some("debugId".to_string()),
+        "GetBoundingBox" => Some("boundingBox".to_string()),
+        "GetTouchingParts" | "GetPartsInPart" | "GetPartBoundsInBox" | "GetPartBoundsInRadius" => {
+            Some("parts".to_string())
+        }
         "UserOwnsGamePassAsync" => Some("ownsGamePass".to_string()),
         "GetUserIdFromNameAsync" => Some("userId".to_string()),
+        "GetNameFromUserIdAsync" => Some("username".to_string()),
+        "GetRankInGroup" => Some("rank".to_string()),
+        "GetRoleInGroup" => Some("role".to_string()),
+        "IsInGroup" => Some("inGroup".to_string()),
+        "GetProductInfo" => Some("productInfo".to_string()),
+        "GetFriendsAsync" => Some("friendsPages".to_string()),
+        "GetServerTimeNow" => Some("serverTime".to_string()),
+        "CreatePath" => Some("path".to_string()),
+        "GetWaypoints" => Some("waypoints".to_string()),
+        "GetTagged" => Some("tagged".to_string()),
         // Common Roblox/HTTP/DataStore/stdlib result nouns.
         "Clone" => Some("clone".to_string()),
         "GetPivot" => Some("pivot".to_string()),
@@ -1412,6 +2154,21 @@ fn derive_from_method(recv: &Expr, method: &str, args: &[Expr]) -> Option<String
         // GetChildren -> children, GetPlayers -> players, Clone -> clone, etc.
         _ => method_to_noun(method),
     }
+}
+
+fn receiver_mentions(recv: &Expr, needle: &str) -> bool {
+    trailing_noun(recv)
+        .map(|name| name.to_ascii_lowercase().contains(needle))
+        .unwrap_or(false)
+}
+
+fn service_name_arg(args: &[Expr]) -> Option<String> {
+    let arg = if matches!(args.first(), Some(Expr::Var(name)) if name == "game") {
+        args.get(1)
+    } else {
+        args.first()
+    };
+    arg.and_then(name_from_value)
 }
 
 fn upper_first(s: &str) -> String {
@@ -1486,20 +2243,73 @@ fn loop_item_suggestion(coll_expr: &Expr) -> Option<String> {
             }
         }
     }
+    if let Expr::MethodCall(_, method, args) = coll_expr {
+        if method == "GetTagged" {
+            if let Some(Expr::Str(lit)) = args.first() {
+                return sanitize(&singular(&field_to_local_name(&strip_quotes(lit))));
+            }
+            return Some("tagged".to_string());
+        }
+    }
     collection_name(coll_expr).map(|c| singular(&c))
 }
 
 fn singular(s: &str) -> String {
-    if s == "children" {
-        return "child".to_string();
+    singularize(s).unwrap_or_else(|| s.to_string())
+}
+
+fn singularize(name: &str) -> Option<String> {
+    if name == "children" {
+        return Some("child".to_string());
     }
-    if let Some(stem) = s.strip_suffix("ies") {
+    if !name.is_ascii() {
+        return None;
+    }
+
+    let lower = name.to_ascii_lowercase();
+    const NON_PLURAL: &[&str] = &[
+        "status", "data", "address", "class", "process", "bonus", "physics", "analysis", "axis",
+        "props", "series", "species", "news", "progress", "pass", "mass", "boss", "loss", "glass",
+        "lens", "gas", "basis", "access", "success", "focus", "bias", "canvas", "radius", "virus",
+        "index",
+    ];
+    if NON_PLURAL.contains(&lower.as_str()) {
+        return None;
+    }
+
+    let singular = if let Some(stem) = name.strip_suffix("ies") {
+        let prev = stem.chars().last()?;
+        if stem.len() < 3 || "aeiouAEIOU".contains(prev) {
+            return None;
+        }
         format!("{stem}y")
-    } else if s.len() > 1 && s.ends_with('s') && !s.ends_with("ss") {
-        s[..s.len() - 1].to_string()
+    } else if lower.ends_with("ses")
+        || lower.ends_with("xes")
+        || lower.ends_with("zes")
+        || lower.ends_with("ches")
+        || lower.ends_with("shes")
+    {
+        name[..name.len() - 2].to_string()
+    } else if lower.ends_with("oes") {
+        return None;
+    } else if let Some(stem) = name.strip_suffix('s') {
+        let bytes = name.as_bytes();
+        if name.len() < 2 {
+            return None;
+        }
+        let prev = bytes[name.len() - 2].to_ascii_lowercase();
+        if matches!(prev, b's' | b'i' | b'u') {
+            return None;
+        }
+        stem.to_string()
     } else {
-        s.to_string()
+        return None;
+    };
+
+    if singular.eq_ignore_ascii_case(name) || singular.len() < 2 {
+        return None;
     }
+    sanitize(&singular)
 }
 
 fn suffix_base(arg: Option<&Expr>, suffix: &str, default: &str) -> String {
@@ -1521,17 +2331,243 @@ fn datatype_value_name(owner: &str) -> Option<String> {
         "Ray" => "ray",
         "Region3" => "region3",
         "Rect" => "rect",
-        "NumberSequence" | "ColorSequence" => "sequence",
+        "NumberRange" => "numberRange",
+        "NumberSequence" => "numberSequence",
+        "ColorSequence" => "colorSequence",
+        "NumberSequenceKeypoint" | "ColorSequenceKeypoint" => "keypoint",
+        "PathWaypoint" => "waypoint",
+        "PhysicalProperties" => "physicalProperties",
+        "Axes" => "axes",
+        "Faces" => "faces",
+        "CatalogSearchParams" => "catalogSearchParams",
+        "FloatCurveKey" => "key",
+        "RotationCurveKey" => "key",
+        "Secret" => "secret",
         _ => return None,
     };
     Some(name.to_string())
+}
+
+fn class_name_hint(class_name: &str) -> Option<String> {
+    Some(
+        match class_name {
+            "BasePart" | "Part" | "MeshPart" | "UnionOperation" => "part",
+            "Script" | "LocalScript" | "ModuleScript" | "BaseScript" => "script",
+            "Model" | "WorldModel" => "model",
+            "Folder" => "folder",
+            "Attachment" => "attachment",
+            "GuiButton" | "TextButton" | "ImageButton" => "button",
+            "GuiObject" => "guiObject",
+            "Frame" | "ScrollingFrame" | "ViewportFrame" => "frame",
+            "TextLabel" => "label",
+            "TextBox" => "textBox",
+            "ImageLabel" => "image",
+            "ScreenGui" => "screenGui",
+            "SurfaceGui" => "surfaceGui",
+            "BillboardGui" => "billboardGui",
+            "UIListLayout" => "listLayout",
+            "UIGridLayout" => "gridLayout",
+            "UITableLayout" => "tableLayout",
+            "UIPadding" => "padding",
+            "UIStroke" => "stroke",
+            "UICorner" => "corner",
+            "UIScale" => "scale",
+            "UIGradient" => "gradient",
+            "ParticleEmitter" => "emitter",
+            "Beam" => "beam",
+            "Trail" => "trail",
+            "PointLight" | "SpotLight" | "SurfaceLight" => "light",
+            "RemoteEvent" => "remoteEvent",
+            "RemoteFunction" => "remoteFunction",
+            "BindableEvent" => "bindableEvent",
+            "BindableFunction" => "bindableFunction",
+            "Humanoid" => "humanoid",
+            "Animator" => "animator",
+            "Animation" => "animation",
+            "AnimationController" => "animationController",
+            "AnimationTrack" => "track",
+            "Sound" => "sound",
+            "SoundGroup" => "soundGroup",
+            "Tool" => "tool",
+            "Backpack" => "backpack",
+            "Camera" => "camera",
+            "Weld" | "WeldConstraint" | "ManualWeld" => "weld",
+            "Motor6D" => "motor",
+            "ProximityPrompt" => "prompt",
+            "ClickDetector" => "clickDetector",
+            "Decal" | "Texture" => "texture",
+            "SurfaceAppearance" => "surfaceAppearance",
+            "BodyVelocity" | "LinearVelocity" => "velocity",
+            "BodyGyro" | "AlignOrientation" => "alignOrientation",
+            "BodyPosition" | "AlignPosition" => "alignPosition",
+            "VectorForce" => "force",
+            "ObjectValue" => "objectValue",
+            "StringValue" => "stringValue",
+            "NumberValue" | "IntValue" => "numberValue",
+            "BoolValue" => "boolValue",
+            "RaycastParams" => "raycastParams",
+            "OverlapParams" => "overlapParams",
+            other => return sanitize(&lower_first(other)),
+        }
+        .to_string(),
+    )
+}
+
+fn table_collection_name(fields: &[TableField]) -> Option<String> {
+    let names = fields
+        .iter()
+        .filter_map(|field| match field {
+            TableField::Item(value) => name_from_value(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if names.len() < 2 {
+        return None;
+    }
+
+    let known_target_folders = names
+        .iter()
+        .filter(|name| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "npcs"
+                    | "debris"
+                    | "animals"
+                    | "characters"
+                    | "farm"
+                    | "farms"
+                    | "plots"
+                    | "plants"
+                    | "clouds"
+                    | "folders"
+            )
+        })
+        .count();
+    if known_target_folders >= 2 {
+        return Some("targetFolders".to_string());
+    }
+    if names
+        .iter()
+        .any(|name| name.to_ascii_lowercase().contains("folder"))
+    {
+        return Some("folders".to_string());
+    }
+    None
+}
+
+fn param_name_from_field_key(key: &str) -> Option<String> {
+    const GENERIC_FIELD_KEYS: &[&str] = &[
+        "value", "val", "v", "data", "item", "key", "index", "self", "type", "result", "arg", "n",
+    ];
+    let sanitized = sanitize(&field_to_local_name(key.trim_start_matches('_')))?;
+    let trimmed = sanitized.trim_end_matches(|c: char| c.is_ascii_digit());
+    let name = if trimmed.len() >= 2 {
+        trimmed.to_string()
+    } else {
+        sanitized
+    };
+    if name.len() < 2 || GENERIC_FIELD_KEYS.contains(&name.as_str()) {
+        return None;
+    }
+    Some(name)
+}
+
+fn callback_field_name(key: &str) -> Option<String> {
+    let sanitized = sanitize(&field_to_local_name(key.trim_start_matches('_')))?;
+    if sanitized == "callback" || sanitized == "handler" {
+        return Some(sanitized);
+    }
+    if sanitized.starts_with("on")
+        && sanitized
+            .chars()
+            .nth(2)
+            .is_some_and(|c| c.is_ascii_uppercase())
+    {
+        return Some(sanitized);
+    }
+    if sanitized.starts_with("set")
+        && sanitized
+            .chars()
+            .nth(3)
+            .is_some_and(|c| c.is_ascii_uppercase())
+    {
+        return Some(sanitized);
+    }
+    None
+}
+
+fn callback_arg_index(callee: &Expr) -> Option<usize> {
+    if let Some((owner, member)) = call_owner_member(callee) {
+        match (owner.as_str(), member.as_str()) {
+            ("task", "spawn" | "defer") | ("coroutine", "wrap" | "create") => Some(0),
+            ("task", "delay") => Some(1),
+            ("Promise", "new" | "try" | "defer") => Some(0),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+fn type_guard_name<'a>(a: &'a Expr, b: &'a Expr) -> Option<(&'a str, &'a str)> {
+    if let (Some(name), Some(type_name)) = (typeof_call_var(a), string_literal_value(b)) {
+        return Some((name, type_name));
+    }
+    if let (Some(name), Some(type_name)) = (typeof_call_var(b), string_literal_value(a)) {
+        return Some((name, type_name));
+    }
+    None
+}
+
+fn typeof_call_var(expr: &Expr) -> Option<&str> {
+    let Expr::Call(callee, args) = expr else {
+        return None;
+    };
+    let Expr::Var(name) = callee.as_ref() else {
+        return None;
+    };
+    if name != "typeof" && name != "type" || args.len() != 1 {
+        return None;
+    }
+    match args.first() {
+        Some(Expr::Var(var)) => Some(var),
+        _ => None,
+    }
+}
+
+fn string_literal_value(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Str(lit) => Some(lit.trim_matches('"').trim_matches('\'')),
+        _ => None,
+    }
+}
+
+fn type_name_hint(type_name: &str) -> Option<&'static str> {
+    match type_name {
+        "string" => Some("text"),
+        "number" => Some("amount"),
+        "boolean" => Some("enabled"),
+        "Instance" => Some("instance"),
+        "Vector3" | "Vector2" => Some("vector"),
+        "CFrame" => Some("cframe"),
+        "function" => Some("callback"),
+        "table" => Some("data"),
+        _ => None,
+    }
 }
 
 /// A noun extracted from a value used as a path/key (require arg, service name, child name).
 fn name_from_value(e: &Expr) -> Option<String> {
     match e {
         Expr::Str(lit) => last_segment(&strip_quotes(lit)).and_then(|s| sanitize(&s)),
-        Expr::Var(path) => last_segment(path).and_then(|s| sanitize(&s)),
+        Expr::Var(path) => {
+            let segment = last_segment(path)?;
+            if is_synthetic(&segment) || is_parameter(&segment) {
+                None
+            } else {
+                sanitize(&segment)
+            }
+        }
         Expr::Field(_, f) => sanitize(f),
         Expr::Index(_, k) => {
             if let Expr::Str(lit) = k.as_ref() {
@@ -1560,16 +2596,95 @@ fn method_to_noun(method: &str) -> Option<String> {
 /// Name a variable from the call's function identifier, stripping common verb prefixes so
 /// `GetData()` -> `data`, `computeThing()` -> `thing`.
 fn name_from_call_ident(f: &str) -> Option<String> {
-    for prefix in [
-        "Get", "get", "Create", "create", "Make", "New", "Build", "Compute", "Load", "Fetch",
-    ] {
-        if let Some(rest) = f.strip_prefix(prefix) {
-            if !rest.is_empty() && rest.chars().next().unwrap().is_ascii_uppercase() {
-                return sanitize(&lower_first(rest));
+    if let Some(rest) = strip_verb_prefix(f) {
+        return sanitize(&lower_first(rest));
+    }
+    sanitize(&lower_first(f))
+}
+
+fn strip_verb_prefix(name: &str) -> Option<&str> {
+    fn noun_like(rest: &str) -> Option<&str> {
+        if rest.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && !starts_with_connective(rest)
+        {
+            Some(rest)
+        } else {
+            None
+        }
+    }
+
+    const COMPOUND: &[&str] = &["getOr", "findOr", "getAnd", "findAnd"];
+    const SECOND_VERBS: &[&str] = &["Create", "Make", "Build", "Get", "Find", "Spawn"];
+    for compound in COMPOUND {
+        if let Some(rest) = name.strip_prefix(compound) {
+            if !rest.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                continue;
+            }
+            for verb in SECOND_VERBS {
+                if let Some(tail) = rest.strip_prefix(verb) {
+                    return noun_like(tail);
+                }
+            }
+            return noun_like(rest);
+        }
+    }
+
+    const VERBS: &[&str] = &[
+        "Get",
+        "get",
+        "Find",
+        "find",
+        "Create",
+        "create",
+        "Make",
+        "make",
+        "New",
+        "Build",
+        "build",
+        "Compute",
+        "compute",
+        "Load",
+        "load",
+        "Fetch",
+        "fetch",
+        "Ensure",
+        "ensure",
+        "Resolve",
+        "resolve",
+        "Clone",
+        "clone",
+        "Normalize",
+        "normalize",
+        "Spawn",
+        "spawn",
+    ];
+    for verb in VERBS {
+        if let Some(rest) = name.strip_prefix(verb) {
+            if rest.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                return noun_like(rest);
             }
         }
     }
-    sanitize(&lower_first(f))
+    None
+}
+
+fn starts_with_connective(rest: &str) -> bool {
+    const CONNECTIVES: &[&str] = &[
+        "and", "or", "from", "to", "with", "by", "of", "in", "for", "on", "into", "out", "off",
+        "via", "at", "as", "the", "a",
+    ];
+    let mut chars = rest.chars();
+    let mut word = String::new();
+    if let Some(first) = chars.next() {
+        word.push(first.to_ascii_lowercase());
+    }
+    for c in chars {
+        if c.is_ascii_uppercase() {
+            break;
+        }
+        word.push(c.to_ascii_lowercase());
+    }
+    CONNECTIVES.contains(&word.as_str())
 }
 
 fn is_var(e: &Expr, name: &str) -> bool {
@@ -1836,6 +2951,193 @@ mod tests {
     }
 
     #[test]
+    fn pure_builtin_constructors_can_be_inlined_safely() {
+        let color = Expr::Call(
+            Box::new(Expr::Field(
+                Box::new(Expr::Var("Color3".into())),
+                "fromRGB".into(),
+            )),
+            vec![
+                Expr::Num("1".into()),
+                Expr::Num("2".into()),
+                Expr::Num("3".into()),
+            ],
+        );
+        assert!(is_pure(&color));
+
+        let instance = Expr::Call(
+            Box::new(Expr::Field(
+                Box::new(Expr::Var("Instance".into())),
+                "new".into(),
+            )),
+            vec![s("Part")],
+        );
+        assert!(!is_pure(&instance));
+    }
+
+    #[test]
+    fn conflicting_reused_register_defs_do_not_get_one_misleading_name() {
+        let stmts = vec![
+            Stmt::Assign {
+                targets: vec![Expr::Var("v0".into())],
+                values: vec![Expr::Field(
+                    Box::new(Expr::Var("Reference".into())),
+                    "addToReplicatedStorage".into(),
+                )],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("v0".into())],
+                values: vec![call("require", vec![Expr::Var("goodSignal".into())])],
+            },
+            Stmt::Call(Expr::Call(Box::new(Expr::Var("v0".into())), Vec::new())),
+        ];
+
+        let map = smart_rename(&stmts, &[String::from("v0")], false);
+        assert!(!map.contains_key("v0"), "{map:?}");
+    }
+
+    #[test]
+    fn derives_tovek_style_value_names() {
+        let guarded_lookup = Expr::Binary(
+            "and",
+            Box::new(Expr::Var("folder".into())),
+            Box::new(Expr::MethodCall(
+                Box::new(Expr::Var("folder".into())),
+                "FindFirstChild".into(),
+                vec![s("Client")],
+            )),
+        );
+        assert_eq!(derive_name(&guarded_lookup).as_deref(), Some("Client"));
+
+        let fallback = Expr::Binary(
+            "or",
+            Box::new(Expr::Field(
+                Box::new(Expr::Var("player".into())),
+                "Character".into(),
+            )),
+            Box::new(Expr::MethodCall(
+                Box::new(Expr::Field(
+                    Box::new(Expr::Var("player".into())),
+                    "CharacterAdded".into(),
+                )),
+                "Wait".into(),
+                vec![],
+            )),
+        );
+        assert_eq!(derive_name(&fallback).as_deref(), Some("character"));
+
+        let enabled = Expr::Binary(
+            "==",
+            Box::new(Expr::Field(
+                Box::new(Expr::Var("config".into())),
+                "Enabled".into(),
+            )),
+            Box::new(Expr::Bool(true)),
+        );
+        assert_eq!(derive_name(&enabled).as_deref(), Some("enabled"));
+
+        let planted = Expr::Binary(
+            "~=",
+            Box::new(Expr::MethodCall(
+                Box::new(Expr::Var("plot".into())),
+                "GetAttribute".into(),
+                vec![s("IsPlanted")],
+            )),
+            Box::new(Expr::Bool(false)),
+        );
+        assert_eq!(derive_name(&planted).as_deref(), Some("isPlanted"));
+
+        let not_favorite = Expr::Binary(
+            "==",
+            Box::new(Expr::Field(
+                Box::new(Expr::Var("item".into())),
+                "Favorite".into(),
+            )),
+            Box::new(Expr::Bool(false)),
+        );
+        assert_eq!(derive_name(&not_favorite), None);
+    }
+
+    #[test]
+    fn derives_class_and_collection_names() {
+        let text_button = Expr::Call(
+            Box::new(Expr::Field(
+                Box::new(Expr::Var("Instance".into())),
+                "new".into(),
+            )),
+            vec![s("TextButton")],
+        );
+        assert_eq!(derive_name(&text_button).as_deref(), Some("button"));
+
+        let base_part = Expr::MethodCall(
+            Box::new(Expr::Var("model".into())),
+            "FindFirstChildWhichIsA".into(),
+            vec![s("BasePart")],
+        );
+        assert_eq!(derive_name(&base_part).as_deref(), Some("part"));
+
+        let target_folders = Expr::Table(vec![
+            TableField::Item(Expr::Field(
+                Box::new(Expr::Var("workspace".into())),
+                "NPCs".into(),
+            )),
+            TableField::Item(Expr::Field(
+                Box::new(Expr::Var("workspace".into())),
+                "Debris".into(),
+            )),
+        ]);
+        assert_eq!(
+            derive_name(&target_folders).as_deref(),
+            Some("targetFolders")
+        );
+    }
+
+    #[test]
+    fn strips_more_factory_verbs_and_keeps_plural_words_safe() {
+        assert_eq!(
+            derive_name(&call("getOrCreateButton", vec![])).as_deref(),
+            Some("button")
+        );
+        assert_eq!(
+            derive_name(&call("ensureFolder", vec![])).as_deref(),
+            Some("folder")
+        );
+        assert_eq!(
+            derive_name(&call("cloneFromNode", vec![])).as_deref(),
+            Some("cloneFromNode")
+        );
+        assert_eq!(singular("buttons"), "button");
+        assert_eq!(singular("entries"), "entry");
+        assert_eq!(singular("status"), "status");
+        assert_eq!(singular("classes"), "class");
+    }
+
+    #[test]
+    fn field_sink_and_type_guard_hints_name_parameters() {
+        let stmts = vec![Stmt::Assign {
+            targets: vec![Expr::Field(
+                Box::new(Expr::Var("weld".into())),
+                "Part0".into(),
+            )],
+            values: vec![Expr::Var("p0".into())],
+        }];
+        let map = smart_rename(&stmts, &[], false);
+        assert_eq!(map.get("p0").map(String::as_str), Some("part"));
+
+        let stmts = vec![Stmt::If {
+            cond: Expr::Binary(
+                "==",
+                Box::new(call("typeof", vec![Expr::Var("p1".into())])),
+                Box::new(s("string")),
+            ),
+            then_body: vec![Stmt::Return(vec![Expr::Var("p1".into())])],
+            else_body: Vec::new(),
+        }];
+        let map = smart_rename(&stmts, &[], false);
+        assert_eq!(map.get("p1").map(String::as_str), Some("text"));
+    }
+
+    #[test]
     fn keeps_copies_and_literals_unnamed() {
         assert_eq!(derive_name(&Expr::Var("x".into())), None);
         assert_eq!(derive_name(&Expr::Num("3".into())), None);
@@ -2039,5 +3341,491 @@ mod tests {
         }];
         let map = smart_rename_with_event(&stmts, &[], false, None);
         assert_eq!(map.get("v0").map(String::as_str), Some("button"));
+    }
+
+    #[test]
+    fn apply_rename_updates_loop_headers() {
+        let mut stmts = vec![
+            Stmt::NumericFor {
+                var: "i".into(),
+                start: Expr::Num("1".into()),
+                limit: Expr::Var("limit".into()),
+                step: None,
+                body: vec![Stmt::Call(call("print", vec![Expr::Var("i".into())]))],
+            },
+            Stmt::GenericFor {
+                vars: vec!["_".into(), "v0".into()],
+                exprs: vec![Expr::Var("players".into())],
+                body: vec![Stmt::Call(call("print", vec![Expr::Var("v0".into())]))],
+            },
+        ];
+        let map = BTreeMap::from([
+            ("i".to_string(), "index".to_string()),
+            ("v0".to_string(), "player".to_string()),
+        ]);
+
+        apply_rename(&mut stmts, &map);
+
+        match &stmts[0] {
+            Stmt::NumericFor { var, body, .. } => {
+                assert_eq!(var, "index");
+                assert!(matches!(
+                    &body[0],
+                    Stmt::Call(Expr::Call(_, args)) if args == &[Expr::Var("index".into())]
+                ));
+            }
+            _ => panic!("expected numeric for"),
+        }
+        match &stmts[1] {
+            Stmt::GenericFor { vars, body, .. } => {
+                assert_eq!(vars, &["_", "player"]);
+                assert!(matches!(
+                    &body[0],
+                    Stmt::Call(Expr::Call(_, args)) if args == &[Expr::Var("player".into())]
+                ));
+            }
+            _ => panic!("expected generic for"),
+        }
+    }
+
+    #[test]
+    fn local_defs_and_tuple_locals_get_named() {
+        let stmts = vec![
+            Stmt::Local {
+                names: vec!["input".into()],
+                values: vec![Expr::Var("p0".into())],
+            },
+            Stmt::Local {
+                names: vec!["v0".into()],
+                values: vec![Expr::Field(
+                    Box::new(Expr::Var("input".into())),
+                    "Position".into(),
+                )],
+            },
+            Stmt::Local {
+                names: vec!["v1".into(), "v2".into()],
+                values: vec![call("pcall", vec![Expr::Var("callback".into())])],
+            },
+        ];
+
+        let map = smart_rename(&stmts, &["v0".into(), "v1".into(), "v2".into()], false);
+
+        assert_eq!(map.get("v0").map(String::as_str), Some("inputPosition"));
+        assert_eq!(map.get("v1").map(String::as_str), Some("ok"));
+        assert_eq!(map.get("v2").map(String::as_str), Some("result"));
+    }
+
+    #[test]
+    fn expanded_event_callback_parameter_naming() {
+        let stmts = vec![Stmt::Return(vec![
+            Expr::Var("p0".into()),
+            Expr::Var("p1".into()),
+        ])];
+
+        let map = smart_rename_with_event(&stmts, &[], false, Some("Heartbeat"));
+        assert_eq!(map.get("p0").map(String::as_str), Some("deltaTime"));
+
+        let map = smart_rename_with_event(&stmts, &[], false, Some("Stepped"));
+        assert_eq!(map.get("p0").map(String::as_str), Some("time"));
+        assert_eq!(map.get("p1").map(String::as_str), Some("deltaTime"));
+
+        let map = smart_rename_with_event(&stmts, &[], false, Some("CharacterAdded"));
+        assert_eq!(map.get("p0").map(String::as_str), Some("character"));
+
+        let map = smart_rename_with_event(&stmts, &[], false, Some("DescendantAdded"));
+        assert_eq!(map.get("p0").map(String::as_str), Some("descendant"));
+
+        let map = smart_rename_with_event(&stmts, &[], false, Some("AncestryChanged"));
+        assert_eq!(map.get("p0").map(String::as_str), Some("child"));
+        assert_eq!(map.get("p1").map(String::as_str), Some("parent"));
+
+        let map = smart_rename_with_event(&stmts, &[], false, Some("TouchEnded"));
+        assert_eq!(map.get("p0").map(String::as_str), Some("otherPart"));
+    }
+
+    #[test]
+    fn api_slot_receiver_and_callback_names() {
+        let stmts = vec![
+            Stmt::Call(Expr::MethodCall(
+                Box::new(Expr::Var("p0".into())),
+                "IsA".into(),
+                vec![Expr::Var("p1".into())],
+            )),
+            Stmt::Call(Expr::MethodCall(
+                Box::new(Expr::Var("p2".into())),
+                "SetAttribute".into(),
+                vec![Expr::Var("p3".into()), Expr::Var("p4".into())],
+            )),
+            Stmt::Call(Expr::MethodCall(
+                Box::new(Expr::Var("p5".into())),
+                "GetPropertyChangedSignal".into(),
+                vec![Expr::Var("p6".into())],
+            )),
+            Stmt::Call(Expr::MethodCall(
+                Box::new(Expr::Var("p7".into())),
+                "Disconnect".into(),
+                vec![],
+            )),
+            Stmt::Call(Expr::MethodCall(
+                Box::new(Expr::Var("p8".into())),
+                "LoadAnimation".into(),
+                vec![Expr::Var("p9".into())],
+            )),
+            Stmt::Call(call(
+                "pcall",
+                vec![Expr::Var("p10".into()), Expr::Var("payload".into())],
+            )),
+            Stmt::Call(Expr::Call(
+                Box::new(Expr::Field(
+                    Box::new(Expr::Var("task".into())),
+                    "delay".into(),
+                )),
+                vec![Expr::Num("1".into()), Expr::Var("p11".into())],
+            )),
+        ];
+
+        let map = smart_rename(&stmts, &[], false);
+
+        assert_eq!(map.get("p1").map(String::as_str), Some("className"));
+        assert_eq!(map.get("p3").map(String::as_str), Some("attributeName"));
+        assert_eq!(map.get("p6").map(String::as_str), Some("propertyName"));
+        assert_eq!(map.get("p7").map(String::as_str), Some("connection"));
+        assert_eq!(map.get("p8").map(String::as_str), Some("animator"));
+        assert_eq!(map.get("p9").map(String::as_str), Some("animation"));
+        assert_eq!(map.get("p10").map(String::as_str), Some("callback"));
+        assert_eq!(map.get("p11").map(String::as_str), Some("callback2"));
+    }
+
+    #[test]
+    fn table_callback_fields_and_export_tables_are_named() {
+        let stmts = vec![
+            Stmt::Local {
+                names: vec!["v0".into()],
+                values: vec![Expr::Table(vec![
+                    TableField::Named("onClose".into(), Expr::Var("p0".into())),
+                    TableField::Keyed(Expr::Str("\"setVisible\"".into()), Expr::Var("p1".into())),
+                ])],
+            },
+            Stmt::Local {
+                names: vec!["v1".into()],
+                values: vec![Expr::Table(vec![])],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Field(
+                    Box::new(Expr::Var("v1".into())),
+                    "DoThing".into(),
+                )],
+                values: vec![Expr::Closure {
+                    text: "function()\nend".into(),
+                    captures: vec![],
+                }],
+            },
+            Stmt::Return(vec![Expr::Var("v1".into())]),
+        ];
+
+        let map = smart_rename(&stmts, &["v0".into(), "v1".into()], false);
+
+        assert_eq!(map.get("p0").map(String::as_str), Some("onClose"));
+        assert_eq!(map.get("p1").map(String::as_str), Some("setVisible"));
+        assert_eq!(map.get("v1").map(String::as_str), Some("module"));
+    }
+
+    #[test]
+    fn service_aliases_and_more_call_results_are_named() {
+        let dotted_service = Expr::Call(
+            Box::new(Expr::Field(
+                Box::new(Expr::Var("game".into())),
+                "GetService".into(),
+            )),
+            vec![Expr::Var("game".into()), s("Players")],
+        );
+        assert_eq!(derive_name(&dotted_service).as_deref(), Some("Players"));
+
+        let require_synthetic = call("require", vec![Expr::Var("v0".into())]);
+        assert_eq!(derive_name(&require_synthetic), None);
+
+        assert_eq!(
+            derive_name(&Expr::Field(
+                Box::new(Expr::Var("game".into())),
+                "ReplicatedStorage".into()
+            ))
+            .as_deref(),
+            Some("ReplicatedStorage")
+        );
+        assert_eq!(
+            derive_name(&Expr::Call(
+                Box::new(Expr::Field(
+                    Box::new(Expr::Var("RaycastParams".into())),
+                    "new".into(),
+                )),
+                vec![],
+            ))
+            .as_deref(),
+            Some("raycastParams")
+        );
+        assert_eq!(
+            derive_name(&Expr::MethodCall(
+                Box::new(Expr::Var("animator".into())),
+                "LoadAnimation".into(),
+                vec![Expr::Var("animation".into())],
+            ))
+            .as_deref(),
+            Some("track")
+        );
+    }
+
+    #[test]
+    fn much_more_event_callback_parameter_naming() {
+        let stmts = vec![Stmt::Return(vec![
+            Expr::Var("p0".into()),
+            Expr::Var("p1".into()),
+        ])];
+
+        let map = smart_rename_with_event(&stmts, &[], false, Some("OnClientEvent"));
+        assert_eq!(map.get("p0").map(String::as_str), Some("payload"));
+
+        let map = smart_rename_with_event(&stmts, &[], false, Some("OnServerInvoke"));
+        assert_eq!(map.get("p0").map(String::as_str), Some("player"));
+
+        let map = smart_rename_with_event(&stmts, &[], false, Some("Activated"));
+        assert_eq!(map.get("p0").map(String::as_str), Some("input"));
+        assert_eq!(map.get("p1").map(String::as_str), Some("clickCount"));
+
+        let map = smart_rename_with_event(&stmts, &[], false, Some("FocusLost"));
+        assert_eq!(map.get("p0").map(String::as_str), Some("enterPressed"));
+        assert_eq!(map.get("p1").map(String::as_str), Some("input"));
+
+        let map = smart_rename_with_event(&stmts, &[], false, Some("Equipped"));
+        assert_eq!(map.get("p0").map(String::as_str), Some("mouse"));
+
+        let map = smart_rename_with_event(&stmts, &[], false, Some("StateChanged"));
+        assert_eq!(map.get("p0").map(String::as_str), Some("oldState"));
+        assert_eq!(map.get("p1").map(String::as_str), Some("newState"));
+
+        let map = smart_rename_with_event(&stmts, &[], false, Some("Seated"));
+        assert_eq!(map.get("p0").map(String::as_str), Some("active"));
+        assert_eq!(map.get("p1").map(String::as_str), Some("seatPart"));
+
+        let map = smart_rename_with_event(&stmts, &[], false, Some("KeyframeReached"));
+        assert_eq!(map.get("p0").map(String::as_str), Some("keyframeName"));
+    }
+
+    #[test]
+    fn roblox_usage_hints_name_many_receivers_and_arguments() {
+        let stmts = vec![
+            Stmt::Return(vec![
+                Expr::Field(Box::new(Expr::Var("p0".into())), "Health".into()),
+                Expr::Field(Box::new(Expr::Var("p1".into())), "MouseButton1Click".into()),
+                Expr::Field(Box::new(Expr::Var("p2".into())), "Text".into()),
+                Expr::Field(Box::new(Expr::Var("p3".into())), "SoundId".into()),
+                Expr::Field(Box::new(Expr::Var("p4".into())), "FieldOfView".into()),
+                Expr::Field(Box::new(Expr::Var("p5".into())), "Part0".into()),
+            ]),
+            Stmt::Call(Expr::MethodCall(
+                Box::new(Expr::Var("p6".into())),
+                "Kick".into(),
+                vec![],
+            )),
+            Stmt::Call(Expr::MethodCall(
+                Box::new(Expr::Var("p7".into())),
+                "TakeDamage".into(),
+                vec![Expr::Num("10".into())],
+            )),
+            Stmt::Call(Expr::MethodCall(
+                Box::new(Expr::Var("p8".into())),
+                "GetTouchingParts".into(),
+                vec![],
+            )),
+            Stmt::Call(Expr::MethodCall(
+                Box::new(Expr::Var("p9".into())),
+                "JSONDecode".into(),
+                vec![Expr::Var("json".into())],
+            )),
+            Stmt::Call(Expr::MethodCall(
+                Box::new(Expr::Var("p10".into())),
+                "BindAction".into(),
+                vec![
+                    Expr::Var("p11".into()),
+                    Expr::Var("p12".into()),
+                    Expr::Bool(false),
+                ],
+            )),
+            Stmt::Call(Expr::MethodCall(
+                Box::new(Expr::Var("p13".into())),
+                "SetNetworkOwner".into(),
+                vec![Expr::Var("p14".into())],
+            )),
+        ];
+
+        let map = smart_rename(&stmts, &[], false);
+
+        assert_eq!(map.get("p0").map(String::as_str), Some("humanoid"));
+        assert_eq!(map.get("p1").map(String::as_str), Some("button"));
+        assert_eq!(map.get("p2").map(String::as_str), Some("label"));
+        assert_eq!(map.get("p3").map(String::as_str), Some("sound"));
+        assert_eq!(map.get("p4").map(String::as_str), Some("camera"));
+        assert_eq!(map.get("p5").map(String::as_str), Some("weld"));
+        assert_eq!(map.get("p6").map(String::as_str), Some("player"));
+        assert_eq!(map.get("p7").map(String::as_str), Some("humanoid2"));
+        assert_eq!(map.get("p8").map(String::as_str), Some("part"));
+        assert_eq!(map.get("p9").map(String::as_str), Some("httpService"));
+        assert_eq!(
+            map.get("p10").map(String::as_str),
+            Some("contextActionService")
+        );
+        assert_eq!(map.get("p11").map(String::as_str), Some("actionName"));
+        assert_eq!(map.get("p12").map(String::as_str), Some("callback"));
+        assert_eq!(map.get("p13").map(String::as_str), Some("part2"));
+        assert_eq!(map.get("p14").map(String::as_str), Some("player2"));
+    }
+
+    #[test]
+    fn tuple_method_results_and_framework_calls_are_named() {
+        let stmts = vec![
+            Stmt::Local {
+                names: vec!["v0".into(), "v1".into()],
+                values: vec![Expr::MethodCall(
+                    Box::new(Expr::Var("model".into())),
+                    "GetBoundingBox".into(),
+                    vec![],
+                )],
+            },
+            Stmt::Local {
+                names: vec!["v2".into(), "v3".into()],
+                values: vec![Expr::MethodCall(
+                    Box::new(Expr::Var("camera".into())),
+                    "WorldToViewportPoint".into(),
+                    vec![Expr::Var("worldPosition".into())],
+                )],
+            },
+            Stmt::Local {
+                names: vec!["v4".into(), "v5".into(), "v6".into()],
+                values: vec![Expr::MethodCall(
+                    Box::new(Expr::Var("transform".into())),
+                    "ToOrientation".into(),
+                    vec![],
+                )],
+            },
+        ];
+
+        let map = smart_rename(
+            &stmts,
+            &[
+                "v0".into(),
+                "v1".into(),
+                "v2".into(),
+                "v3".into(),
+                "v4".into(),
+                "v5".into(),
+                "v6".into(),
+            ],
+            false,
+        );
+
+        assert_eq!(map.get("v0").map(String::as_str), Some("cframe"));
+        assert_eq!(map.get("v1").map(String::as_str), Some("size"));
+        assert_eq!(map.get("v2").map(String::as_str), Some("screenPoint"));
+        assert_eq!(map.get("v3").map(String::as_str), Some("onScreen"));
+        assert_eq!(map.get("v4").map(String::as_str), Some("x"));
+        assert_eq!(map.get("v5").map(String::as_str), Some("y"));
+        assert_eq!(map.get("v6").map(String::as_str), Some("z"));
+
+        assert_eq!(
+            derive_name(&Expr::MethodCall(
+                Box::new(Expr::Var("tweenService".into())),
+                "Create".into(),
+                vec![
+                    Expr::Var("object".into()),
+                    Expr::Var("info".into()),
+                    Expr::Var("goals".into()),
+                ],
+            ))
+            .as_deref(),
+            Some("tween")
+        );
+        assert_eq!(
+            derive_name(&Expr::MethodCall(
+                Box::new(Expr::Var("pathfindingService".into())),
+                "CreatePath".into(),
+                vec![],
+            ))
+            .as_deref(),
+            Some("path")
+        );
+        assert_eq!(
+            derive_name(&Expr::MethodCall(
+                Box::new(Expr::Var("collectionService".into())),
+                "GetTagged".into(),
+                vec![s("Enemy")],
+            ))
+            .as_deref(),
+            Some("tagged")
+        );
+
+        let loop_stmts = vec![Stmt::GenericFor {
+            vars: vec!["_".into(), "v0".into()],
+            exprs: vec![Expr::MethodCall(
+                Box::new(Expr::Var("collectionService".into())),
+                "GetTagged".into(),
+                vec![s("Enemies")],
+            )],
+            body: vec![],
+        }];
+        let map = smart_rename(&loop_stmts, &[], false);
+        assert_eq!(map.get("v0").map(String::as_str), Some("enemy"));
+    }
+
+    #[test]
+    fn expanded_class_constructor_hints() {
+        let cases = [
+            ("Folder", "folder"),
+            ("Model", "model"),
+            ("Attachment", "attachment"),
+            ("TextBox", "textBox"),
+            ("ScreenGui", "screenGui"),
+            ("WeldConstraint", "weld"),
+            ("Motor6D", "motor"),
+            ("ProximityPrompt", "prompt"),
+            ("ClickDetector", "clickDetector"),
+            ("RaycastParams", "raycastParams"),
+        ];
+
+        for (class_name, expected) in cases {
+            let expr = Expr::Call(
+                Box::new(Expr::Field(
+                    Box::new(Expr::Var("Instance".into())),
+                    "new".into(),
+                )),
+                vec![s(class_name)],
+            );
+            assert_eq!(derive_name(&expr).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn framework_callback_slots_name_arguments() {
+        let bind_render = vec![Stmt::Call(Expr::MethodCall(
+            Box::new(Expr::Var("p0".into())),
+            "BindToRenderStep".into(),
+            vec![
+                Expr::Var("p1".into()),
+                Expr::Num("100".into()),
+                Expr::Var("p2".into()),
+            ],
+        ))];
+        let map = smart_rename(&bind_render, &[], false);
+        assert_eq!(map.get("p0").map(String::as_str), Some("runService"));
+        assert_eq!(map.get("p1").map(String::as_str), Some("renderStepName"));
+        assert_eq!(map.get("p2").map(String::as_str), Some("callback"));
+
+        let promise = vec![Stmt::Call(Expr::Call(
+            Box::new(Expr::Field(
+                Box::new(Expr::Var("Promise".into())),
+                "new".into(),
+            )),
+            vec![Expr::Var("p0".into())],
+        ))];
+        let map = smart_rename(&promise, &[], false);
+        assert_eq!(map.get("p0").map(String::as_str), Some("callback"));
     }
 }

@@ -127,14 +127,26 @@ pub fn render_block(stmts: &[Stmt], indent: usize) -> String {
 }
 
 fn wants_blank_line_between(prev: &Stmt, next: &Stmt, block_len: usize, indent: usize) -> bool {
-    if block_len <= 2 && indent > 0 {
-        return renders_as_function(prev) || renders_as_function(next);
+    if renders_as_comment(prev) || renders_as_comment(next) {
+        return !(renders_as_comment(prev) && renders_as_comment(next));
     }
-    if block_len <= 4 && indent > 0 && matches!(next, Stmt::Return(_)) {
+    if block_len <= 2 && indent > 0 {
+        return renders_as_function(prev)
+            || renders_as_function(next)
+            || renders_as_multiline_value(prev)
+            || renders_as_multiline_value(next);
+    }
+    if block_len <= 4
+        && indent > 0
+        && matches!(next, Stmt::Return(_))
+        && !renders_as_multiline_value(prev)
+    {
         return false;
     }
     renders_as_function(prev)
         || renders_as_function(next)
+        || renders_as_multiline_value(prev)
+        || renders_as_multiline_value(next)
         || renders_as_block(prev)
         || renders_as_block(next)
         || matches!(next, Stmt::Return(_))
@@ -148,6 +160,10 @@ fn renders_as_function(stmt: &Stmt) -> bool {
     }
 }
 
+fn renders_as_comment(stmt: &Stmt) -> bool {
+    matches!(stmt, Stmt::Comment(_))
+}
+
 fn renders_as_block(stmt: &Stmt) -> bool {
     matches!(
         stmt,
@@ -157,6 +173,38 @@ fn renders_as_block(stmt: &Stmt) -> bool {
             | Stmt::NumericFor { .. }
             | Stmt::GenericFor { .. }
     )
+}
+
+fn renders_as_multiline_value(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Local { values, .. } | Stmt::Assign { values, .. } | Stmt::Return(values) => {
+            values.iter().any(expression_renders_multiline)
+        }
+        Stmt::Call(expr) => expression_renders_multiline(expr),
+        _ => false,
+    }
+}
+
+fn expression_renders_multiline(expr: &Expr) -> bool {
+    match expr {
+        Expr::Closure { .. } => true,
+        Expr::Table(fields) => table_needs_multiline(fields),
+        Expr::Index(base, key) => {
+            expression_renders_multiline(base) || expression_renders_multiline(key)
+        }
+        Expr::Field(base, _) => expression_renders_multiline(base),
+        Expr::Call(callee, args) => {
+            expression_renders_multiline(callee) || call_args_need_multiline(args)
+        }
+        Expr::MethodCall(recv, _, args) => {
+            expression_renders_multiline(recv) || call_args_need_multiline(args)
+        }
+        Expr::Unary(_, inner) => expression_renders_multiline(inner),
+        Expr::Binary(_, left, right) => {
+            expression_renders_multiline(left) || expression_renders_multiline(right)
+        }
+        _ => false,
+    }
 }
 
 fn pad(out: &mut String, indent: usize) {
@@ -320,10 +368,46 @@ fn render_if_statement(
     else_body: &[Stmt],
     indent: usize,
 ) {
+    if then_body.is_empty() && !else_body.is_empty() {
+        let negated = negate_condition(cond);
+        pad(out, indent);
+        let _ = writeln!(out, "if {} then", render_expr_at(&negated, indent));
+        out.push_str(&render_block(else_body, indent + 1));
+        pad(out, indent);
+        out.push_str("end\n");
+        return;
+    }
+
     pad(out, indent);
     let _ = writeln!(out, "if {} then", render_expr_at(cond, indent));
     out.push_str(&render_block(then_body, indent + 1));
     render_else_tail(out, else_body, indent);
+}
+
+fn negate_condition(cond: &Expr) -> Expr {
+    match cond {
+        Expr::Unary("not ", inner) => *inner.clone(),
+        Expr::Binary(op, left, right) => {
+            if let Some(inverted) = inverted_comparison(op) {
+                Expr::Binary(inverted, left.clone(), right.clone())
+            } else {
+                Expr::Unary("not ", Box::new(cond.clone()))
+            }
+        }
+        _ => Expr::Unary("not ", Box::new(cond.clone())),
+    }
+}
+
+fn inverted_comparison(op: &str) -> Option<&'static str> {
+    Some(match op {
+        "==" => "~=",
+        "~=" => "==",
+        "<" => ">=",
+        "<=" => ">",
+        ">" => "<=",
+        ">=" => "<",
+        _ => return None,
+    })
 }
 
 fn render_else_tail(out: &mut String, else_body: &[Stmt], indent: usize) {
@@ -380,10 +464,7 @@ fn assignment_function_text(targets: &[Expr], values: &[Expr], indent: usize) ->
 }
 
 fn method_colon_sugar(target: &Expr, text: &str, indent: usize) -> Option<String> {
-    let Expr::Field(base, field) = target else {
-        return None;
-    };
-    let base_name = function_assignment_target(base)?;
+    let (base_name, field) = function_assignment_field_target(target)?;
     let tail = text.strip_prefix("function")?;
     let tail_trimmed = tail.trim_start();
     if !tail_trimmed.starts_with('(') {
@@ -415,13 +496,49 @@ fn method_colon_sugar(target: &Expr, text: &str, indent: usize) -> Option<String
     Some(indent_multiline(&sugar_signature, indent))
 }
 
+fn function_assignment_field_target(target: &Expr) -> Option<(String, String)> {
+    match target {
+        Expr::Field(base, field) => Some((function_assignment_target(base)?, field.clone())),
+        Expr::Index(base, key) => {
+            let Expr::Str(lit) = key.as_ref() else {
+                return None;
+            };
+            let field = unquoted_identifier_key(lit)?;
+            Some((function_assignment_target(base)?, field))
+        }
+        _ => None,
+    }
+}
+
 fn function_assignment_target(target: &Expr) -> Option<String> {
     match target {
         Expr::Var(name) => Some(name.clone()),
         Expr::Field(base, field) => {
             function_assignment_target(base).map(|base| format!("{base}.{field}"))
         }
+        Expr::Index(base, key) => {
+            let Expr::Str(lit) = key.as_ref() else {
+                return None;
+            };
+            let field = unquoted_identifier_key(lit)?;
+            function_assignment_target(base).map(|base| format!("{base}.{field}"))
+        }
         _ => None,
+    }
+}
+
+fn unquoted_identifier_key(lit: &str) -> Option<String> {
+    let key = lit.strip_prefix('"')?.strip_suffix('"')?;
+    if key
+        .bytes()
+        .any(|b| matches!(b, b'\\' | b'\n' | b'\r' | b'\t'))
+    {
+        return None;
+    }
+    if is_luau_identifier(key) {
+        Some(key.to_string())
+    } else {
+        None
     }
 }
 
@@ -459,6 +576,70 @@ fn join_exprs_at(exprs: &[Expr], indent: usize) -> String {
         .join(", ")
 }
 
+fn render_call_args_at(args: &[Expr], indent: usize) -> String {
+    if args.is_empty() {
+        return String::new();
+    }
+    if !call_args_need_multiline(args) {
+        return join_exprs_at(args, indent);
+    }
+
+    let mut out = String::new();
+    out.push('\n');
+    for (index, arg) in args.iter().enumerate() {
+        pad(&mut out, indent + 1);
+        out.push_str(&render_expr_at(arg, indent + 1));
+        if index + 1 < args.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    pad(&mut out, indent);
+    out
+}
+
+fn call_args_need_multiline(args: &[Expr]) -> bool {
+    if args.is_empty() {
+        return false;
+    }
+    if args.len() == 1 && matches!(args[0], Expr::Closure { .. }) {
+        return false;
+    }
+    args.len() > 3
+        || call_inline_len(args) > 92
+        || args.iter().any(call_arg_renders_multiline)
+        || (args.len() > 1 && args.iter().any(|arg| matches!(arg, Expr::Closure { .. })))
+}
+
+fn call_arg_renders_multiline(arg: &Expr) -> bool {
+    match arg {
+        Expr::Closure { .. } => true,
+        Expr::Table(fields) => table_needs_multiline(fields),
+        Expr::Call(callee, args) => {
+            call_args_need_multiline(args) || call_arg_renders_multiline(callee)
+        }
+        Expr::MethodCall(recv, _, args) => {
+            call_args_need_multiline(args) || call_arg_renders_multiline(recv)
+        }
+        Expr::Index(base, key) => {
+            call_arg_renders_multiline(base) || call_arg_renders_multiline(key)
+        }
+        Expr::Field(base, _) => call_arg_renders_multiline(base),
+        Expr::Unary(_, inner) => call_arg_renders_multiline(inner),
+        Expr::Binary(_, left, right) => {
+            call_arg_renders_multiline(left) || call_arg_renders_multiline(right)
+        }
+        _ => false,
+    }
+}
+
+fn call_inline_len(args: &[Expr]) -> usize {
+    args.iter()
+        .map(|arg| render_expr_at(arg, 0).len())
+        .sum::<usize>()
+        + args.len().saturating_sub(1) * 2
+}
+
 fn join_generic_for_exprs_at(exprs: &[Expr], indent: usize) -> String {
     let mut end = exprs.len();
     while end > 1 && matches!(exprs[end - 1], Expr::Nil) {
@@ -479,15 +660,26 @@ fn render_expr_at(e: &Expr, indent: usize) -> String {
         Expr::Str(s) | Expr::Vector(s) | Expr::Var(s) | Expr::Raw(s) => s.clone(),
         Expr::Closure { text, .. } => indent_multiline(text, indent),
         Expr::Vararg => "...".to_string(),
-        Expr::Index(t, k) => format!("{}[{}]", prefix_at(t, indent), render_expr_at(k, indent)),
+        Expr::Index(t, k) => {
+            if let Expr::Str(lit) = k.as_ref() {
+                if let Some(field) = unquoted_identifier_key(lit) {
+                    return format!("{}.{}", prefix_at(t, indent), field);
+                }
+            }
+            format!("{}[{}]", prefix_at(t, indent), render_expr_at(k, indent))
+        }
         Expr::Field(t, f) => format!("{}.{}", prefix_at(t, indent), f),
-        Expr::Call(f, args) => format!("{}({})", prefix_at(f, indent), join_exprs_at(args, indent)),
+        Expr::Call(f, args) => format!(
+            "{}({})",
+            prefix_at(f, indent),
+            render_call_args_at(args, indent)
+        ),
         Expr::MethodCall(o, m, args) => {
             format!(
                 "{}:{}({})",
                 prefix_at(o, indent),
                 m,
-                join_exprs_at(args, indent)
+                render_call_args_at(args, indent)
             )
         }
         Expr::Unary(op, a) => {
@@ -518,8 +710,21 @@ fn render_number(text: &str) -> String {
     let Ok(value) = text.parse::<f64>() else {
         return text.to_string();
     };
-    if !value.is_finite() {
-        return text.to_string();
+    if value.is_infinite() {
+        return if value.is_sign_positive() {
+            "math.huge".to_string()
+        } else {
+            "-math.huge".to_string()
+        };
+    }
+    if value.is_nan() {
+        return "(0 / 0)".to_string();
+    }
+    if value.to_bits() == std::f64::consts::PI.to_bits() {
+        return "math.pi".to_string();
+    }
+    if value.to_bits() == (-std::f64::consts::PI).to_bits() {
+        return "-math.pi".to_string();
     }
 
     let candidate = value.to_string();
@@ -640,7 +845,10 @@ fn render_table(fields: &[TableField], indent: usize) -> String {
 
     let mut out = String::new();
     out.push_str("{\n");
-    for fld in fields {
+    for (index, fld) in fields.iter().enumerate() {
+        if index > 0 && table_wants_blank_line_between(&fields[index - 1], fld) {
+            out.push('\n');
+        }
         pad(&mut out, indent + 1);
         out.push_str(&render_table_field(fld, indent + 1));
         out.push_str(",\n");
@@ -664,6 +872,11 @@ fn render_table_field(fld: &TableField, indent: usize) -> String {
             )
         }
         TableField::Keyed(k, v) => {
+            if let Expr::Str(lit) = k {
+                if let Some(field) = unquoted_identifier_key(lit) {
+                    return format!("{field} = {}", render_expr_at(v, indent));
+                }
+            }
             format!(
                 "[{}] = {}",
                 render_expr_at(k, indent),
@@ -712,10 +925,70 @@ const LUAU_KEYWORDS: &[&str] = &[
 
 fn table_needs_multiline(fields: &[TableField]) -> bool {
     fields.len() > 3
+        || table_is_string_list(fields)
+        || table_inline_len(fields) > 72
         || fields.iter().any(|f| match f {
             TableField::Item(e) | TableField::Named(_, e) => expr_needs_multiline(e),
             TableField::Keyed(k, v) => expr_needs_multiline(k) || expr_needs_multiline(v),
         })
+}
+
+fn table_is_string_list(fields: &[TableField]) -> bool {
+    fields.len() >= 2
+        && fields
+            .iter()
+            .all(|field| matches!(field, TableField::Item(Expr::Str(_))))
+}
+
+fn table_inline_len(fields: &[TableField]) -> usize {
+    // Approximate the inline rendering length. This keeps small scalar tables compact while
+    // wrapping long records/lists before they become hard to scan in decompiled output.
+    2 + fields
+        .iter()
+        .map(|field| render_table_field(field, 0).len())
+        .sum::<usize>()
+        + fields.len().saturating_sub(1) * 2
+}
+
+fn table_wants_blank_line_between(prev: &TableField, next: &TableField) -> bool {
+    table_field_is_function(prev)
+        || table_field_is_function(next)
+        || (table_field_kind(prev) != table_field_kind(next)
+            && (table_field_is_multiline(prev) || table_field_is_multiline(next)))
+}
+
+fn table_field_is_function(field: &TableField) -> bool {
+    matches!(table_field_value(field), Expr::Closure { .. })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableFieldKind {
+    Item,
+    Named,
+    Keyed,
+}
+
+fn table_field_kind(field: &TableField) -> TableFieldKind {
+    match field {
+        TableField::Item(_) => TableFieldKind::Item,
+        TableField::Named(_, _) => TableFieldKind::Named,
+        TableField::Keyed(_, _) => TableFieldKind::Keyed,
+    }
+}
+
+fn table_field_is_multiline(field: &TableField) -> bool {
+    match field {
+        TableField::Item(value) | TableField::Named(_, value) => expr_needs_multiline(value),
+        TableField::Keyed(key, value) => expr_needs_multiline(key) || expr_needs_multiline(value),
+    }
+}
+
+fn table_field_value(field: &TableField) -> &Expr {
+    match field {
+        TableField::Item(value) | TableField::Named(_, value) | TableField::Keyed(_, value) => {
+            value
+        }
+    }
 }
 
 fn expr_needs_multiline(e: &Expr) -> bool {
@@ -724,10 +997,8 @@ fn expr_needs_multiline(e: &Expr) -> bool {
         Expr::Table(fields) => table_needs_multiline(fields),
         Expr::Index(t, k) => expr_needs_multiline(t) || expr_needs_multiline(k),
         Expr::Field(t, _) => expr_needs_multiline(t),
-        Expr::Call(f, args) => expr_needs_multiline(f) || args.iter().any(expr_needs_multiline),
-        Expr::MethodCall(o, _, args) => {
-            expr_needs_multiline(o) || args.iter().any(expr_needs_multiline)
-        }
+        Expr::Call(f, args) => expr_needs_multiline(f) || call_args_need_multiline(args),
+        Expr::MethodCall(o, _, args) => expr_needs_multiline(o) || call_args_need_multiline(args),
         Expr::Unary(_, a) => expr_needs_multiline(a),
         Expr::Binary(_, a, b) => expr_needs_multiline(a) || expr_needs_multiline(b),
         _ => false,
@@ -973,9 +1244,24 @@ mod tests {
         assert_eq!(render_expr(&Expr::Num("0.90000000000000002".into())), "0.9");
         assert_eq!(
             render_expr(&Expr::Num("3.1415926535897931".into())),
-            "3.141592653589793"
+            "math.pi"
         );
         assert_eq!(render_expr(&Expr::Num("42".into())), "42");
+    }
+
+    #[test]
+    fn renders_special_numeric_idioms() {
+        assert_eq!(render_expr(&Expr::Num("inf".into())), "math.huge");
+        assert_eq!(render_expr(&Expr::Num("-inf".into())), "-math.huge");
+        assert_eq!(render_expr(&Expr::Num("nan".into())), "(0 / 0)");
+        assert_eq!(
+            render_expr(&Expr::Num("-3.1415926535897931".into())),
+            "-math.pi"
+        );
+        assert_eq!(
+            render_expr(&Expr::Num("3.141592653589794".into())),
+            "3.141592653589794"
+        );
     }
 
     #[test]
@@ -996,6 +1282,36 @@ mod tests {
         assert!(rendered.contains("elseif b then"), "{rendered}");
         assert!(!rendered.contains("else\n\tif b then"), "{rendered}");
         assert_eq!(rendered.matches("end").count(), 1, "{rendered}");
+    }
+
+    #[test]
+    fn empty_then_else_is_rendered_as_positive_body() {
+        let rendered = render_block(
+            &[Stmt::If {
+                cond: Expr::Binary(
+                    "==",
+                    Box::new(Expr::Var("value".into())),
+                    Box::new(Expr::Nil),
+                ),
+                then_body: Vec::new(),
+                else_body: vec![Stmt::Return(vec![Expr::Var("value".into())])],
+            }],
+            0,
+        );
+        assert_eq!(rendered, "if value ~= nil then\n\treturn value\nend\n");
+
+        let rendered = render_block(
+            &[Stmt::If {
+                cond: Expr::Unary("not ", Box::new(Expr::Var("ready".into()))),
+                then_body: Vec::new(),
+                else_body: vec![Stmt::Call(Expr::Call(
+                    Box::new(Expr::Var("run".into())),
+                    Vec::new(),
+                ))],
+            }],
+            0,
+        );
+        assert_eq!(rendered, "if ready then\n\trun()\nend\n");
     }
 
     #[test]
@@ -1149,6 +1465,21 @@ mod tests {
     }
 
     #[test]
+    fn string_identifier_indexes_use_dot_sugar() {
+        let expr = Expr::Index(
+            Box::new(Expr::Var("module".into())),
+            Box::new(Expr::Str("\"Config\"".into())),
+        );
+        assert_eq!(render_expr(&expr), "module.Config");
+
+        let keyword = Expr::Index(
+            Box::new(Expr::Var("module".into())),
+            Box::new(Expr::Str("\"end\"".into())),
+        );
+        assert_eq!(render_expr(&keyword), "module[\"end\"]");
+    }
+
+    #[test]
     fn table_formatting_styles() {
         let t1 = Expr::Table(vec![
             TableField::Item(Expr::Num("1".into())),
@@ -1168,7 +1499,7 @@ mod tests {
             TableField::Named("key".into(), Expr::Str("\"val\"".into())),
             TableField::Keyed(Expr::Str("\"other\"".into()), Expr::Bool(true)),
         ]);
-        assert_eq!(render_expr(&t3), "{1, key = \"val\", [\"other\"] = true}");
+        assert_eq!(render_expr(&t3), "{1, key = \"val\", other = true}");
 
         let t_keyword = Expr::Table(vec![
             TableField::Named("nil".into(), Expr::Bool(true)),
@@ -1177,6 +1508,18 @@ mod tests {
         assert_eq!(
             render_expr(&t_keyword),
             "{[\"nil\"] = true, [\"has-dash\"] = 1}"
+        );
+
+        let t_string_keys = Expr::Table(vec![
+            TableField::Keyed(Expr::Str("\"Name\"".into()), Expr::Str("\"Gear\"".into())),
+            TableField::Keyed(
+                Expr::Str("\"has-dash\"".into()),
+                Expr::Str("\"kept\"".into()),
+            ),
+        ]);
+        assert_eq!(
+            render_expr(&t_string_keys),
+            "{Name = \"Gear\", [\"has-dash\"] = \"kept\"}"
         );
 
         let t4 = Expr::Table(vec![
@@ -1217,6 +1560,169 @@ mod tests {
             TableField::Item(Expr::Num("4".into())),
         ]);
         assert_eq!(render_expr(&t7), "{\n\t1,\n\t2,\n\t3,\n\t4,\n}");
+
+        let string_list = Expr::Table(vec![
+            TableField::Item(Expr::Str("\"testtestestest\"".into())),
+            TableField::Item(Expr::Str("\"testestestset\"".into())),
+        ]);
+        assert_eq!(
+            render_expr(&string_list),
+            "{\n\t\"testtestestest\",\n\t\"testestestset\",\n}"
+        );
+
+        let long_record = Expr::Table(vec![
+            TableField::Named(
+                "firstLongKey".into(),
+                Expr::Str("\"aaaaaaaaaaaaaaaaaaaaaaaa\"".into()),
+            ),
+            TableField::Named(
+                "secondLongKey".into(),
+                Expr::Str("\"bbbbbbbbbbbbbbbbbbbbbbbb\"".into()),
+            ),
+        ]);
+        assert_eq!(
+            render_expr(&long_record),
+            "{\n\tfirstLongKey = \"aaaaaaaaaaaaaaaaaaaaaaaa\",\n\tsecondLongKey = \"bbbbbbbbbbbbbbbbbbbbbbbb\",\n}"
+        );
+    }
+
+    #[test]
+    fn groups_multiline_table_assignments() {
+        let rendered = render_block(
+            &[
+                Stmt::Local {
+                    names: vec!["cool".into()],
+                    values: vec![Expr::Table(vec![
+                        TableField::Item(Expr::Str("\"testtestestest\"".into())),
+                        TableField::Item(Expr::Str("\"testestestset\"".into())),
+                    ])],
+                },
+                Stmt::Return(vec![Expr::Var("cool".into())]),
+            ],
+            1,
+        );
+
+        assert_eq!(
+            rendered,
+            "\tlocal cool = {\n\t\t\"testtestestest\",\n\t\t\"testestestset\",\n\t}\n\n\treturn cool\n"
+        );
+    }
+
+    #[test]
+    fn table_function_fields_get_spacing() {
+        let rendered = render_expr(&Expr::Table(vec![
+            TableField::Named("Name".into(), Expr::Str("\"Thing\"".into())),
+            TableField::Named(
+                "new".into(),
+                Expr::Closure {
+                    text: "function()\n\treturn {}\nend".into(),
+                    captures: vec![],
+                },
+            ),
+            TableField::Named(
+                "destroy".into(),
+                Expr::Closure {
+                    text: "function(self)\n\tself.Destroyed = true\nend".into(),
+                    captures: vec![],
+                },
+            ),
+        ]));
+
+        assert!(
+            rendered.contains("Name = \"Thing\",\n\n\tnew = function()"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("end,\n\n\tdestroy = function(self)"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn long_calls_wrap_arguments() {
+        let rendered = render_block(
+            &[Stmt::Local {
+                names: vec!["result".into()],
+                values: vec![Expr::Call(
+                    Box::new(Expr::Var("buildWidget".into())),
+                    vec![
+                        Expr::Var("alpha".into()),
+                        Expr::Var("beta".into()),
+                        Expr::Var("gamma".into()),
+                        Expr::Var("delta".into()),
+                    ],
+                )],
+            }],
+            0,
+        );
+
+        assert_eq!(
+            rendered,
+            "local result = buildWidget(\n\talpha,\n\tbeta,\n\tgamma,\n\tdelta\n)\n"
+        );
+
+        let method_rendered = render_expr(&Expr::MethodCall(
+            Box::new(Expr::Var("remote".into())),
+            "FireServer".into(),
+            vec![
+                Expr::Str("\"ReallyLongEventNameThatWouldMakeTheCallHardToRead\"".into()),
+                Expr::Var("payload".into()),
+                Expr::Var("options".into()),
+                Expr::Var("extra".into()),
+            ],
+        ));
+        assert_eq!(
+            method_rendered,
+            "remote:FireServer(\n\t\"ReallyLongEventNameThatWouldMakeTheCallHardToRead\",\n\tpayload,\n\toptions,\n\textra\n)"
+        );
+    }
+
+    #[test]
+    fn multiline_call_args_group_nested_tables_but_keep_single_callbacks_inline() {
+        let table_arg = render_expr(&Expr::Call(
+            Box::new(Expr::Var("configure".into())),
+            vec![Expr::Table(vec![
+                TableField::Item(Expr::Str("\"alpha\"".into())),
+                TableField::Item(Expr::Str("\"beta\"".into())),
+            ])],
+        ));
+        assert_eq!(
+            table_arg,
+            "configure(\n\t{\n\t\t\"alpha\",\n\t\t\"beta\",\n\t}\n)"
+        );
+
+        let callback = render_expr(&Expr::MethodCall(
+            Box::new(Expr::Var("signal".into())),
+            "Connect".into(),
+            vec![Expr::Closure {
+                text: "function()\n\treturn true\nend".into(),
+                captures: vec![],
+            }],
+        ));
+        assert_eq!(callback, "signal:Connect(function()\n\treturn true\nend)");
+    }
+
+    #[test]
+    fn comments_are_grouped_away_from_code() {
+        let rendered = render_block(
+            &[
+                Stmt::Local {
+                    names: vec!["value".into()],
+                    values: vec![Expr::Num("1".into())],
+                },
+                Stmt::Comment("fallback marker".into()),
+                Stmt::Assign {
+                    targets: vec![Expr::Var("value".into())],
+                    values: vec![Expr::Num("2".into())],
+                },
+            ],
+            0,
+        );
+
+        assert_eq!(
+            rendered,
+            "local value = 1\n\n-- fallback marker\n\nvalue = 2\n"
+        );
     }
 
     #[test]
@@ -1237,6 +1743,44 @@ mod tests {
         );
         assert!(
             rendered.contains("function module:foo(x)\n\treturn x\nend"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn indexed_function_assignment_uses_sugar_when_key_is_identifier() {
+        let rendered = render_block(
+            &[
+                Stmt::Assign {
+                    targets: vec![Expr::Index(
+                        Box::new(Expr::Var("module".into())),
+                        Box::new(Expr::Str("\"new\"".into())),
+                    )],
+                    values: vec![Expr::Closure {
+                        text: "function(name)\n\treturn name\nend".into(),
+                        captures: vec![],
+                    }],
+                },
+                Stmt::Assign {
+                    targets: vec![Expr::Index(
+                        Box::new(Expr::Var("module".into())),
+                        Box::new(Expr::Str("\"add\"".into())),
+                    )],
+                    values: vec![Expr::Closure {
+                        text: "function(self, amount)\n\treturn amount\nend".into(),
+                        captures: vec![],
+                    }],
+                },
+            ],
+            0,
+        );
+
+        assert!(
+            rendered.contains("function module.new(name)\n\treturn name\nend"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("function module:add(amount)\n\treturn amount\nend"),
             "{rendered}"
         );
     }

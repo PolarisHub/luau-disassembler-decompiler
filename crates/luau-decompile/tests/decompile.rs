@@ -649,8 +649,8 @@ fn overwritten_pure_temp_stores_are_removed() {
         "dead register initializer survived before overwrite:\n{out}"
     );
     assert!(
-        out.contains("local floor = math.floor(n)"),
-        "real assignment should be promoted after dead-store removal:\n{out}"
+        out.contains("return string.sub(s, 1, n), len, math.floor(n), math.max(n, len)"),
+        "real assignment should be removed or inlined after dead-store removal:\n{out}"
     );
     assert!(
         recompiles(&out, "overwritten_debug_store"),
@@ -663,8 +663,8 @@ fn overwritten_pure_temp_stores_are_removed() {
         "dead stripped register initializer survived before overwrite:\n{out}"
     );
     assert!(
-        out.contains("local rounded = math.floor(p1)"),
-        "stripped math.floor result should be named after the real assignment:\n{out}"
+        out.contains("return string.sub(p0, 1, p1), len, math.floor(p1), math.max(p1, len)"),
+        "stripped math.floor result should be removed or inlined after dead-store removal:\n{out}"
     );
     assert!(
         recompiles(&out, "overwritten_stripped_store"),

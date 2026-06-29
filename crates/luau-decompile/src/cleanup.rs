@@ -4772,6 +4772,12 @@ fn reads_table(e: &Expr) -> bool {
         Expr::Field(..) | Expr::Index(..) => true,
         Expr::Unary(_, a) => reads_table(a),
         Expr::Binary(_, a, b) => reads_table(a) || reads_table(b),
+        Expr::Call(callee, args) => reads_table(callee) || args.iter().any(reads_table),
+        Expr::MethodCall(recv, _, args) => reads_table(recv) || args.iter().any(reads_table),
+        Expr::Table(fields) => fields.iter().any(|field| match field {
+            TableField::Item(value) | TableField::Named(_, value) => reads_table(value),
+            TableField::Keyed(key, value) => reads_table(key) || reads_table(value),
+        }),
         _ => false,
     }
 }
@@ -6553,6 +6559,49 @@ mod tests {
             !rendered.contains("local tmp = {ConstraintType"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn folds_pure_constructor_temps_into_table_literals() {
+        let mut stmts = vec![
+            Stmt::Local {
+                names: vec!["palette".into()],
+                values: vec![Expr::Table(Vec::new())],
+            },
+            Stmt::Local {
+                names: vec!["color".into()],
+                values: vec![Expr::Call(
+                    Box::new(Expr::Field(
+                        Box::new(Expr::Var("Color3".into())),
+                        "fromRGB".into(),
+                    )),
+                    vec![
+                        Expr::Num("71".into()),
+                        Expr::Num("184".into()),
+                        Expr::Num("197".into()),
+                    ],
+                )],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Field(
+                    Box::new(Expr::Var("palette".into())),
+                    "Teal".into(),
+                )],
+                values: vec![Expr::Var("color".into())],
+            },
+            Stmt::Return(vec![Expr::Var("palette".into())]),
+        ];
+
+        single_use_inline(&mut stmts, &BTreeSet::new());
+        fold_table_literals(&mut stmts);
+
+        let rendered = render_block(&stmts, 0);
+        assert!(
+            rendered.contains("Teal = Color3.fromRGB(71, 184, 197)"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("local color"), "{rendered}");
+        assert!(!rendered.contains("palette.Teal"), "{rendered}");
     }
 
     #[test]
