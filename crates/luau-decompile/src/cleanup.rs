@@ -111,7 +111,35 @@ pub fn promote_top_level_initializers(root: &mut [Stmt], exclude: &BTreeSet<Stri
 /// Inline single-use pure temporaries to fixpoint. `protected` names are never inlined
 /// (e.g. registers captured by closures or globals).
 pub fn single_use_inline(root: &mut Vec<Stmt>, protected: &BTreeSet<String>) {
-    while inline_in_block(root, protected) {}
+    // Inlining is strictly block-local: a definition and the use it folds into are always in the
+    // same block (the def->use window is verified to contain no control flow), so a rewrite in one
+    // block never enables a rewrite in another. Reduce each nested block to its own fixpoint FIRST,
+    // then reduce this block — visiting every block once instead of restarting the whole-tree scan
+    // from the root after each rewrite. The per-block result and the restart-from-0 order *within*
+    // a block are unchanged (the same nested-then-flat order the old `while inline_in_block` ran);
+    // only the wasteful cross-block re-traversal is removed.
+    for s in root.iter_mut() {
+        match s {
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                single_use_inline(then_body, protected);
+                single_use_inline(else_body, protected);
+            }
+            Stmt::While { cond, body } | Stmt::Repeat { body, cond } => {
+                let mut loop_protected = protected.clone();
+                loop_protected.extend(reads_of_expr(cond));
+                single_use_inline(body, &loop_protected);
+            }
+            Stmt::NumericFor { body, .. } | Stmt::GenericFor { body, .. } => {
+                single_use_inline(body, protected);
+            }
+            _ => {}
+        }
+    }
+    while flat_inline_once(root, protected) {}
 }
 
 /// Remove dead pure stores; reduce dead call-stores to bare calls. `protected` names are
@@ -4404,13 +4432,38 @@ fn collect_goto_names(stmt: &Stmt, names: &mut BTreeSet<String>) {
 
 // --- inlining --------------------------------------------------------------------------
 
-fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool {
-    // Recurse into nested blocks first.
-    for s in block.iter_mut() {
-        if inline_nested_block(s, protected) {
-            return true;
+/// One flat (non-recursive) inline within `block`: find the first foldable single-use definition
+/// and inline it, returning whether it did. The caller loops this to the block's fixpoint; nested
+/// blocks are reduced separately by [`single_use_inline`].
+fn flat_inline_once(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool {
+    // Only LARGE blocks suffer the within-block O(n^2) (`next_def` scanning to end-of-block and the
+    // goto-prefix check, for each of n candidates). For them, precompute per-name read/write
+    // positions and a goto prefix ONCE — built from the exact same helpers (`writes_of_stmt`,
+    // `count_uses_stmt`, `stmt_contains_goto`) so the lookups are identical to the direct scans.
+    // Small blocks keep the direct scans: there the index build would cost more than it saves.
+    type InlineIndex = (
+        Vec<bool>,
+        BTreeMap<String, Vec<usize>>,
+        BTreeMap<String, Vec<(usize, usize)>>,
+    );
+    let index: Option<InlineIndex> = (block.len() > 64).then(|| {
+        let mut goto_before = Vec::with_capacity(block.len() + 1);
+        goto_before.push(false);
+        let mut writes_at: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        let mut reads_at: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
+        for (k, s) in block.iter().enumerate() {
+            goto_before.push(goto_before[k] || stmt_contains_goto(s));
+            for w in writes_of_stmt(s) {
+                writes_at.entry(w).or_default().push(k);
+            }
+            let mut rc = BTreeMap::new();
+            count_uses_stmt(s, &mut rc);
+            for (name, count) in rc {
+                reads_at.entry(name).or_default().push((k, count));
+            }
         }
-    }
+        (goto_before, writes_at, reads_at)
+    });
 
     for i in 0..block.len() {
         let Some((name, val)) = sole_var_assign_ref(&block[i]) else {
@@ -4429,15 +4482,32 @@ fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool 
 
         // The definition's value is live until `name` is next written. Work only within a
         // straight-line window up to that point so we can see every use of THIS value.
-        let next_def = ((i + 1)..block.len())
-            .find(|&k| stmt_writes_var(&block[k], name))
-            .unwrap_or(block.len());
-        let reads: Vec<(usize, usize)> = ((i + 1)..next_def)
-            .filter_map(|k| {
-                let count = stmt_read_count(&block[k], name);
-                (count > 0).then_some((k, count))
-            })
-            .collect();
+        let next_def = match &index {
+            Some((_, writes_at, _)) => writes_at
+                .get(name)
+                .and_then(|ws| ws.iter().find(|&&k| k > i).copied())
+                .unwrap_or(block.len()),
+            None => ((i + 1)..block.len())
+                .find(|&k| stmt_writes_var(&block[k], name))
+                .unwrap_or(block.len()),
+        };
+        let reads: Vec<(usize, usize)> = match &index {
+            Some((_, _, reads_at)) => reads_at
+                .get(name)
+                .map(|rs| {
+                    rs.iter()
+                        .filter(|&&(k, _)| k > i && k < next_def)
+                        .copied()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            None => ((i + 1)..next_def)
+                .filter_map(|k| {
+                    let count = stmt_read_count(&block[k], name);
+                    (count > 0).then_some((k, count))
+                })
+                .collect(),
+        };
         if reads.is_empty() {
             continue;
         }
@@ -4447,7 +4517,11 @@ fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool 
         if replaceable_reads == 0 {
             continue;
         }
-        if block[..i].iter().any(stmt_contains_goto) {
+        let goto_before_i = match &index {
+            Some((goto_before, _, _)) => goto_before[i],
+            None => block[..i].iter().any(stmt_contains_goto),
+        };
+        if goto_before_i {
             continue; // an earlier goto may jump a label into this value's def->use window;
                       // break/continue only exit to loop boundaries, never into the window
         }
@@ -4507,25 +4581,6 @@ fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool 
         return true;
     }
     false
-}
-
-fn inline_nested_block(s: &mut Stmt, protected: &BTreeSet<String>) -> bool {
-    match s {
-        Stmt::If {
-            then_body,
-            else_body,
-            ..
-        } => inline_in_block(then_body, protected) || inline_in_block(else_body, protected),
-        Stmt::While { cond, body } | Stmt::Repeat { body, cond } => {
-            let mut loop_protected = protected.clone();
-            loop_protected.extend(reads_of_expr(cond));
-            inline_in_block(body, &loop_protected)
-        }
-        Stmt::NumericFor { body, .. } | Stmt::GenericFor { body, .. } => {
-            inline_in_block(body, protected)
-        }
-        _ => false,
-    }
 }
 
 /// The variable read first when evaluating an expression (its receiver/leftmost operand),
