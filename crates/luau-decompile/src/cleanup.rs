@@ -2710,7 +2710,10 @@ pub fn fold_table_literals(root: &mut Vec<Stmt>) {
             root.remove(idx);
         }
 
-        i = 0;
+        // Re-examine the just-folded table (it may absorb further writes) but do NOT restart
+        // from index 0: folding the table at `i` only rewrites `root[i]` and removes statements
+        // after it, so no earlier table's foldability can change. Restarting was an O(tables·n)
+        // re-scan that dominated large table-building protos.
     }
 }
 

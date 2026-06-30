@@ -82,6 +82,7 @@ struct ClosureJob {
 }
 
 /// A pre-decompiled child closure, cached by its creation PC for `closure_expr` to consume.
+#[derive(Clone)]
 struct CachedClosure {
     expr: Expr,
     /// Whether the child (or any of its descendants) decompiled to a partial result.
@@ -244,9 +245,7 @@ fn decompile_proto(
         d.closure_cache.insert(pc, CachedClosure { expr, partial });
     }
 
-    let _m0 = std::time::Instant::now();
     let mut stmts = d.run();
-    let _m1 = std::time::Instant::now();
 
     // Remove unreachable code left after returns/breaks by inline-cache flushes.
     cleanup::drop_unreachable(&mut stmts);
@@ -319,7 +318,6 @@ fn decompile_proto(
     cleanup::recover_unstructured_backward_loops(&mut stmts);
     // A constant `1` step on a numeric for is implicit.
     drop_unit_for_steps(&mut stmts);
-    let _m2 = std::time::Instant::now();
 
     // Locals that still need a hoisted declaration (a sole-Var assignment survived),
     // excluding parameters and upvalues.
@@ -350,7 +348,6 @@ fn decompile_proto(
     // Now that this function's locals have their final names, rewrite the `u0`/`u1`/… upvalue
     // placeholders inside each nested closure to the captured local's name.
     d.resolve_closures(&mut stmts, &rename);
-    let _m3 = std::time::Instant::now();
     cleanup::promote_top_level_initializers(&mut stmts, &non_local);
     cleanup::fold_table_literals(&mut stmts);
     cleanup::inline_table_literal_fill_temps(&mut stmts);
@@ -471,47 +468,6 @@ fn decompile_proto(
     cleanup::simplify_redundant_conditions(&mut stmts);
     cleanup::drop_trailing_empty_return(&mut stmts);
     let hoist_names = cleanup::assigned_locals(&stmts, &non_local);
-
-    if std::env::var_os("DECOMP_PROF").is_some() {
-        let m4 = std::time::Instant::now();
-        let total = m4 - _m0;
-        if total.as_millis() > 50 {
-            eprintln!(
-                "PROF proto={proto_idx} total={:?} run={:?}[pre={:.1}ms emit={:.1}ms post={:.1}ms insns={} emit_iters={}] pre+fix1={:?} naming={:?} post={:?} gc_scan={}",
-                total,
-                _m1 - _m0,
-                d.rt_pre as f64 / 1e6,
-                d.rt_emit as f64 / 1e6,
-                d.rt_post as f64 / 1e6,
-                d.insn_count,
-                d.emit_iters,
-                _m2 - _m1,
-                _m3 - _m2,
-                m4 - _m3,
-                d.gc_scan.get(),
-            );
-            if d.rt_emit > 1_000_000_000 {
-                let mut hist: Vec<(usize, u64, u64)> = (0..256)
-                    .map(|i| (i, d.op_ns[i], d.op_cnt[i]))
-                    .filter(|x| x.1 > 0)
-                    .collect();
-                hist.sort_by_key(|x| std::cmp::Reverse(x.1));
-                let top: Vec<String> = hist
-                    .iter()
-                    .take(8)
-                    .map(|(op, ns, cnt)| {
-                        format!(
-                            "{:?}={:.0}ms/{}",
-                            Opcode::from_u8(*op as u8),
-                            *ns as f64 / 1e6,
-                            cnt
-                        )
-                    })
-                    .collect();
-                eprintln!("PROF_OPS proto={proto_idx} {}", top.join(" "));
-            }
-        }
-    }
 
     // Determine `partial` from the FINAL tree: a proto is partial only if some unstructured
     // control flow (a goto/label) survived all recovery passes, or a nested closure was partial.
@@ -666,14 +622,6 @@ struct Decompiler<'a> {
     /// locals — doing so would turn a global write into a local one.
     globals: BTreeSet<String>,
     notes: Vec<String>,
-    gc_scan: std::cell::Cell<u64>,
-    rt_pre: u64,
-    rt_emit: u64,
-    rt_post: u64,
-    insn_count: u64,
-    emit_iters: u64,
-    op_ns: [u64; 256],
-    op_cnt: [u64; 256],
     /// Child closures pre-decompiled before `run()`, keyed by their creation PC. `closure_expr`
     /// removes from this as `run()` reaches each NEWCLOSURE/DUPCLOSURE.
     closure_cache: BTreeMap<usize, CachedClosure>,
@@ -696,35 +644,21 @@ impl<'a> Decompiler<'a> {
             globals: BTreeSet::new(),
             notes: Vec::new(),
             closure_cache: BTreeMap::new(),
-            gc_scan: std::cell::Cell::new(0),
-            rt_pre: 0,
-            rt_emit: 0,
-            rt_post: 0,
-            insn_count: 0,
-            emit_iters: 0,
-            op_ns: [0; 256],
-            op_cnt: [0; 256],
         }
     }
 
     fn run(&mut self) -> Vec<Stmt> {
-        let _t = std::time::Instant::now();
         self.loop_back = self.compute_loop_back();
         self.captured_regs = self.compute_captured_regs();
-        self.rt_pre = _t.elapsed().as_nanos() as u64;
         let mut stmts = Vec::new();
         let mut pending = None;
-        let _t2 = std::time::Instant::now();
         self.emit_range(0, self.proto.code.len(), &mut stmts, &mut pending, None);
-        self.rt_emit = _t2.elapsed().as_nanos() as u64;
 
         // Drop labels nothing jumps to (recursively). Structured regions don't reference
         // their internal targets, and the FASTCALL skip-over is never a goto, so those labels
         // (not even valid Luau on their own) are removed.
-        let _t3 = std::time::Instant::now();
         let referenced = collect_goto_targets(&stmts);
         retain_referenced_labels(&mut stmts, &referenced);
-        self.rt_post = _t3.elapsed().as_nanos() as u64;
         stmts
     }
 
@@ -770,7 +704,6 @@ impl<'a> Decompiler<'a> {
     ) {
         let mut pc = lo;
         while pc < hi {
-            self.emit_iters += 1;
             let insn = self.proto.code[pc];
             let op = match Opcode::from_u8(insn_op(insn)) {
                 Some(o) => o,
@@ -878,11 +811,7 @@ impl<'a> Decompiler<'a> {
 
             // Straight-line (or goto fallback for unstructured control flow).
             self.maybe_label(pc, stmts);
-            let _op_t = std::time::Instant::now();
             self.step(op, pc, stmts, pending);
-            let _op_idx = insn_op(insn) as usize;
-            self.op_ns[_op_idx] += _op_t.elapsed().as_nanos() as u64;
-            self.op_cnt[_op_idx] += 1;
             pc += len;
         }
     }
@@ -1219,7 +1148,6 @@ impl<'a> Decompiler<'a> {
         let mut jumps: Vec<usize> = Vec::new();
         let mut p = pc;
         while p < hi {
-            self.gc_scan.set(self.gc_scan.get() + 1);
             let op = Opcode::from_u8(insn_op(self.proto.code[p]))?;
             if is_conditional_jump(op) {
                 jumps.push(p);
@@ -1668,7 +1596,6 @@ impl<'a> Decompiler<'a> {
         stmts: &mut Vec<Stmt>,
         pending_namecall: &mut Option<(u8, Expr, String)>,
     ) {
-        self.insn_count += 1;
         let insn = self.proto.code[pc];
         let aux = self.proto.code.get(pc + 1).copied().unwrap_or(0);
         let a = insn_a(insn);
@@ -2102,12 +2029,17 @@ impl<'a> Decompiler<'a> {
     }
 
     fn closure_expr(&mut self, child_idx: usize, pc: usize) -> Expr {
-        // Fast path: consume the child decompiled up-front (possibly on another core).
-        if let Some(cached) = self.closure_cache.remove(&pc) {
+        // Fast path: read the child decompiled up-front (possibly on another core). The lookup
+        // is NON-consuming (clone, not remove): a speculative structural emit (e.g. a `while`
+        // setup-scan that bails) can `step()` through this NEWCLOSURE before the real emit does,
+        // and a consuming lookup would leave the second, real visit to fall through to the
+        // (catastrophic) inline re-decompile below. Cloning the cached literal is microseconds;
+        // re-decompiling a giant child is tens of seconds.
+        if let Some(cached) = self.closure_cache.get(&pc) {
             if cached.partial {
                 self.has_partial_child = true;
             }
-            return cached.expr;
+            return cached.expr.clone();
         }
         // Defensive fallback: the pre-scan and `run()` agree on which PCs create closures, so
         // this is unreached in practice. Decompile inline if they ever diverge, keeping output
