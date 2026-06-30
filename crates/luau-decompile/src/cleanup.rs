@@ -2341,26 +2341,36 @@ pub fn remove_dead_literal_markers(root: &mut Vec<Stmt>) {
     remove_dead_literal_markers_with_continuation(root, &[]);
 }
 
-fn remove_dead_literal_markers_with_continuation(root: &mut Vec<Stmt>, continuation: &[Stmt]) {
+/// The statements that execute after the current block, as a chain of borrowed slices (innermost
+/// first). This is what a literal marker must survive un-overwritten-and-unread to be dead. It is
+/// only ever read, so it is passed by reference — never the per-statement deep clone it used to be.
+fn remove_dead_literal_markers_with_continuation(root: &mut Vec<Stmt>, continuation: &[&[Stmt]]) {
     for i in 0..root.len() {
-        let mut after_stmt = root[i + 1..].to_vec();
-        after_stmt.extend_from_slice(continuation);
-        match &mut root[i] {
-            Stmt::If {
+        // Only an `If` propagates this block's tail as its branches' continuation; loops use an
+        // empty continuation and plain statements never recurse. `split_at_mut` lets us mutate the
+        // `If` at index `i` while borrowing the tail `root[i+1..]` as the child continuation —
+        // exactly the two borrows the old per-statement `.to_vec()` deep clone worked around.
+        if matches!(root[i], Stmt::If { .. }) {
+            let (head, tail) = root.split_at_mut(i + 1);
+            let tail: &[Stmt] = tail;
+            let mut child: Vec<&[Stmt]> = Vec::with_capacity(continuation.len() + 1);
+            child.push(tail);
+            child.extend_from_slice(continuation);
+            if let Stmt::If {
                 then_body,
                 else_body,
                 ..
-            } => {
-                remove_dead_literal_markers_with_continuation(then_body, &after_stmt);
-                remove_dead_literal_markers_with_continuation(else_body, &after_stmt);
+            } = &mut head[i]
+            {
+                remove_dead_literal_markers_with_continuation(then_body, &child);
+                remove_dead_literal_markers_with_continuation(else_body, &child);
             }
-            Stmt::While { body, .. }
-            | Stmt::Repeat { body, .. }
-            | Stmt::NumericFor { body, .. }
-            | Stmt::GenericFor { body, .. } => {
-                remove_dead_literal_markers_with_continuation(body, &[]);
-            }
-            _ => {}
+        } else if let Stmt::While { body, .. }
+        | Stmt::Repeat { body, .. }
+        | Stmt::NumericFor { body, .. }
+        | Stmt::GenericFor { body, .. } = &mut root[i]
+        {
+            remove_dead_literal_markers_with_continuation(body, &[]);
         }
     }
 
@@ -2378,8 +2388,9 @@ fn remove_dead_literal_markers_with_continuation(root: &mut Vec<Stmt>, continuat
     }
 }
 
-fn literal_marker_dead_before_read(stmts: &[Stmt], continuation: &[Stmt], name: &str) -> bool {
-    match marker_sequence_flow(stmts.iter().chain(continuation), name) {
+fn literal_marker_dead_before_read(stmts: &[Stmt], continuation: &[&[Stmt]], name: &str) -> bool {
+    let cont = continuation.iter().flat_map(|s| s.iter());
+    match marker_sequence_flow(stmts.iter().chain(cont), name) {
         MarkerFlow::Read | MarkerFlow::Open => false,
         MarkerFlow::Killed => true,
     }
@@ -4408,7 +4419,10 @@ fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool 
         if protected.contains(&name) {
             continue;
         }
-        if reads_of_expr(&val).contains(&name) {
+        // Computed once and reused for the self-reference test and the interference check below
+        // (`val` is not mutated in between).
+        let val_reads = reads_of_expr(&val);
+        if val_reads.contains(&name) {
             continue; // self-referential definition (a refinement); leave it
         }
         // Pure values can move anywhere (interference-checked). An impure value (a call) may
@@ -4419,7 +4433,7 @@ fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool 
         // The definition's value is live until `name` is next written. Work only within a
         // straight-line window up to that point so we can see every use of THIS value.
         let next_def = ((i + 1)..block.len())
-            .find(|&k| writes_of_stmt(&block[k]).contains(&name))
+            .find(|&k| stmt_writes_var(&block[k], &name))
             .unwrap_or(block.len());
         let reads: Vec<(usize, usize)> = ((i + 1)..next_def)
             .filter_map(|k| {
@@ -4445,7 +4459,6 @@ fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool 
         }
 
         // Interference check on the statements strictly between def and use.
-        let inputs = reads_of_expr(&val);
         let needs_no_effects = reads_table(&val) || impure;
         let mut safe = true;
         for stmt in &block[i + 1..j] {
@@ -4453,7 +4466,7 @@ fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool 
                 safe = false;
                 break;
             }
-            if !writes_of_stmt(stmt).is_disjoint(&inputs) {
+            if stmt_writes_any_of(stmt, &val_reads) {
                 safe = false;
                 break;
             }
@@ -4951,6 +4964,52 @@ fn writes_of_stmt(s: &Stmt) -> BTreeSet<String> {
     }
     walk(s, &mut out);
     out
+}
+
+/// Whether `s` writes `name` anywhere — `writes_of_stmt(s).contains(name)` without the BTreeSet
+/// allocation. Mirrors `writes_of_stmt`'s arms and recursion (via `for_each_block`) exactly, so it
+/// is membership-identical; used in the hot `single_use_inline` scan where it ran once per
+/// (candidate, statement) pair.
+fn stmt_writes_var(s: &Stmt, name: &str) -> bool {
+    let direct = match s {
+        Stmt::Assign { targets, .. } => targets
+            .iter()
+            .any(|t| matches!(t, Expr::Var(n) if n == name)),
+        Stmt::Local { names, .. } => names.iter().any(|n| n == name),
+        Stmt::NumericFor { var, .. } => var == name,
+        Stmt::GenericFor { vars, .. } => vars.iter().any(|v| v == name),
+        _ => false,
+    };
+    if direct {
+        return true;
+    }
+    let mut found = false;
+    for_each_block(s, |b| {
+        found = found || b.iter().any(|st| stmt_writes_var(st, name));
+    });
+    found
+}
+
+/// Whether `s` writes any name in `set` — `!writes_of_stmt(s).is_disjoint(set)` without the
+/// allocation. Mirrors `writes_of_stmt` exactly.
+fn stmt_writes_any_of(s: &Stmt, set: &BTreeSet<String>) -> bool {
+    let direct = match s {
+        Stmt::Assign { targets, .. } => targets
+            .iter()
+            .any(|t| matches!(t, Expr::Var(n) if set.contains(n))),
+        Stmt::Local { names, .. } => names.iter().any(|n| set.contains(n)),
+        Stmt::NumericFor { var, .. } => set.contains(var),
+        Stmt::GenericFor { vars, .. } => vars.iter().any(|v| set.contains(v)),
+        _ => false,
+    };
+    if direct {
+        return true;
+    }
+    let mut found = false;
+    for_each_block(s, |b| {
+        found = found || b.iter().any(|st| stmt_writes_any_of(st, set));
+    });
+    found
 }
 
 /// Whether a statement performs an observable side effect (a call, or a write through a
@@ -6648,14 +6707,20 @@ fn collect_split_candidates_recursive(
 }
 
 pub fn split_reused_registers(stmts: &mut [Stmt], protected: &BTreeSet<String>) {
-    if count_stmts(stmts) > 600 {
+    // This pass is O(candidates * statements) per block. The bounds below are a safety valve
+    // against pathological single protos only — they sit far above any real Roblox module (the
+    // 22k-line fixtures stay well under), so large protos now get full register splitting (which
+    // markedly improves naming on them) and still finish within the server's time budget. The
+    // upstream fixpoint passes were made near-linear, so raising these from the old 600/80 no
+    // longer risks a timeout.
+    if count_stmts(stmts) > 20_000 {
         return;
     }
     let mut unsplittable = protected.clone();
     collect_unsplittable(stmts, false, &mut unsplittable);
     let mut candidates = BTreeSet::new();
     collect_split_candidates_recursive(stmts, &unsplittable, &mut candidates);
-    if candidates.len() > 80 {
+    if candidates.len() > 2_000 {
         return;
     }
     split_reused_registers_in_block(stmts, &unsplittable);
