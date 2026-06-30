@@ -21,6 +21,9 @@ mod cleanup;
 mod naming;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
+
+use rayon::prelude::*;
 
 use ast::{render_block, render_expr, Capture, Expr, Stmt, TableField};
 use luau_bytecode::opcode::*;
@@ -29,6 +32,121 @@ use luau_disasm::{compute_labels, render_constant_at};
 
 const GOTO_STRUCTURING_NOTE: &str =
     "control flow rendered with goto/labels (structuring incomplete)";
+
+/// Modules with more protos than this decompile their proto tree across cores. Smaller
+/// modules stay single-threaded: they are already sub-millisecond, so the thread-pool
+/// hand-off would only add latency. The decompile of each proto is a pure function of the
+/// (immutable) `Module`, so parallelism is race-free and byte-for-byte identical.
+const PARALLEL_PROTO_THRESHOLD: usize = 48;
+
+/// The proto-count threshold above which the proto tree is decompiled across cores. Defaults
+/// to [`PARALLEL_PROTO_THRESHOLD`]; `LUAU_DECOMPILE_PARALLEL_THRESHOLD` overrides it (set it
+/// very high to force single-threaded decompilation — a kill-switch and an A/B test hook).
+fn parallel_threshold() -> usize {
+    static T: OnceLock<usize> = OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("LUAU_DECOMPILE_PARALLEL_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(PARALLEL_PROTO_THRESHOLD)
+    })
+}
+
+/// Configure rayon's global pool with a generous stack once, before the first parallel
+/// decompile. Proto trees recurse (a closure decompiles its children, whose cleanup passes
+/// recurse over deeply-nested blocks); the default 2 MiB worker stack can be too small for
+/// the giant protos in obfuscated modules, where the single-threaded main stack would cope.
+/// The reserve is lazily committed, so it costs address space, not memory.
+fn ensure_pool() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let _ = rayon::ThreadPoolBuilder::new()
+            .stack_size(256 * 1024 * 1024)
+            .build_global();
+    });
+}
+
+/// One child closure to decompile, discovered by a static pre-scan of the parent's bytecode.
+/// Everything here is read-only data, so a batch of jobs can be decompiled in parallel.
+struct ClosureJob {
+    /// PC of the NEWCLOSURE/DUPCLOSURE in the parent — the key `closure_expr` looks up.
+    pc: usize,
+    /// Flat module proto index of the child.
+    child_idx: usize,
+    /// Whether the closure is used method-style (`obj:m()`), so its first param renders `self`.
+    is_method: bool,
+    /// The event name if the closure is a `:Connect`-style handler (drives parameter naming).
+    event_name: Option<String>,
+    /// The ordered upvalue captures backing the closure (read from following CAPTURE insns).
+    captures: Vec<Capture>,
+}
+
+/// A pre-decompiled child closure, cached by its creation PC for `closure_expr` to consume.
+struct CachedClosure {
+    expr: Expr,
+    /// Whether the child (or any of its descendants) decompiled to a partial result.
+    partial: bool,
+}
+
+/// Build the `function(...) ... end` literal for a decompiled child. Pulled out of
+/// `closure_expr` so the parallel workers can produce the finished expression themselves.
+fn build_closure_expr(
+    module: &Module,
+    child_idx: usize,
+    res: &ProtoDecompileResult,
+    captures: Vec<Capture>,
+) -> Expr {
+    let child = &module.protos[child_idx];
+    // Indent the child body by one level.
+    let indented: String = res
+        .body
+        .lines()
+        .map(|l| {
+            if l.is_empty() {
+                String::from("\n")
+            } else {
+                format!("\t{l}\n")
+            }
+        })
+        .collect();
+    let vararg = if child.is_vararg {
+        if res.params.is_empty() {
+            "...".to_string()
+        } else {
+            ", ...".to_string()
+        }
+    } else {
+        String::new()
+    };
+    Expr::Closure {
+        text: format!(
+            "function({}{})\n{}end",
+            res.params.join(", "),
+            vararg,
+            indented
+        ),
+        captures,
+    }
+}
+
+/// Decompile one child closure job: recurse into the child proto, then assemble its literal
+/// and roll up its reports. The return tuple is `(pc, expr, partial, child_reports)`.
+fn decompile_one_closure(
+    module: &Module,
+    job: &ClosureJob,
+) -> (usize, Expr, bool, Vec<ProtoReport>) {
+    let mut sub_reports = Vec::new();
+    let res = decompile_proto(
+        module,
+        job.child_idx,
+        job.is_method,
+        job.event_name.clone(),
+        &mut sub_reports,
+    );
+    let expr = build_closure_expr(module, job.child_idx, &res, job.captures.clone());
+    let partial = sub_reports.iter().any(|r| r.partial);
+    (job.pc, expr, partial, sub_reports)
+}
 
 /// Result of decompiling a whole module.
 #[derive(Debug, Clone)]
@@ -102,6 +220,30 @@ fn decompile_proto(
 ) -> ProtoDecompileResult {
     let proto = &module.protos[proto_idx];
     let mut d = Decompiler::new(module, proto);
+
+    // Pre-decompile this proto's child closures (across cores for large modules) and cache
+    // them by creation PC; `closure_expr` consumes the cache during `run()`. Each child is a
+    // pure function of the immutable module, so parallel and sequential decompiles produce
+    // identical output. `emit_range` visits instructions in ascending PC, so sorting the
+    // results by PC reproduces the original depth-first report order exactly.
+    let jobs = d.collect_closure_jobs();
+    let mut child_results: Vec<(usize, Expr, bool, Vec<ProtoReport>)> =
+        if jobs.len() > 1 && module.protos.len() > parallel_threshold() {
+            ensure_pool();
+            jobs.par_iter()
+                .map(|job| decompile_one_closure(module, job))
+                .collect()
+        } else {
+            jobs.iter()
+                .map(|job| decompile_one_closure(module, job))
+                .collect()
+        };
+    child_results.sort_by_key(|r| r.0);
+    for (pc, expr, partial, sub_reports) in child_results {
+        reports.extend(sub_reports);
+        d.closure_cache.insert(pc, CachedClosure { expr, partial });
+    }
+
     let mut stmts = d.run();
 
     // Remove unreachable code left after returns/breaks by inline-cache flushes.
@@ -130,6 +272,7 @@ fn decompile_proto(
     cleanup::merge_leading_while_break_guards(&mut stmts);
     cleanup::recover_loop_bool_selector_gotos(&mut stmts);
     cleanup::recover_loop_find_breaks(&mut stmts);
+    cleanup::recover_unstructured_backward_loops(&mut stmts);
 
     // Captured registers, upvalues, and globals are excluded from inlining/elimination:
     // closures must keep the variables they close over, and a write to an upvalue or global
@@ -171,6 +314,7 @@ fn decompile_proto(
     cleanup::merge_leading_while_break_guards(&mut stmts);
     cleanup::recover_loop_bool_selector_gotos(&mut stmts);
     cleanup::recover_loop_find_breaks(&mut stmts);
+    cleanup::recover_unstructured_backward_loops(&mut stmts);
     // A constant `1` step on a numeric for is implicit.
     drop_unit_for_steps(&mut stmts);
 
@@ -246,6 +390,7 @@ fn decompile_proto(
     cleanup::merge_leading_while_break_guards(&mut stmts);
     cleanup::recover_loop_bool_selector_gotos(&mut stmts);
     cleanup::recover_loop_find_breaks(&mut stmts);
+    cleanup::recover_unstructured_backward_loops(&mut stmts);
     cleanup::recover_loop_carried_call_updates(&mut stmts);
     cleanup::simplify_repeat_return_guards(&mut stmts);
     cleanup::simplify_redundant_conditions(&mut stmts);
@@ -279,6 +424,7 @@ fn decompile_proto(
     cleanup::recover_natural_loops(&mut stmts);
     cleanup::merge_leading_while_break_guards(&mut stmts);
     cleanup::recover_loop_find_breaks(&mut stmts);
+    cleanup::recover_unstructured_backward_loops(&mut stmts);
     cleanup::simplify_redundant_conditions(&mut stmts);
     cleanup::drop_unreachable(&mut stmts);
     cleanup::remove_redundant_gotos(&mut stmts);
@@ -475,6 +621,9 @@ struct Decompiler<'a> {
     /// locals — doing so would turn a global write into a local one.
     globals: BTreeSet<String>,
     notes: Vec<String>,
+    /// Child closures pre-decompiled before `run()`, keyed by their creation PC. `closure_expr`
+    /// removes from this as `run()` reaches each NEWCLOSURE/DUPCLOSURE.
+    closure_cache: BTreeMap<usize, CachedClosure>,
 }
 
 impl<'a> Decompiler<'a> {
@@ -493,6 +642,7 @@ impl<'a> Decompiler<'a> {
             has_partial_child: false,
             globals: BTreeSet::new(),
             notes: Vec::new(),
+            closure_cache: BTreeMap::new(),
         }
     }
 
@@ -1878,50 +2028,68 @@ impl<'a> Decompiler<'a> {
     }
 
     fn closure_expr(&mut self, child_idx: usize, pc: usize) -> Expr {
-        // Recursively decompile the child proto into a function literal.
-        let child = &self.module.protos[child_idx];
+        // Fast path: consume the child decompiled up-front (possibly on another core).
+        if let Some(cached) = self.closure_cache.remove(&pc) {
+            if cached.partial {
+                self.has_partial_child = true;
+            }
+            return cached.expr;
+        }
+        // Defensive fallback: the pre-scan and `run()` agree on which PCs create closures, so
+        // this is unreached in practice. Decompile inline if they ever diverge, keeping output
+        // correct (the lost report would only affect metadata, never the rendered source).
         let captures = self.closure_captures(pc);
-        let mut sub_reports = Vec::new();
-        let insn = self.proto.code[pc];
-        let reg_a = insn_a(insn);
+        let reg_a = insn_a(self.proto.code[pc]);
         let is_method = self.is_closure_method_like(pc, reg_a);
         let event_name = self.find_closure_event_name(pc, reg_a);
-        let res = decompile_proto(
-            self.module,
-            child_idx,
-            is_method,
-            event_name,
-            &mut sub_reports,
-        );
-        let body = res.body;
-        let params = res.params;
+        let mut sub_reports = Vec::new();
+        let res = decompile_proto(self.module, child_idx, is_method, event_name, &mut sub_reports);
         if sub_reports.iter().any(|r| r.partial) {
             self.has_partial_child = true;
         }
-        // Indent the child body by one level.
-        let indented: String = body
-            .lines()
-            .map(|l| {
-                if l.is_empty() {
-                    String::from("\n")
-                } else {
-                    format!("\t{l}\n")
+        build_closure_expr(self.module, child_idx, &res, captures)
+    }
+
+    /// Statically scan this proto's bytecode for every NEWCLOSURE/DUPCLOSURE that resolves to
+    /// a child proto, returning one [`ClosureJob`] per site. Mirrors the resolution the
+    /// `run()` handlers do, so the job set matches the PCs that will call `closure_expr`.
+    fn collect_closure_jobs(&self) -> Vec<ClosureJob> {
+        let code = &self.proto.code;
+        let mut jobs = Vec::new();
+        let mut pc = 0;
+        while pc < code.len() {
+            let insn = code[pc];
+            let Some(op) = Opcode::from_u8(insn_op(insn)) else {
+                pc += 1;
+                continue;
+            };
+            let child_idx = match op {
+                Opcode::NEWCLOSURE => self
+                    .proto
+                    .child_protos
+                    .get(insn_d(insn) as usize)
+                    .map(|&c| c as usize),
+                Opcode::DUPCLOSURE => {
+                    match self.proto.constants.get(insn_d(insn) as usize) {
+                        Some(Constant::Closure { proto }) => Some(*proto as usize),
+                        _ => None,
+                    }
                 }
-            })
-            .collect();
-        let vararg = if child.is_vararg {
-            if params.is_empty() {
-                "...".to_string()
-            } else {
-                ", ...".to_string()
+                _ => None,
+            };
+            if let Some(child_idx) = child_idx {
+                let reg_a = insn_a(insn);
+                jobs.push(ClosureJob {
+                    pc,
+                    child_idx,
+                    is_method: self.is_closure_method_like(pc, reg_a),
+                    event_name: self.find_closure_event_name(pc, reg_a),
+                    captures: self.closure_captures(pc),
+                });
             }
-        } else {
-            String::new()
-        };
-        Expr::Closure {
-            text: format!("function({}{})\n{}end", params.join(", "), vararg, indented),
-            captures,
+            pc += op.length().max(1);
         }
+        jobs
     }
 
     /// The ordered upvalue captures of the closure created at `pc`, read from the CAPTURE

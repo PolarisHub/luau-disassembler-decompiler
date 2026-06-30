@@ -6120,6 +6120,49 @@ fn recover_if_else_once(root: &mut Vec<Stmt>) -> bool {
     false
 }
 
+/// Last-resort recovery for an unstructured infinite loop: `::L:: <body> goto L`, where the single
+/// backward goto to `L` is an unconditional top-level statement, becomes `while true do <body> end`.
+/// Unlike [`recover_backward_goto_while`] this needs no exit-test-at-top — the body's own
+/// `return`/`break` are its exits (the obfuscator's dispatch/decryption loops have this shape).
+/// Processing innermost blocks first means nested same-named labels resolve one loop at a time, so
+/// the count-of-one guard holds. This turns the goto/label fallback into legal Luau, which has no
+/// `goto`; it only fires on protos that already fell back to goto, so structured output is untouched.
+pub fn recover_unstructured_backward_loops(root: &mut Vec<Stmt>) {
+    for s in root.iter_mut() {
+        for_each_block_mut(s, recover_unstructured_backward_loops);
+    }
+    while recover_unstructured_backward_loop_once(root) {}
+}
+
+fn recover_unstructured_backward_loop_once(root: &mut Vec<Stmt>) -> bool {
+    for i in 0..root.len() {
+        let Stmt::Label(label) = &root[i] else {
+            continue;
+        };
+        let label = label.clone();
+        // Exactly one goto targets this label (counted recursively), and it is a bare top-level
+        // statement after the label — the loop's back-edge.
+        if count_gotos_named(root, &label) != 1 {
+            continue;
+        }
+        let Some(j) = (i + 1..root.len()).find(|&k| matches!(&root[k], Stmt::Goto(l) if l == &label))
+        else {
+            continue;
+        };
+        if i + 1 >= j {
+            continue;
+        }
+        let body = root[i + 1..j].to_vec();
+        root[i] = Stmt::While {
+            cond: Expr::Bool(true),
+            body,
+        };
+        root.drain(i + 1..=j);
+        return true;
+    }
+    false
+}
+
 pub fn recover_backward_goto_while(root: &mut Vec<Stmt>) {
     for s in root.iter_mut() {
         for_each_block_mut(s, recover_backward_goto_while);
@@ -9998,5 +10041,50 @@ mod tests {
         let rendered = render_block(&stmts, 0);
         assert!(rendered.contains("local v1 = 5"), "{rendered}");
         assert!(rendered.contains("v1 = 10"), "{rendered}");
+    }
+
+    #[test]
+    fn recovers_unstructured_backward_goto_loop() {
+        // `::L1:: <body> goto L1` (unconditional back-edge) -> `while true do <body> end`.
+        let mut stmts = vec![
+            Stmt::Label("L1".into()),
+            Stmt::Assign {
+                targets: vec![Expr::Var("x".into())],
+                values: vec![Expr::Num("1".into())],
+            },
+            Stmt::If {
+                cond: Expr::Var("done".into()),
+                then_body: vec![Stmt::Return(vec![])],
+                else_body: Vec::new(),
+            },
+            Stmt::Goto("L1".into()),
+        ];
+        recover_unstructured_backward_loops(&mut stmts);
+        assert_eq!(stmts.len(), 1, "{}", render_block(&stmts, 0));
+        let Stmt::While { cond, body } = &stmts[0] else {
+            panic!("expected while loop, got {}", render_block(&stmts, 0));
+        };
+        assert_eq!(*cond, Expr::Bool(true));
+        assert_eq!(body.len(), 2); // the assign and the if; no goto/label remain
+        let rendered = render_block(&stmts, 0);
+        assert!(!rendered.contains("goto") && !rendered.contains("::"), "{rendered}");
+
+        // Nested same-named labels: inner loop is recovered first (count-of-one holds per level).
+        let mut nested = vec![
+            Stmt::Label("L1".into()),
+            Stmt::If {
+                cond: Expr::Var("c".into()),
+                then_body: vec![
+                    Stmt::Label("L1".into()),
+                    Stmt::Call(Expr::Call(Box::new(Expr::Var("f".into())), vec![])),
+                    Stmt::Goto("L1".into()),
+                ],
+                else_body: Vec::new(),
+            },
+            Stmt::Goto("L1".into()),
+        ];
+        recover_unstructured_backward_loops(&mut nested);
+        let rendered = render_block(&nested, 0);
+        assert!(!rendered.contains("goto") && !rendered.contains("::"), "{rendered}");
     }
 }

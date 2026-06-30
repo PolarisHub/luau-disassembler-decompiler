@@ -12,3 +12,6 @@ description = "Reconstructs readable Luau source from the IR."
 luau-bytecode.workspace = true
 luau-disasm.workspace = true
 luau-ir.workspace = true
+# Work-stealing thread pool. Used only to decompile the proto tree of large modules across
+# cores; small modules (the common case) stay single-threaded and never touch the pool.
+rayon = "1"

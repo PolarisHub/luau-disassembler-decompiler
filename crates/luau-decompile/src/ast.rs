@@ -926,7 +926,11 @@ fn quoted_luau_string(text: &str) -> String {
             b'\t' => out.push_str("\\t"),
             0x20..=0x7e => out.push(b as char),
             _ => {
-                let _ = write!(out, "\\{b}");
+                // Zero-pad the decimal escape to 3 digits. Luau reads up to 3 digits for `\ddd`,
+                // so an unpadded short escape (`\26`) followed by a literal digit (`0`) would be
+                // misread as one escape (`\260`) — which exceeds 255 and is a malformed-escape
+                // error. `\026` is always read as exactly those 3 digits.
+                let _ = write!(out, "\\{b:03}");
             }
         }
     }

@@ -3058,8 +3058,11 @@ pub fn lua_string_literal(bytes: &[u8]) -> String {
             b'\r' => out.push_str("\\r"),
             b'\t' => out.push_str("\\t"),
             0x20..=0x7e => out.push(b as char),
-            // Non-printable / non-ASCII: emit a numeric escape, valid for any byte.
-            _ => out.push_str(&format!("\\{b}")),
+            // Non-printable / non-ASCII: emit a numeric escape, zero-padded to 3 digits. Luau
+            // reads up to 3 digits for `\ddd`, so an unpadded short escape (`\26`) followed by a
+            // literal digit (`0`) would be misread as one escape (`\260`) — which exceeds 255 and
+            // is rejected as a malformed escape sequence. `\026` is always exactly 3 digits.
+            _ => out.push_str(&format!("\\{b:03}")),
         }
     }
     out.push('"');
