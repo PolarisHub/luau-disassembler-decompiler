@@ -4413,31 +4413,28 @@ fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool 
     }
 
     for i in 0..block.len() {
-        let Some((name, val)) = sole_var_assign(&block[i]) else {
+        let Some((name, val)) = sole_var_assign_ref(&block[i]) else {
             continue;
         };
-        if protected.contains(&name) {
+        if protected.contains(name) {
             continue;
         }
-        // Computed once and reused for the self-reference test and the interference check below
-        // (`val` is not mutated in between).
-        let val_reads = reads_of_expr(&val);
-        if val_reads.contains(&name) {
+        if expr_count_var(val, name) > 0 {
             continue; // self-referential definition (a refinement); leave it
         }
         // Pure values can move anywhere (interference-checked). An impure value (a call) may
         // only be inlined when the use evaluates it first (the temp is the head/receiver) and
         // nothing effectful sits between — then no side effect is reordered.
-        let impure = !is_pure(&val);
+        let impure = !is_pure(val);
 
         // The definition's value is live until `name` is next written. Work only within a
         // straight-line window up to that point so we can see every use of THIS value.
         let next_def = ((i + 1)..block.len())
-            .find(|&k| stmt_writes_var(&block[k], &name))
+            .find(|&k| stmt_writes_var(&block[k], name))
             .unwrap_or(block.len());
         let reads: Vec<(usize, usize)> = ((i + 1)..next_def)
             .filter_map(|k| {
-                let count = stmt_read_count(&block[k], &name);
+                let count = stmt_read_count(&block[k], name);
                 (count > 0).then_some((k, count))
             })
             .collect();
@@ -4446,7 +4443,7 @@ fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool 
         }
         let total_reads: usize = reads.iter().map(|(_, count)| *count).sum();
         let (j, reads_in_stmt) = reads[0];
-        let replaceable_reads = stmt_replaceable_read_count(&block[j], &name);
+        let replaceable_reads = stmt_replaceable_read_count(&block[j], name);
         if replaceable_reads == 0 {
             continue;
         }
@@ -4458,8 +4455,10 @@ fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool 
             continue; // a branch/loop before the use may hide path-specific behavior
         }
 
-        // Interference check on the statements strictly between def and use.
-        let needs_no_effects = reads_table(&val) || impure;
+        // Interference check on the statements strictly between def and use. The read-set is
+        // built only here — candidates that bailed at the cheaper checks above never allocate it.
+        let val_reads = reads_of_expr(val);
+        let needs_no_effects = reads_table(val) || impure;
         let mut safe = true;
         for stmt in &block[i + 1..j] {
             if matches!(stmt, Stmt::Label(_) | Stmt::Goto(_)) {
@@ -4476,7 +4475,7 @@ fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool 
             }
         }
         // An impure value may only be inlined where it is evaluated first (head/receiver).
-        if impure && stmt_head(&block[j]) != Some(name.as_str()) {
+        if impure && stmt_head(&block[j]) != Some(name) {
             safe = false;
         }
         if !safe {
@@ -4486,18 +4485,21 @@ fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool 
         // If this logical value has exactly one read and the next definition doesn't also
         // read it (`x = x.foo`), the materializing assignment can disappear entirely.
         let can_remove_def = total_reads == 1
-            && !(next_def < block.len() && stmt_reads_var(&block[next_def], &name));
-        if stmt_reads_var_in_assignment_target(&block[j], &name) {
+            && !(next_def < block.len() && stmt_reads_var(&block[next_def], name));
+        if stmt_reads_var_in_assignment_target(&block[j], name) {
             continue;
         }
-        if !can_remove_def && !is_duplicable_leaf(&val) {
+        if !can_remove_def && !is_duplicable_leaf(val) {
             continue;
         }
         if !can_remove_def && (reads_in_stmt != 1 || replaceable_reads != 1) {
             continue; // don't partially inline `x` inside `x and x.y`
         }
 
-        let mut v = Some(val);
+        // Commit: only now do we clone the name/value (every candidate above was inspected by
+        // reference). The borrows of `block[i]` via `name`/`val` end here, before the mutation.
+        let name = name.to_string();
+        let mut v = Some(val.clone());
         replace_first_var(&mut block[j], &name, &mut v);
         if can_remove_def {
             block.remove(i);
@@ -4843,16 +4845,22 @@ fn reads_of_expr(e: &Expr) -> BTreeSet<String> {
 /// If `s` is `name = value` or `local name = value` with a single bare name, return
 /// `(name, value)`.
 fn sole_var_assign(s: &Stmt) -> Option<(String, Expr)> {
+    sole_var_assign_ref(s).map(|(name, val)| (name.to_string(), val.clone()))
+}
+
+/// Borrowing form of [`sole_var_assign`] — `(name, value)` for a single-target `x = v` / `local
+/// x = v`, without cloning. The hot `inline_in_block` scan uses this so it only clones the value
+/// at the rare point where it actually commits an inline, not for every candidate it inspects.
+fn sole_var_assign_ref(s: &Stmt) -> Option<(&str, &Expr)> {
     match s {
         Stmt::Assign { targets, values } if targets.len() == 1 && values.len() == 1 => {
-            if let Expr::Var(name) = &targets[0] {
-                Some((name.clone(), values[0].clone()))
-            } else {
-                None
+            match &targets[0] {
+                Expr::Var(name) => Some((name.as_str(), &values[0])),
+                _ => None,
             }
         }
         Stmt::Local { names, values } if names.len() == 1 && values.len() == 1 => {
-            Some((names[0].clone(), values[0].clone()))
+            Some((names[0].as_str(), &values[0]))
         }
         _ => None,
     }
@@ -4882,46 +4890,106 @@ fn stmt_reads_var_in_assignment_target(s: &Stmt, name: &str) -> bool {
     }
 }
 
-fn stmt_read_count(s: &Stmt, name: &str) -> usize {
-    let mut counts = BTreeMap::new();
-    count_uses_stmt(s, &mut counts);
-    counts.get(name).copied().unwrap_or(0)
+/// `count_occurrences(e, ..)[name]` without the BTreeMap — mirrors `count_occurrences`'s arms and
+/// the `!name.contains('.')` guard exactly, so it returns the identical count.
+fn expr_count_var(e: &Expr, name: &str) -> usize {
+    match e {
+        Expr::Var(n) if !n.contains('.') => usize::from(n == name),
+        Expr::Var(_) => 0,
+        Expr::Index(t, k) => expr_count_var(t, name) + expr_count_var(k, name),
+        Expr::Field(t, _) => expr_count_var(t, name),
+        Expr::Call(f, args) => {
+            expr_count_var(f, name) + args.iter().map(|a| expr_count_var(a, name)).sum::<usize>()
+        }
+        Expr::MethodCall(o, _, args) => {
+            expr_count_var(o, name) + args.iter().map(|a| expr_count_var(a, name)).sum::<usize>()
+        }
+        Expr::Unary(_, a) => expr_count_var(a, name),
+        Expr::Binary(_, a, b) => expr_count_var(a, name) + expr_count_var(b, name),
+        Expr::Table(fields) => fields
+            .iter()
+            .map(|f| match f {
+                TableField::Item(e) | TableField::Named(_, e) => expr_count_var(e, name),
+                TableField::Keyed(k, v) => expr_count_var(k, name) + expr_count_var(v, name),
+            })
+            .sum(),
+        _ => 0,
+    }
 }
 
-fn stmt_replaceable_read_count(s: &Stmt, name: &str) -> usize {
-    let mut counts = BTreeMap::new();
-    match s {
-        Stmt::Local { values, .. } => values.iter().for_each(|e| add_reads(e, &mut counts)),
+/// `count_uses_stmt(s, ..)[name]` without the BTreeMap — mirrors `count_uses_stmt`'s arms,
+/// the sole-Var-target-is-a-write rule, and the nested-block recursion exactly.
+fn stmt_count_var(s: &Stmt, name: &str) -> usize {
+    let mut n = match s {
+        Stmt::Local { values, .. } => values.iter().map(|e| expr_count_var(e, name)).sum(),
         Stmt::Assign { targets, values } => {
-            for t in targets {
-                if !matches!(t, Expr::Var(_)) {
-                    add_reads(t, &mut counts);
-                }
-            }
-            values.iter().for_each(|e| add_reads(e, &mut counts));
+            targets
+                .iter()
+                .map(|t| match t {
+                    Expr::Var(_) => 0,
+                    other => expr_count_var(other, name),
+                })
+                .sum::<usize>()
+                + values.iter().map(|e| expr_count_var(e, name)).sum::<usize>()
         }
-        Stmt::Call(e) => add_reads(e, &mut counts),
-        Stmt::Return(es) => es.iter().for_each(|e| add_reads(e, &mut counts)),
-        Stmt::If { cond, .. } => add_reads(cond, &mut counts),
+        Stmt::Call(e) => expr_count_var(e, name),
+        Stmt::Return(es) => es.iter().map(|e| expr_count_var(e, name)).sum(),
+        Stmt::If { cond, .. } | Stmt::While { cond, .. } | Stmt::Repeat { cond, .. } => {
+            expr_count_var(cond, name)
+        }
         Stmt::NumericFor {
             start, limit, step, ..
         } => {
-            add_reads(start, &mut counts);
-            add_reads(limit, &mut counts);
-            if let Some(step) = step {
-                add_reads(step, &mut counts);
-            }
+            expr_count_var(start, name)
+                + expr_count_var(limit, name)
+                + step.as_ref().map_or(0, |s| expr_count_var(s, name))
         }
-        Stmt::GenericFor { exprs, .. } => exprs.iter().for_each(|e| add_reads(e, &mut counts)),
+        Stmt::GenericFor { exprs, .. } => exprs.iter().map(|e| expr_count_var(e, name)).sum(),
+        Stmt::Break | Stmt::Continue | Stmt::Label(_) | Stmt::Goto(_) | Stmt::Comment(_) => 0,
+    };
+    for_each_block(s, |b| {
+        n += b.iter().map(|st| stmt_count_var(st, name)).sum::<usize>();
+    });
+    n
+}
+
+fn stmt_read_count(s: &Stmt, name: &str) -> usize {
+    stmt_count_var(s, name)
+}
+
+/// Reads of `name` directly in `s`'s own expressions (NOT nested blocks) — the shallow,
+/// allocation-free counterpart of the original; mirrors its arms exactly (note While/Repeat
+/// conditions are excluded, matching the original).
+fn stmt_replaceable_read_count(s: &Stmt, name: &str) -> usize {
+    match s {
+        Stmt::Local { values, .. } => values.iter().map(|e| expr_count_var(e, name)).sum(),
+        Stmt::Assign { targets, values } => {
+            targets
+                .iter()
+                .filter(|t| !matches!(t, Expr::Var(_)))
+                .map(|t| expr_count_var(t, name))
+                .sum::<usize>()
+                + values.iter().map(|e| expr_count_var(e, name)).sum::<usize>()
+        }
+        Stmt::Call(e) => expr_count_var(e, name),
+        Stmt::Return(es) => es.iter().map(|e| expr_count_var(e, name)).sum(),
+        Stmt::If { cond, .. } => expr_count_var(cond, name),
+        Stmt::NumericFor {
+            start, limit, step, ..
+        } => {
+            expr_count_var(start, name)
+                + expr_count_var(limit, name)
+                + step.as_ref().map_or(0, |s| expr_count_var(s, name))
+        }
+        Stmt::GenericFor { exprs, .. } => exprs.iter().map(|e| expr_count_var(e, name)).sum(),
         Stmt::While { .. }
         | Stmt::Repeat { .. }
         | Stmt::Break
         | Stmt::Continue
         | Stmt::Label(_)
         | Stmt::Goto(_)
-        | Stmt::Comment(_) => {}
+        | Stmt::Comment(_) => 0,
     }
-    counts.get(name).copied().unwrap_or(0)
 }
 
 fn is_duplicable_leaf(e: &Expr) -> bool {
@@ -6707,20 +6775,19 @@ fn collect_split_candidates_recursive(
 }
 
 pub fn split_reused_registers(stmts: &mut [Stmt], protected: &BTreeSet<String>) {
-    // This pass is O(candidates * statements) per block. The bounds below are a safety valve
-    // against pathological single protos only — they sit far above any real Roblox module (the
-    // 22k-line fixtures stay well under), so large protos now get full register splitting (which
-    // markedly improves naming on them) and still finish within the server's time budget. The
-    // upstream fixpoint passes were made near-linear, so raising these from the old 600/80 no
-    // longer risks a timeout.
-    if count_stmts(stmts) > 20_000 {
+    // These bounds cap this O(candidates * statements) pass, but they are ALSO a correctness guard:
+    // splitting multiplies the number of distinct locals, and a large proto can blow past Luau's
+    // hard 200-locals-per-function limit (the compiler rejects the output with "out of local
+    // registers"). Keeping large protos un-split keeps their registers fused and under the limit.
+    // Raising these caused real fixtures (e.g. Networking) to stop recompiling, so they stay put.
+    if count_stmts(stmts) > 600 {
         return;
     }
     let mut unsplittable = protected.clone();
     collect_unsplittable(stmts, false, &mut unsplittable);
     let mut candidates = BTreeSet::new();
     collect_split_candidates_recursive(stmts, &unsplittable, &mut candidates);
-    if candidates.len() > 2_000 {
+    if candidates.len() > 80 {
         return;
     }
     split_reused_registers_in_block(stmts, &unsplittable);
