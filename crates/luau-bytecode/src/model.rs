@@ -46,9 +46,6 @@ pub mod proto_flag {
 pub struct StringRef(pub Option<usize>);
 
 impl StringRef {
-    pub fn is_some(self) -> bool {
-        self.0.is_some()
-    }
     pub fn index(self) -> Option<usize> {
         self.0
     }

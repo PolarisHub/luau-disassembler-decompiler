@@ -172,13 +172,9 @@ pub fn build_cfg(proto: &Proto) -> Cfg {
     let mut blocks: Vec<BasicBlock> = Vec::new();
     for (i, &start) in leaders.iter().enumerate() {
         let end = leaders.get(i + 1).copied().unwrap_or(n);
-        let block_instrs: Vec<(usize, usize)> = instrs
-            .iter()
-            .copied()
-            .filter(|&(pc, _)| pc >= start && pc < end)
-            .collect();
-        let insns: Vec<usize> = block_instrs.iter().map(|&(pc, _)| pc).collect();
-        let (last_pc, last_len) = block_instrs.last().copied().unwrap_or((start, 1));
+        let in_block = |&&(pc, _): &&(usize, usize)| pc >= start && pc < end;
+        let insns: Vec<usize> = instrs.iter().filter(&in_block).map(|&(pc, _)| pc).collect();
+        let (last_pc, last_len) = instrs.iter().rfind(&in_block).copied().unwrap_or((start, 1));
         let term = terminator(proto, last_pc, last_len);
         blocks.push(BasicBlock {
             index: i,

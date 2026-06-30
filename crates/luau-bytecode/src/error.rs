@@ -41,11 +41,19 @@ pub enum ErrorKind {
     /// An unknown constant tag was encountered (not one of LBC_CONSTANT_*).
     UnknownConstantTag { tag: u8 },
 
+    /// An instruction's opcode byte did not decode to any opcode we support. The stream
+    /// is no longer decodable past this point (we can't know the instruction length).
+    UnknownOpcode { op: u8 },
+
     /// A string-table reference (1-based id) pointed outside the table.
     StringIndexOutOfRange { id: u32, count: u32 },
 
     /// A constant-table reference pointed outside the proto's constant table.
     ConstantIndexOutOfRange { index: u32, count: u32 },
+
+    /// A register operand addressed a slot outside the proto's declared frame
+    /// (`max_stack_size`).
+    RegisterIndexOutOfRange { index: u32, count: u32 },
 
     /// A child-proto / closure reference pointed outside the proto table.
     ProtoIndexOutOfRange { index: u32, count: u32 },
@@ -87,11 +95,15 @@ impl fmt::Display for Error {
                 write!(f, "input is a compile-error blob: {message}")
             }
             ErrorKind::UnknownConstantTag { tag } => write!(f, "unknown constant tag {tag}"),
+            ErrorKind::UnknownOpcode { op } => write!(f, "unknown opcode {op}"),
             ErrorKind::StringIndexOutOfRange { id, count } => {
                 write!(f, "string id {id} out of range (table has {count})")
             }
             ErrorKind::ConstantIndexOutOfRange { index, count } => {
                 write!(f, "constant index {index} out of range (proto has {count})")
+            }
+            ErrorKind::RegisterIndexOutOfRange { index, count } => {
+                write!(f, "register {index} out of range (frame has {count} slots)")
             }
             ErrorKind::ProtoIndexOutOfRange { index, count } => {
                 write!(f, "proto index {index} out of range ({count} protos)")

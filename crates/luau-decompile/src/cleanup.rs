@@ -1992,6 +1992,19 @@ fn tail_reads_late_local(
         })
 }
 
+/// Replace the `Goto` at `stmts[i]` with `tail` (when `pad_return`, append a bare `return`
+/// unless the tail already ends terminated). Returns how many statements `i` now spans, so
+/// callers can advance past the splice and adjust any tracked label index.
+fn splice_tail_at(stmts: &mut Vec<Stmt>, i: usize, tail: &[Stmt], pad_return: bool) -> usize {
+    let mut replacement = tail.to_vec();
+    if pad_return && !block_ends_terminated(&replacement) {
+        replacement.push(Stmt::Return(Vec::new()));
+    }
+    let replacement_len = replacement.len();
+    stmts.splice(i..=i, replacement);
+    replacement_len
+}
+
 fn replace_gotos_with_tail_return_before(
     root: &mut Vec<Stmt>,
     label_idx: &mut usize,
@@ -2003,12 +2016,7 @@ fn replace_gotos_with_tail_return_before(
     while i < *label_idx {
         match &mut root[i] {
             Stmt::Goto(target) if target == label => {
-                let mut replacement = tail.to_vec();
-                if !block_ends_terminated(&replacement) {
-                    replacement.push(Stmt::Return(Vec::new()));
-                }
-                let replacement_len = replacement.len();
-                root.splice(i..=i, replacement);
+                let replacement_len = splice_tail_at(root, i, tail, true);
                 *label_idx += replacement_len - 1;
                 i += replacement_len;
                 changed = true;
@@ -2040,12 +2048,7 @@ fn replace_gotos_with_tail_return_in_block(
     while i < stmts.len() {
         match &mut stmts[i] {
             Stmt::Goto(target) if target == label => {
-                let mut replacement = tail.to_vec();
-                if !block_ends_terminated(&replacement) {
-                    replacement.push(Stmt::Return(Vec::new()));
-                }
-                let replacement_len = replacement.len();
-                stmts.splice(i..=i, replacement);
+                let replacement_len = splice_tail_at(stmts, i, tail, true);
                 i += replacement_len;
                 changed = true;
             }
@@ -2077,9 +2080,7 @@ fn replace_gotos_with_terminal_tail_before(
     while i < *label_idx {
         match &mut root[i] {
             Stmt::Goto(target) if target == label => {
-                let replacement = tail.to_vec();
-                let replacement_len = replacement.len();
-                root.splice(i..=i, replacement);
+                let replacement_len = splice_tail_at(root, i, tail, false);
                 *label_idx += replacement_len - 1;
                 i += replacement_len;
                 changed = true;
@@ -2111,9 +2112,7 @@ fn replace_gotos_with_terminal_tail_in_block(
     while i < stmts.len() {
         match &mut stmts[i] {
             Stmt::Goto(target) if target == label => {
-                let replacement = tail.to_vec();
-                let replacement_len = replacement.len();
-                stmts.splice(i..=i, replacement);
+                let replacement_len = splice_tail_at(stmts, i, tail, false);
                 i += replacement_len;
                 changed = true;
             }
@@ -4437,8 +4436,9 @@ fn inline_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool 
         if replaceable_reads == 0 {
             continue;
         }
-        if block[..i].iter().any(stmt_contains_nonlocal_flow) {
-            continue; // an earlier goto/break/continue may jump to this value's use
+        if block[..i].iter().any(stmt_contains_goto) {
+            continue; // an earlier goto may jump a label into this value's def->use window;
+                      // break/continue only exit to loop boundaries, never into the window
         }
         if block[i + 1..j].iter().any(is_control_flow) {
             continue; // a branch/loop before the use may hide path-specific behavior
@@ -4572,6 +4572,25 @@ fn stmt_contains_nonlocal_flow(stmt: &Stmt) -> bool {
         | Stmt::Repeat { body, .. }
         | Stmt::NumericFor { body, .. }
         | Stmt::GenericFor { body, .. } => body.iter().any(stmt_contains_nonlocal_flow),
+        _ => false,
+    }
+}
+
+/// Whether `stmt` contains a `goto` anywhere (including inside nested loops/ifs). Unlike
+/// `break`/`continue`, a `goto` can target a label outside its enclosing loop, so only a `goto`
+/// can land control *inside* a straight-line def->use window.
+fn stmt_contains_goto(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Goto(_) => true,
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => then_body.iter().chain(else_body).any(stmt_contains_goto),
+        Stmt::While { body, .. }
+        | Stmt::Repeat { body, .. }
+        | Stmt::NumericFor { body, .. }
+        | Stmt::GenericFor { body, .. } => body.iter().any(stmt_contains_goto),
         _ => false,
     }
 }
@@ -5644,18 +5663,11 @@ fn recover_if_join_once(root: &mut Vec<Stmt>) -> bool {
             } else {
                 root[i] = Stmt::Call(cond.clone());
             }
-            if remove_label {
-                root.drain(i + 1..=label_idx);
-            } else {
-                root.drain(i + 1..label_idx);
-            }
-        } else {
-            if remove_label {
-                root.drain(i + 1..=label_idx);
-            } else {
-                root.drain(i + 1..label_idx);
-            }
         }
+        // The rewrite above acts at index `i`, so it never shifts the `i + 1..` range start;
+        // the label itself is consumed only when it was the sole goto target.
+        let drain_end = if remove_label { label_idx + 1 } else { label_idx };
+        root.drain(i + 1..drain_end);
         return true;
     }
     false
@@ -6629,23 +6641,9 @@ fn collect_split_candidates_recursive(
     );
 
     for stmt in stmts {
-        match stmt {
-            Stmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                collect_split_candidates_recursive(then_body, unsplittable, candidates);
-                collect_split_candidates_recursive(else_body, unsplittable, candidates);
-            }
-            Stmt::While { body, .. }
-            | Stmt::Repeat { body, .. }
-            | Stmt::NumericFor { body, .. }
-            | Stmt::GenericFor { body, .. } => {
-                collect_split_candidates_recursive(body, unsplittable, candidates);
-            }
-            _ => {}
-        }
+        for_each_block(stmt, |b| {
+            collect_split_candidates_recursive(b, unsplittable, candidates)
+        });
     }
 }
 

@@ -32,7 +32,7 @@ fn validate_proto(proto: &crate::model::Proto) -> Result<()> {
             // An unknown opcode means we cannot know the instruction length, so the stream
             // is no longer decodable. We support every opcode through version 11, so this
             // is genuinely malformed input.
-            Error::new(pc, ErrorKind::UnknownConstantTag { tag: insn_op(word) })
+            Error::new(pc, ErrorKind::UnknownOpcode { op: insn_op(word) })
         })?;
 
         let len = op.length();
@@ -57,6 +57,10 @@ fn validate_proto(proto: &crate::model::Proto) -> Result<()> {
 
 fn const_oob(pc: usize, index: u32, count: u32) -> Error {
     Error::new(pc, ErrorKind::ConstantIndexOutOfRange { index, count })
+}
+
+fn reg_oob(pc: usize, index: u32, count: u32) -> Error {
+    Error::new(pc, ErrorKind::RegisterIndexOutOfRange { index, count })
 }
 
 fn check_operands(
@@ -133,13 +137,7 @@ fn check_operands(
     if op == NEWCLASSMEMBER {
         let c = insn_c(word) as u32;
         if max_reg > 0 && c >= max_reg {
-            return Err(Error::new(
-                pc,
-                ErrorKind::ConstantIndexOutOfRange {
-                    index: c,
-                    count: max_reg,
-                },
-            ));
+            return Err(reg_oob(pc, c, max_reg));
         }
     }
 
@@ -150,13 +148,7 @@ fn check_operands(
     if a_is_register(op) {
         let a = insn_a(word) as u32;
         if max_reg > 0 && a >= max_reg {
-            return Err(Error::new(
-                pc,
-                ErrorKind::ConstantIndexOutOfRange {
-                    index: a,
-                    count: max_reg,
-                },
-            ));
+            return Err(reg_oob(pc, a, max_reg));
         }
     }
 

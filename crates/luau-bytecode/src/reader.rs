@@ -83,7 +83,7 @@ impl<'a> Cursor<'a> {
     pub fn varint(&mut self) -> Result<u32> {
         let mut result: u32 = 0;
         let mut shift: u32 = 0;
-        for i in 0..5 {
+        for _ in 0..5 {
             let byte = self.u8()?;
             // The 5th byte only has 4 meaningful low bits for a u32; masking keeps us
             // from overflowing the shift. Real bytecode never sets the discarded bits.
@@ -92,7 +92,6 @@ impl<'a> Cursor<'a> {
                 return Ok(result);
             }
             shift += 7;
-            let _ = i;
         }
         Err(self.err(ErrorKind::VarIntTooLong { max_bytes: 5 }))
     }

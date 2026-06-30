@@ -121,7 +121,21 @@ pub fn render_block(stmts: &[Stmt], indent: usize) -> String {
         if index > 0 && wants_blank_line_between(&stmts[index - 1], s, block_len, indent) {
             out.push('\n');
         }
-        render_stmt(&mut out, s, indent);
+        let mut piece = String::new();
+        render_stmt(&mut piece, s, indent);
+        // A statement that renders starting with `(` — an immediately-called closure
+        // `(function() ... end)()` or a `(a or b):m()` call produced by inlining — is ambiguous
+        // when it follows another statement: Lua reads the `(` as a call on the previous line's
+        // value. A `;` separator after the indentation disambiguates. It is only valid after a
+        // preceding statement, so it is never emitted for the first statement of a block.
+        if index > 0 {
+            if let Some(pos) = piece.find(|c: char| c != '\t' && c != ' ') {
+                if piece[pos..].starts_with('(') {
+                    piece.insert(pos, ';');
+                }
+            }
+        }
+        out.push_str(&piece);
     }
     out
 }
@@ -911,7 +925,9 @@ fn quoted_luau_string(text: &str) -> String {
             b'\r' => out.push_str("\\r"),
             b'\t' => out.push_str("\\t"),
             0x20..=0x7e => out.push(b as char),
-            _ => out.push_str(&format!("\\{b}")),
+            _ => {
+                let _ = write!(out, "\\{b}");
+            }
         }
     }
     out.push('"');

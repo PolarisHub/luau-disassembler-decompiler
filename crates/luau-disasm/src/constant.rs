@@ -78,11 +78,9 @@ fn render_import(module: &Module, proto: &Proto, path: &[u32]) -> String {
     let mut parts = Vec::with_capacity(path.len());
     for &k in path {
         let text = match proto.constants.get(k as usize) {
-            Some(Constant::String(sref)) => sref
-                .index()
-                .and_then(|i| module.string_bytes(i))
-                .map(|b| String::from_utf8_lossy(b).into_owned())
-                .unwrap_or_default(),
+            // `resolve` already does the index -> bytes -> lossy-UTF-8 dance, yielding
+            // an empty segment for the 0 sentinel, exactly as this site wants.
+            Some(Constant::String(sref)) => module.resolve(*sref).map(|s| s.into_owned()).unwrap_or_default(),
             _ => "?".to_string(),
         };
         parts.push(text);

@@ -949,7 +949,12 @@ pub fn smart_rename_with_event(
             } else if list[1..].iter().all(|e| expr_references(e, orig)) {
                 list.last()
             } else {
-                None
+                // Multi-definition but non-conflicting (the definitions don't vote for differing
+                // names): a register reused for the same kind of value — e.g. `Instance.new("X")`
+                // in several branches, or the same field/child lookup — should still be named.
+                // Pick the first definition that yields a name; since they don't conflict, any
+                // named one is representative of the whole lifetime.
+                list.iter().find(|e| derive_name(e).is_some())
             };
             if let Some(c) = chosen {
                 if let Some(derived) = derive_name(c) {
@@ -999,6 +1004,12 @@ pub fn smart_rename_with_event(
             if let Some(col_list) = collector.suggestions.get(orig) {
                 suggs.extend(col_list.iter().cloned());
             }
+        } else if let Some(name) = defs.get(orig).and_then(|list| lifetime_name(list)) {
+            // The definitions disagree on a single specific name, but share a class family
+            // (Motor6D + Weld -> "joint") or form a divergent part role (PrimaryPart +
+            // FindFirstChild("Middle") -> "mainPart"). Name it from the whole lifetime instead
+            // of leaving it as a synthetic vN. (Non-conflicting variables are untouched.)
+            suggs.push((name, 40));
         }
 
         if let Some(event) = event_name {
@@ -1678,13 +1689,9 @@ fn collect_all_defs(
 
 /// Whether `e` reads the variable `name` anywhere.
 fn expr_references(e: &Expr, name: &str) -> bool {
-    let mut found = false;
     let mut set = BTreeSet::new();
     collect_used_in_expr(e, &mut set);
-    if set.contains(name) {
-        found = true;
-    }
-    found
+    set.contains(name)
 }
 
 fn collect_used_names(stmts: &[Stmt], out: &mut BTreeSet<String>) {
@@ -1775,6 +1782,247 @@ fn for_each_child_block(s: &Stmt, mut f: impl FnMut(&[Stmt])) {
 
 /// Derive a readable variable name from the expression a local is assigned, or `None` to
 /// keep the synthesized name. First match wins.
+/// Classification of a single definition expression, for naming a variable from its WHOLE
+/// lifetime (every value ever assigned to it) instead of one definition. See [`lifetime_name`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TypeTag {
+    /// A constructor/lookup that yields a known Roblox class: `Instance.new("Weld")`,
+    /// `FindFirstChildOfClass("Humanoid")`. Carries the class name.
+    Class(String),
+    /// A part-typed source whose identity differs by site — a part property (`PrimaryPart`,
+    /// `from_property = true`) or a child lookup (`FindFirstChild("Middle")`,
+    /// `from_property = false`). Carries the field/literal so divergence can be detected.
+    PartRole { name: String, from_property: bool },
+    /// Some other derivable value; its presence means the lifetime is not purely class- or
+    /// part-typed, so no family/role name is produced (the variable stays generic).
+    Other,
+    /// Literals, `nil`, and self/synthetic re-aliases: ignored — they never block agreement
+    /// between the real definitions, nor invent a name on their own.
+    Ignore,
+}
+
+/// The class string of an `Instance.new("Class")` call, if that is what `callee`/`args` are.
+fn instance_new_class(callee: &Expr, args: &[Expr]) -> Option<String> {
+    let (owner, member) = call_owner_member(callee)?;
+    if owner == "Instance" && member == "new" {
+        if let Some(Expr::Str(lit)) = args.first() {
+            return Some(strip_quotes(lit));
+        }
+    }
+    None
+}
+
+/// The class string of a class-filtered child/ancestor lookup, if `method` is one.
+fn find_by_class_name(method: &str, args: &[Expr]) -> Option<String> {
+    if matches!(
+        method,
+        "FindFirstChildOfClass"
+            | "FindFirstChildWhichIsA"
+            | "FindFirstAncestorOfClass"
+            | "FindFirstAncestorWhichIsA"
+    ) {
+        if let Some(Expr::Str(lit)) = args.first() {
+            return Some(strip_quotes(lit));
+        }
+    }
+    None
+}
+
+/// Instance properties that read a BasePart, so a variable fed by several of them (or by one of
+/// them plus a child lookup) is recognised as "the main part" rather than any single property.
+fn is_part_field(field: &str) -> bool {
+    matches!(
+        field,
+        "PrimaryPart"
+            | "HumanoidRootPart"
+            | "RootPart"
+            | "Head"
+            | "Torso"
+            | "UpperTorso"
+            | "LowerTorso"
+            | "Handle"
+            | "Hitbox"
+    )
+}
+
+/// Child names that denote a part, so `FindFirstChild("Middle")` anchors a variable as part-typed
+/// even with no sibling part property.
+fn is_part_ish_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "middle"
+            | "handle"
+            | "root"
+            | "rootpart"
+            | "humanoidrootpart"
+            | "torso"
+            | "head"
+            | "hitbox"
+            | "base"
+            | "body"
+            | "center"
+            | "trunk"
+            | "core"
+            | "primarypart"
+            | "mainpart"
+    )
+}
+
+/// The generic local name shared by a family of related Roblox classes — used when one variable
+/// holds MORE THAN ONE class of the family over its lifetime (a `Motor6D` in one branch and a
+/// `Weld` in another are both "joint"). `None` for classes with no good shared name, so such a
+/// variable keeps its specific name (single class) or stays generic rather than gaining a vague
+/// one. Kept deliberately separate from [`class_name_hint`], which gives the single-class name.
+fn class_family(class: &str) -> Option<&'static str> {
+    Some(match class {
+        "Weld" | "WeldConstraint" | "ManualWeld" | "Motor6D" | "Motor" | "Snap" | "Glue" => "joint",
+        "HingeConstraint" | "BallSocketConstraint" | "PrismaticConstraint"
+        | "CylindricalConstraint" | "SpringConstraint" | "RodConstraint" | "RopeConstraint"
+        | "UniversalConstraint" | "NoCollisionConstraint" | "Torque" | "AlignPosition"
+        | "AlignOrientation" | "LinearVelocity" | "AngularVelocity" | "VectorForce"
+        | "LineForce" | "Plane" => "constraint",
+        "BodyVelocity" | "BodyForce" | "BodyGyro" | "BodyPosition" | "BodyThrust"
+        | "BodyAngularVelocity" | "RocketPropulsion" => "mover",
+        "Part" | "BasePart" | "MeshPart" | "UnionOperation" | "NegateOperation" | "WedgePart"
+        | "CornerWedgePart" | "TrussPart" | "SpawnLocation" | "Seat" | "VehicleSeat"
+        | "SkateboardPlatform" => "part",
+        "SpecialMesh" | "BlockMesh" | "CylinderMesh" | "FileMesh" | "CharacterMesh" => "mesh",
+        "StringValue" | "IntValue" | "NumberValue" | "BoolValue" | "ObjectValue" | "CFrameValue"
+        | "Vector3Value" | "Color3Value" | "BrickColorValue" | "RayValue" => "value",
+        "Frame" | "ScrollingFrame" | "ViewportFrame" | "CanvasGroup" => "frame",
+        "TextLabel" | "ImageLabel" => "label",
+        "TextButton" | "ImageButton" => "button",
+        "ScreenGui" | "SurfaceGui" | "BillboardGui" => "gui",
+        "UIListLayout" | "UIGridLayout" | "UITableLayout" | "UIPageLayout" | "UIPadding"
+        | "UICorner" | "UIStroke" | "UIScale" | "UIGradient" | "UIAspectRatioConstraint"
+        | "UISizeConstraint" | "UITextSizeConstraint" => "uiElement",
+        "RemoteEvent" | "RemoteFunction" | "UnreliableRemoteEvent" => "remote",
+        "BindableEvent" | "BindableFunction" => "bindable",
+        "ParticleEmitter" | "Beam" | "Trail" | "Smoke" | "Fire" | "Sparkles" | "Explosion" => {
+            "effect"
+        }
+        "PointLight" | "SpotLight" | "SurfaceLight" => "light",
+        "ColorCorrectionEffect" | "BloomEffect" | "BlurEffect" | "SunRaysEffect"
+        | "DepthOfFieldEffect" => "postEffect",
+        "Sound" | "SoundGroup" => "sound",
+        "EqualizerSoundEffect" | "EchoSoundEffect" | "ReverbSoundEffect" | "DistortionSoundEffect"
+        | "PitchShiftSoundEffect" | "ChorusSoundEffect" | "CompressorSoundEffect"
+        | "FlangeSoundEffect" | "TremoloSoundEffect" => "soundEffect",
+        "Animation" | "AnimationTrack" | "Animator" | "AnimationController" => "animation",
+        "Script" | "LocalScript" | "ModuleScript" | "BaseScript" => "script",
+        "Decal" | "Texture" | "SurfaceAppearance" => "texture",
+        "Attachment" | "Bone" => "attachment",
+        "Accessory" | "Accoutrement" | "Shirt" | "Pants" | "ShirtGraphic" | "Hat" => "accessory",
+        "ProximityPrompt" | "ClickDetector" | "DragDetector" => "interaction",
+        "Model" | "WorldModel" | "Actor" => "model",
+        _ => return None,
+    })
+}
+
+/// Classify one definition expression for lifetime-aware naming.
+fn def_type_tag(e: &Expr) -> TypeTag {
+    match e {
+        Expr::Nil | Expr::Bool(_) | Expr::Num(_) | Expr::Str(_) | Expr::Vector(_) => TypeTag::Ignore,
+        Expr::Var(name) if is_synthetic(name) || is_parameter(name) => TypeTag::Ignore,
+        Expr::Call(callee, args) => match instance_new_class(callee, args) {
+            Some(class) => TypeTag::Class(class),
+            None => TypeTag::Other,
+        },
+        Expr::MethodCall(_, method, args) => {
+            if let Some(class) = find_by_class_name(method, args) {
+                TypeTag::Class(class)
+            } else if matches!(method.as_str(), "FindFirstChild" | "WaitForChild") {
+                match args.first() {
+                    Some(Expr::Str(lit)) => TypeTag::PartRole {
+                        name: strip_quotes(lit),
+                        from_property: false,
+                    },
+                    _ => TypeTag::Other,
+                }
+            } else {
+                TypeTag::Other
+            }
+        }
+        Expr::Field(_, field) if is_part_field(field) => TypeTag::PartRole {
+            name: field.clone(),
+            from_property: true,
+        },
+        _ => TypeTag::Other,
+    }
+}
+
+/// Derive ONE name for a variable from its WHOLE lifetime (`defs` — every value ever assigned to
+/// it), for variables whose definitions disagree on a single specific name but still share a
+/// coherent type:
+/// - all definitions construct the SAME class -> that class's specific name;
+/// - definitions construct DIFFERENT classes of one family -> the family name
+///   (`Motor6D` + `Weld` -> `"joint"`);
+/// - the variable is part-typed but reached different ways -> `"mainPart"`
+///   (`instance.PrimaryPart` in one branch, `instance:FindFirstChild("Middle")` in another).
+///
+/// Returns `None` when the definitions don't cohere, leaving the variable generic. Renaming a
+/// local is always semantics-preserving here, so a family/role name is safe even when imperfect.
+fn lifetime_name(defs: &[Expr]) -> Option<String> {
+    let tags: Vec<TypeTag> = defs
+        .iter()
+        .map(def_type_tag)
+        .filter(|t| *t != TypeTag::Ignore)
+        .collect();
+    if tags.is_empty() {
+        return None;
+    }
+
+    let classes: BTreeSet<&str> = tags
+        .iter()
+        .filter_map(|t| match t {
+            TypeTag::Class(c) => Some(c.as_str()),
+            _ => None,
+        })
+        .collect();
+    // A genuinely unrecognised value (a call/field that isn't an instance source) means the
+    // register's lifetime is incoherent; stay conservative and leave it generic.
+    let has_other = tags.iter().any(|t| matches!(t, TypeTag::Other));
+
+    // Some definition constructs/looks up an instance of a known class. Child lookups
+    // (`FindFirstChild`/`WaitForChild`) and part properties are instance-producing and compatible
+    // with a constructor, so they don't block class naming — this is exactly the ubiquitous
+    // `parent:FindFirstChild("X") or Instance.new("Y")` get-or-create idiom: the variable holds an
+    // instance of the constructed class either way. Same class -> specific name; one family ->
+    // family name (`Motor6D` + `Weld` -> "joint").
+    if !classes.is_empty() && !has_other {
+        if classes.len() == 1 {
+            return class_name_hint(classes.iter().copied().next().unwrap());
+        }
+        let families: Option<BTreeSet<&str>> = classes.iter().copied().map(class_family).collect();
+        return match families {
+            Some(fams) if fams.len() == 1 => Some(fams.into_iter().next().unwrap().to_string()),
+            _ => None,
+        };
+    }
+
+    // No class constructor: a part-typed variable located in divergent ways -> "mainPart" (neither
+    // "primaryPart", which is only the first assignment, nor "middle", only the second). Requires
+    // at least one unambiguous part anchor, then two or more distinct sources.
+    let part_roles: Vec<(&str, bool)> = tags
+        .iter()
+        .filter_map(|t| match t {
+            TypeTag::PartRole { name, from_property } => Some((name.as_str(), *from_property)),
+            _ => None,
+        })
+        .collect();
+    if classes.is_empty() && !has_other && !part_roles.is_empty() {
+        let has_anchor = part_roles
+            .iter()
+            .any(|(name, from_property)| *from_property || is_part_ish_name(name));
+        let sources: BTreeSet<&str> = part_roles.iter().map(|(name, _)| *name).collect();
+        if has_anchor && sources.len() >= 2 {
+            return Some("mainPart".to_string());
+        }
+    }
+
+    None
+}
+
 pub fn derive_name(e: &Expr) -> Option<String> {
     match e {
         Expr::Call(callee, args) => derive_from_call(callee, args),
@@ -3800,6 +4048,128 @@ mod tests {
             );
             assert_eq!(derive_name(&expr).as_deref(), Some(expected));
         }
+    }
+
+    fn instance_new(class: &str) -> Expr {
+        Expr::Call(
+            Box::new(Expr::Field(
+                Box::new(Expr::Var("Instance".into())),
+                "new".into(),
+            )),
+            vec![s(class)],
+        )
+    }
+
+    #[test]
+    fn lifetime_name_groups_class_families() {
+        // Different classes of one family -> the family name.
+        assert_eq!(
+            lifetime_name(&[instance_new("Motor6D"), instance_new("Weld")]).as_deref(),
+            Some("joint")
+        );
+        assert_eq!(
+            lifetime_name(&[instance_new("Part"), instance_new("WedgePart")]).as_deref(),
+            Some("part")
+        );
+        assert_eq!(
+            lifetime_name(&[instance_new("StringValue"), instance_new("NumberValue")]).as_deref(),
+            Some("value")
+        );
+        // Same class throughout -> the specific name, not the family name.
+        assert_eq!(
+            lifetime_name(&[instance_new("Motor6D"), instance_new("Motor6D")]).as_deref(),
+            Some("motor")
+        );
+        // Unrelated families -> no opinion (variable stays generic).
+        assert_eq!(lifetime_name(&[instance_new("Sound"), instance_new("Part")]), None);
+    }
+
+    #[test]
+    fn lifetime_name_handles_get_or_create() {
+        let find = |name: &str| {
+            Expr::MethodCall(
+                Box::new(Expr::Var("parent".into())),
+                "FindFirstChild".into(),
+                vec![s(name)],
+            )
+        };
+        // `parent:FindFirstChild("CCE") or Instance.new("ColorCorrectionEffect")` — the variable
+        // holds a ColorCorrectionEffect either way, so it is named after the constructed class.
+        assert_eq!(
+            lifetime_name(&[find("CursorFreeCC"), instance_new("ColorCorrectionEffect")]).as_deref(),
+            Some("colorCorrectionEffect")
+        );
+        // A child lookup mixed with a joint-family constructor still resolves to the family.
+        assert_eq!(
+            lifetime_name(&[find("Joint"), instance_new("Motor6D"), instance_new("Weld")]).as_deref(),
+            Some("joint")
+        );
+        // A genuinely unrelated value (a plain call) mixed in stays conservative.
+        let other_call = Expr::Call(Box::new(Expr::Var("compute".into())), vec![]);
+        assert_eq!(lifetime_name(&[other_call, instance_new("Part")]), None);
+    }
+
+    #[test]
+    fn lifetime_name_handles_divergent_part_roles() {
+        let field = |f: &str| Expr::Field(Box::new(Expr::Var("instance".into())), f.into());
+        let find = |name: &str| {
+            Expr::MethodCall(
+                Box::new(Expr::Var("instance".into())),
+                "FindFirstChild".into(),
+                vec![s(name)],
+            )
+        };
+        // .PrimaryPart in one branch, :FindFirstChild("Middle") in another -> "mainPart".
+        assert_eq!(
+            lifetime_name(&[field("PrimaryPart"), find("Middle")]).as_deref(),
+            Some("mainPart")
+        );
+        // A single uniform part source is not divergent -> defer to the normal naming path.
+        assert_eq!(lifetime_name(&[field("PrimaryPart")]), None);
+        // Non-part child lookups with no part anchor -> no "mainPart" claim.
+        assert_eq!(lifetime_name(&[find("Config"), find("Settings")]), None);
+        // nil resets between class assignments are ignored, not treated as a conflict.
+        assert_eq!(
+            lifetime_name(&[instance_new("Weld"), Expr::Nil, instance_new("Motor6D")]).as_deref(),
+            Some("joint")
+        );
+    }
+
+    #[test]
+    fn divergent_definitions_get_lifetime_names_end_to_end() {
+        // v5 holds a Motor6D in one branch and a Weld in another: both joints -> "joint".
+        let stmts = vec![
+            Stmt::Assign {
+                targets: vec![Expr::Var("v5".into())],
+                values: vec![instance_new("Motor6D")],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("v5".into())],
+                values: vec![instance_new("Weld")],
+            },
+        ];
+        let map = smart_rename(&stmts, &["v5".to_string()], false);
+        assert_eq!(map.get("v5").map(String::as_str), Some("joint"));
+
+        // v4 is the model's main part, reached two different ways -> "mainPart".
+        let field = |f: &str| Expr::Field(Box::new(Expr::Var("instance".into())), f.into());
+        let find = Expr::MethodCall(
+            Box::new(Expr::Var("instance".into())),
+            "FindFirstChild".into(),
+            vec![s("Middle")],
+        );
+        let stmts = vec![
+            Stmt::Assign {
+                targets: vec![Expr::Var("v4".into())],
+                values: vec![field("PrimaryPart")],
+            },
+            Stmt::Assign {
+                targets: vec![Expr::Var("v4".into())],
+                values: vec![find],
+            },
+        ];
+        let map = smart_rename(&stmts, &["v4".to_string()], false);
+        assert_eq!(map.get("v4").map(String::as_str), Some("mainPart"));
     }
 
     #[test]

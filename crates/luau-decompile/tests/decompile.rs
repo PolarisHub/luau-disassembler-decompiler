@@ -19,6 +19,12 @@ fn read(name: &str) -> Vec<u8> {
     fs::read(root().join("corpus").join("bytecode").join(name)).unwrap()
 }
 
+/// Whether luau-compile produced real bytecode: it emits a version-0 error blob on failure,
+/// so success means exit-0 and a leading version byte in `LBC_VERSION_MIN..=MAX` ([3, 11]).
+fn compiled_ok(out: &std::process::Output) -> bool {
+    out.status.success() && out.stdout.first().is_some_and(|&b| (3..=11).contains(&b))
+}
+
 fn compile_source(name: &str) -> Option<Vec<u8>> {
     let luau = root().join("tools").join("luau-compile.exe");
     if !luau.exists() {
@@ -30,13 +36,7 @@ fn compile_source(name: &str) -> Option<Vec<u8>> {
         .arg(&source)
         .output()
         .expect("run luau-compile");
-    let ok = output.status.success()
-        && output
-            .stdout
-            .first()
-            .map(|&b| (3..=11).contains(&b))
-            .unwrap_or(false);
-    ok.then_some(output.stdout)
+    compiled_ok(&output).then_some(output.stdout)
 }
 
 fn compile_inline_source(tag: &str, source: &str) -> Option<Vec<u8>> {
@@ -54,13 +54,7 @@ fn compile_inline_source(tag: &str, source: &str) -> Option<Vec<u8>> {
         .arg(&path)
         .output()
         .expect("run luau-compile");
-    let ok = output.status.success()
-        && output
-            .stdout
-            .first()
-            .map(|&b| (3..=11).contains(&b))
-            .unwrap_or(false);
-    ok.then_some(output.stdout)
+    compiled_ok(&output).then_some(output.stdout)
 }
 
 fn push_varint(out: &mut Vec<u8>, mut value: u64) {
@@ -923,14 +917,7 @@ fn straight_line_output_recompiles() {
             .output()
             .expect("run luau-compile");
 
-        // luau-compile emits a version-0 error blob on failure; success starts with a
-        // valid version byte in [3, 11].
-        let ok = output.status.success()
-            && output
-                .stdout
-                .first()
-                .map(|&b| (3..=11).contains(&b))
-                .unwrap_or(false);
+        let ok = compiled_ok(&output);
         assert!(
             ok,
             "{name}: decompiled output did not recompile.\n--- source ---\n{src}\n--- stderr ---\n{}",
@@ -957,12 +944,7 @@ fn recompiles(src: &str, tag: &str) -> bool {
         .arg(&tmp)
         .output()
         .expect("run luau-compile");
-    output.status.success()
-        && output
-            .stdout
-            .first()
-            .map(|&b| (3..=11).contains(&b))
-            .unwrap_or(false)
+    compiled_ok(&output)
 }
 
 #[test]
@@ -990,6 +972,60 @@ fn roblox_idioms_get_smart_names() {
         "smart-named output must recompile:\n{}",
         out.source
     );
+}
+
+#[test]
+fn lifetime_aware_naming_recovers_family_and_role_names() {
+    // A variable that holds a Motor6D in one branch and a Weld in another is named for the
+    // shared family ("joint"), not either specific class — recovered from stripped bytecode.
+    let Some(bytes) = compile_stripped_inline_source(
+        "lifetime_joint",
+        r#"
+            return function(useMotor, part, part2)
+                local joint
+                if useMotor then
+                    joint = Instance.new("Motor6D")
+                else
+                    joint = Instance.new("Weld")
+                end
+                joint.Part0 = part
+                joint.Part1 = part2
+                return joint
+            end
+        "#,
+    ) else {
+        eprintln!("skipping: compiler not present");
+        return;
+    };
+    let out = decompile(&parse_and_validate(&bytes).unwrap()).source;
+    assert!(
+        out.contains("joint"),
+        "Motor6D/Weld divergence should recover the family name 'joint':\n{out}"
+    );
+    assert!(recompiles(&out, "lifetime_joint"), "must recompile:\n{out}");
+
+    // A part reached two different ways (a property then a child lookup) is named "mainPart",
+    // not "primaryPart" (only the first source) nor "middle" (only the second).
+    let Some(bytes) = compile_stripped_inline_source(
+        "lifetime_mainpart",
+        r#"
+            return function(instance, useMiddle)
+                local target = instance.PrimaryPart
+                if useMiddle then
+                    target = instance:FindFirstChild("Middle")
+                end
+                return target
+            end
+        "#,
+    ) else {
+        return;
+    };
+    let out = decompile(&parse_and_validate(&bytes).unwrap()).source;
+    assert!(
+        out.contains("mainPart"),
+        "divergent part source should recover 'mainPart':\n{out}"
+    );
+    assert!(recompiles(&out, "lifetime_mainpart"), "must recompile:\n{out}");
 }
 
 #[test]
@@ -1106,17 +1142,7 @@ fn recompile_bytes(src: &str, tag: &str) -> Option<Vec<u8>> {
         .arg(&tmp)
         .output()
         .expect("run luau-compile");
-    if out.status.success()
-        && out
-            .stdout
-            .first()
-            .map(|&b| (3..=11).contains(&b))
-            .unwrap_or(false)
-    {
-        Some(out.stdout)
-    } else {
-        None
-    }
+    compiled_ok(&out).then_some(out.stdout)
 }
 
 /// Count opcodes by category across a module:
@@ -1226,13 +1252,7 @@ fn compile_stripped_inline_source(tag: &str, source: &str) -> Option<Vec<u8>> {
         .arg(&path)
         .output()
         .expect("run luau-compile");
-    let ok = output.status.success()
-        && output
-            .stdout
-            .first()
-            .map(|&b| (3..=11).contains(&b))
-            .unwrap_or(false);
-    ok.then_some(output.stdout)
+    compiled_ok(&output).then_some(output.stdout)
 }
 
 #[test]

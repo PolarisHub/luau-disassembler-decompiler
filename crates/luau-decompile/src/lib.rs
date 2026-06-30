@@ -101,7 +101,7 @@ fn decompile_proto(
     reports: &mut Vec<ProtoReport>,
 ) -> ProtoDecompileResult {
     let proto = &module.protos[proto_idx];
-    let mut d = Decompiler::new(module, proto, proto_idx);
+    let mut d = Decompiler::new(module, proto);
     let mut stmts = d.run();
 
     // Remove unreachable code left after returns/breaks by inline-cache flushes.
@@ -445,7 +445,6 @@ fn expr_contains_unstructured(expr: &Expr) -> bool {
 struct Decompiler<'a> {
     module: &'a Module,
     proto: &'a Proto,
-    proto_idx: usize,
     /// Expression currently held in each register when it is an inlinable immutable leaf
     /// (constant/import/global). `None` means "read this register by its name". The cache is
     /// flushed at every control-flow boundary so no inlined value ever crosses an edge.
@@ -479,11 +478,10 @@ struct Decompiler<'a> {
 }
 
 impl<'a> Decompiler<'a> {
-    fn new(module: &'a Module, proto: &'a Proto, proto_idx: usize) -> Self {
+    fn new(module: &'a Module, proto: &'a Proto) -> Self {
         Decompiler {
             module,
             proto,
-            proto_idx,
             regs: vec![None; proto.max_stack_size as usize + 1],
             hoisted: BTreeSet::new(),
             labels: compute_labels(proto),
@@ -2171,19 +2169,15 @@ impl<'a> Decompiler<'a> {
         for r in 0..count {
             if let Some(e) = self.regs[r].clone() {
                 self.regs[r] = None;
-                if r < self.proto.num_params as usize {
-                    // A parameter slot holding a constant means it was reassigned; emit it.
-                    stmts.push(Stmt::Assign {
-                        targets: vec![Expr::Var(self.reg_name(r as u8))],
-                        values: vec![e],
-                    });
-                } else {
+                // A parameter slot holding a constant means it was reassigned; emit it as-is.
+                // A non-parameter slot additionally needs a hoisted `local` declaration.
+                if r >= self.proto.num_params as usize {
                     self.hoisted.insert(r as u8);
-                    stmts.push(Stmt::Assign {
-                        targets: vec![Expr::Var(self.reg_name(r as u8))],
-                        values: vec![e],
-                    });
                 }
+                stmts.push(Stmt::Assign {
+                    targets: vec![Expr::Var(self.reg_name(r as u8))],
+                    values: vec![e],
+                });
             }
         }
     }
@@ -2468,7 +2462,6 @@ impl<'a> Decompiler<'a> {
         if !self.notes.contains(&m) {
             self.notes.push(m);
         }
-        let _ = self.proto_idx;
     }
 }
 
