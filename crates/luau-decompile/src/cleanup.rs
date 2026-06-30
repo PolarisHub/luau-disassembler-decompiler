@@ -145,9 +145,17 @@ pub fn single_use_inline(root: &mut Vec<Stmt>, protected: &BTreeSet<String>) {
 /// Remove dead pure stores; reduce dead call-stores to bare calls. `protected` names are
 /// never removed.
 pub fn dead_store_elim(root: &mut Vec<Stmt>, protected: &BTreeSet<String>) {
+    // Each pass removes every store the current use-counts prove dead — both the never-read
+    // ones and the overwritten-before-read ones — in a single traversal, then recomputes once
+    // to expose cascades. The removals are monotone (deleting a store only lowers other
+    // variables' read counts, never raises them), so batching reaches the same fixpoint as
+    // removing one-at-a-time would, at a fraction of the `count_uses` recomputes that dominated
+    // large protos (the loop used to recompute the whole-tree count after every single removal).
     loop {
         let uses = count_uses(root);
-        if !dead_in_block(root, &uses, protected) && !dead_overwritten_in_block(root, protected) {
+        let removed_unread = dead_in_block_all(root, &uses, protected);
+        let removed_overwritten = dead_overwritten_all(root, protected);
+        if !removed_unread && !removed_overwritten {
             break;
         }
     }
@@ -4699,80 +4707,85 @@ fn contains_direct_break_continue(stmts: &[Stmt]) -> bool {
 
 // --- dead store elimination ------------------------------------------------------------
 
-fn dead_in_block(
+/// Remove (when pure) or strip to a bare call (when impure) every sole-`Var` assignment whose
+/// variable is read nowhere, at every nesting level, in a single pass. Returns whether anything
+/// changed. The per-statement decision is identical to removing one-at-a-time; only the
+/// batching differs. `uses` may be stale within the pass — that only makes it skip a store that
+/// just became dead (caught on the caller's next recompute), never wrongly remove a live one,
+/// because removing stores can only lower a variable's read count.
+fn dead_in_block_all(
     block: &mut Vec<Stmt>,
     uses: &BTreeMap<String, usize>,
     protected: &BTreeSet<String>,
 ) -> bool {
+    let mut changed = false;
     for s in block.iter_mut() {
-        let mut changed = false;
         for_each_block_mut(s, |b| {
-            if !changed {
-                changed = dead_in_block(b, uses, protected);
+            if dead_in_block_all(b, uses, protected) {
+                changed = true;
             }
         });
-        if changed {
-            return true;
-        }
     }
 
-    for i in 0..block.len() {
+    let mut i = 0;
+    while i < block.len() {
         let Some((name, val)) = sole_var_assign(&block[i]) else {
+            i += 1;
             continue;
         };
-        if protected.contains(&name) {
-            continue;
-        }
         // The local is never read anywhere: its stores are dead regardless of how many there
         // are. (A register reused for several short-lived unread values produces several.)
-        if uses.get(&name).copied().unwrap_or(0) != 0 {
+        if protected.contains(&name) || uses.get(&name).copied().unwrap_or(0) != 0 {
+            i += 1;
             continue;
         }
+        changed = true;
         if is_pure(&val) {
-            block.remove(i); // pure & unused -> gone
+            block.remove(i); // pure & unused -> gone; re-examine the shifted statement
         } else {
             block[i] = Stmt::Call(val); // keep the side effect, drop the binding
+            i += 1;
         }
-        return true;
     }
-    false
+    changed
 }
 
-fn dead_overwritten_in_block(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool {
+fn dead_overwritten_all(block: &mut Vec<Stmt>, protected: &BTreeSet<String>) -> bool {
+    let mut changed = false;
     for s in block.iter_mut() {
         if dead_overwritten_nested_block(s, protected) {
-            return true;
+            changed = true;
         }
     }
 
-    for i in 0..block.len() {
+    let mut i = 0;
+    while i < block.len() {
         let Some((name, val)) = sole_var_assign(&block[i]) else {
+            i += 1;
             continue;
         };
         if protected.contains(&name) || !is_pure(&val) {
+            i += 1;
             continue;
         }
-        let Some(next_def) =
-            ((i + 1)..block.len()).find(|&k| directly_writes_var(&block[k], &name))
+        let Some(next_def) = ((i + 1)..block.len()).find(|&k| directly_writes_var(&block[k], &name))
         else {
+            i += 1;
             continue;
         };
-        if block[i + 1..next_def].iter().any(is_control_flow) {
-            continue;
-        }
-        if block[i + 1..next_def]
-            .iter()
-            .any(|stmt| stmt_reads_var(stmt, &name))
+        if block[i + 1..next_def].iter().any(is_control_flow)
+            || block[i + 1..next_def]
+                .iter()
+                .any(|stmt| stmt_reads_var(stmt, &name))
+            || stmt_reads_var(&block[next_def], &name)
         {
+            i += 1;
             continue;
         }
-        if stmt_reads_var(&block[next_def], &name) {
-            continue;
-        }
-        block.remove(i);
-        return true;
+        block.remove(i); // re-examine the shifted statement
+        changed = true;
     }
-    false
+    changed
 }
 
 fn dead_overwritten_nested_block(s: &mut Stmt, protected: &BTreeSet<String>) -> bool {
@@ -4782,16 +4795,17 @@ fn dead_overwritten_nested_block(s: &mut Stmt, protected: &BTreeSet<String>) -> 
             else_body,
             ..
         } => {
-            dead_overwritten_in_block(then_body, protected)
-                || dead_overwritten_in_block(else_body, protected)
+            let a = dead_overwritten_all(then_body, protected);
+            let b = dead_overwritten_all(else_body, protected);
+            a || b
         }
         Stmt::While { cond, body } | Stmt::Repeat { body, cond } => {
             let mut loop_protected = protected.clone();
             loop_protected.extend(reads_of_expr(cond));
-            dead_overwritten_in_block(body, &loop_protected)
+            dead_overwritten_all(body, &loop_protected)
         }
         Stmt::NumericFor { body, .. } | Stmt::GenericFor { body, .. } => {
-            dead_overwritten_in_block(body, protected)
+            dead_overwritten_all(body, protected)
         }
         _ => false,
     }

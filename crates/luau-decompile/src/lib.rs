@@ -244,7 +244,9 @@ fn decompile_proto(
         d.closure_cache.insert(pc, CachedClosure { expr, partial });
     }
 
+    let _m0 = std::time::Instant::now();
     let mut stmts = d.run();
+    let _m1 = std::time::Instant::now();
 
     // Remove unreachable code left after returns/breaks by inline-cache flushes.
     cleanup::drop_unreachable(&mut stmts);
@@ -317,6 +319,7 @@ fn decompile_proto(
     cleanup::recover_unstructured_backward_loops(&mut stmts);
     // A constant `1` step on a numeric for is implicit.
     drop_unit_for_steps(&mut stmts);
+    let _m2 = std::time::Instant::now();
 
     // Locals that still need a hoisted declaration (a sole-Var assignment survived),
     // excluding parameters and upvalues.
@@ -347,6 +350,7 @@ fn decompile_proto(
     // Now that this function's locals have their final names, rewrite the `u0`/`u1`/… upvalue
     // placeholders inside each nested closure to the captured local's name.
     d.resolve_closures(&mut stmts, &rename);
+    let _m3 = std::time::Instant::now();
     cleanup::promote_top_level_initializers(&mut stmts, &non_local);
     cleanup::fold_table_literals(&mut stmts);
     cleanup::inline_table_literal_fill_temps(&mut stmts);
@@ -467,6 +471,21 @@ fn decompile_proto(
     cleanup::simplify_redundant_conditions(&mut stmts);
     cleanup::drop_trailing_empty_return(&mut stmts);
     let hoist_names = cleanup::assigned_locals(&stmts, &non_local);
+
+    if std::env::var_os("DECOMP_PROF").is_some() {
+        let m4 = std::time::Instant::now();
+        let total = m4 - _m0;
+        if total.as_millis() > 50 {
+            eprintln!(
+                "PROF proto={proto_idx} total={:?} run={:?} pre+fix1={:?} naming={:?} post={:?}",
+                total,
+                _m1 - _m0,
+                _m2 - _m1,
+                _m3 - _m2,
+                m4 - _m3,
+            );
+        }
+    }
 
     // Determine `partial` from the FINAL tree: a proto is partial only if some unstructured
     // control flow (a goto/label) survived all recovery passes, or a nested closure was partial.
