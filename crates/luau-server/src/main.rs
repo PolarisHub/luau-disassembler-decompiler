@@ -26,9 +26,19 @@ type Handled = Result<(u16, String), ApiError>;
 
 /// Maximum request body (base64 bytecode). Generous for real chunks, bounded against abuse.
 const MAX_BODY: usize = 16 * 1024 * 1024;
-/// Per-request analysis budget. Parsing/analysis is linear and bounded, so this is a
-/// backstop, not the normal path.
-const TIME_BUDGET: Duration = Duration::from_secs(10);
+/// Default per-request analysis budget. A backstop, not the normal path. Overridable via
+/// `LUAU_SERVER_TIME_BUDGET_SECS` — large obfuscated modules (hundreds of protos) can take tens
+/// of seconds even after the decompiler's fast path, and the server is loopback-only.
+const DEFAULT_TIME_BUDGET_SECS: u64 = 120;
+
+fn time_budget() -> Duration {
+    let secs = std::env::var("LUAU_SERVER_TIME_BUDGET_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(DEFAULT_TIME_BUDGET_SECS);
+    Duration::from_secs(secs)
+}
 
 fn main() {
     let addr = std::env::args()
@@ -133,7 +143,7 @@ fn run_budgeted(body: Vec<u8>, handler: fn(&[u8]) -> Handled) -> Handled {
         let result = handler(&body);
         let _ = tx.send(result);
     });
-    match rx.recv_timeout(TIME_BUDGET) {
+    match rx.recv_timeout(time_budget()) {
         Ok(result) => result,
         Err(_) => Err(err(408, "timeout", "analysis exceeded time budget")),
     }
